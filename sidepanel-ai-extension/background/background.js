@@ -21,6 +21,7 @@
   safeImport("../common/messages.js");        // defines globalThis.MessageTypes
   safeImport("../common/api.js");             // API wrapper (classic script)
   safeImport("../common/prompts.js");         // Prompt builders (classic script)
+  safeImport("../common/planner.js");         // New multi-step planner
   // api-key-manager.js is optional; guard its absence
   try {
     safeImport("../common/api-key-manager.js");  // API key rotation/manager (if present)
@@ -588,10 +589,12 @@ async function runAgentLoop(tabId, goal, settings) {
   sess.running = true;
   sess.stopped = false;
   sess.step = 0;
+  sess.currentPlan = [];
+  sess.currentStepIndex = 0;
 
   emitAgentLog(tabId, {
     level: LOG_LEVELS.INFO,
-    msg: "Agent started with context engineering",
+    msg: "Agent started with multi-step planning",
     goal,
     model: sess.selectedModel,
     requestId: sess.requestId,
@@ -599,141 +602,52 @@ async function runAgentLoop(tabId, goal, settings) {
     initialTaskContext: sess.taskContext
   });
 
-  const maxSteps = Math.min(Number(settings?.maxSteps || 12), 50);
+  const planner = new AIPlanner({ model: sess.selectedModel });
+  const contextData = await gatherEnhancedContext(tabId, sess, goal);
+  const planResult = await planner.generatePlan(goal, contextData);
 
-  while (!sess.stopped && sess.step < maxSteps) {
-    if (sess.stopped) break;
+  if (!planResult.ok) {
+    stopAgent(tabId, "Failed to generate a plan.");
+    return;
+  }
 
-    const currentSubTask = sess.subTasks[sess.currentTaskIndex] || goal;
+  sess.currentPlan = planResult.plan;
+  emitAgentLog(tabId, {
+    level: LOG_LEVELS.INFO,
+    msg: "Multi-step plan generated",
+    plan: sess.currentPlan
+  });
 
-    // 1. Gather Enhanced Context with Caching
-    const contextData = await gatherEnhancedContext(tabId, sess, currentSubTask);
-    if (!contextData) {
-      stopAgent(tabId, "Context gathering failed");
+  while (!sess.stopped && sess.currentStepIndex < sess.currentPlan.length) {
+    const action = sess.currentPlan[sess.currentStepIndex];
+    const execRes = await executeActionWithContext(tabId, sess, action, settings);
+    updateSessionContext(tabId, sess, action, execRes);
+
+    if (!execRes.ok) {
+      // Handle failure (simplified for now)
+      stopAgent(tabId, `Action failed: ${execRes.observation}`);
       break;
     }
 
-    // 2. Plan Next Action with Context-Aware Prompt
-    const planPrompt = buildAgentPlanPrompt(goal, currentSubTask, contextData);
-    
-    emitAgentLog(tabId, {
-      level: LOG_LEVELS.INFO,
-      msg: "Planning action",
-      step: sess.step + 1,
-      subTask: currentSubTask
-    });
+    // New "reasoning" step
+    const reasoningPrompt = `Given the goal "${goal}", the last action "${JSON.stringify(action)}", and the observation "${execRes.observation}", should I continue with the plan? Respond with "continue" or "stop".`;
+    const reasoningRes = await callModelWithRotation(reasoningPrompt, { model: "gemini-1.5-flash" });
 
-    let planRes = await callModelWithRotation(planPrompt, { model: sess.selectedModel, tabId });
-    
-    // 3. Parse and Validate Action
-    let parsedAction;
-    if (planRes?.ok) {
-      const validationResult = parseAndValidateAction(tabId, sess, planRes.text);
-      if (validationResult.success) {
-        parsedAction = validationResult.action;
-      } else {
-        emitAgentLog(tabId, {
-          level: LOG_LEVELS.WARN,
-          msg: "Primary planning parse failed",
-          error: validationResult.error,
-          rawText: validationResult.rawText
-        });
-        planRes = null; // Mark for recovery
-      }
-    }
-
-    // If planning or parsing failed, attempt recovery
-    if (!planRes?.ok || !parsedAction) {
-      planRes = await attemptRecoveryPlanning(tabId, sess, goal, currentSubTask, contextData);
-      if (planRes?.ok) {
-        const recoveryValidation = parseAndValidateAction(tabId, sess, planRes.text);
-        if (recoveryValidation.success) {
-          parsedAction = recoveryValidation.action;
-        } else {
-           emitAgentLog(tabId, {
-            level: LOG_LEVELS.ERROR,
-            msg: "Recovery planning parse also failed. Stopping.",
-            error: recoveryValidation.error
-          });
-          stopAgent(tabId, "Recovery planning failed");
-          break;
-        }
-      } else {
-        emitAgentLog(tabId, {
-          level: LOG_LEVELS.ERROR,
-          msg: "Main and recovery planning failed. Stopping.",
-          error: planRes?.error || "Unknown recovery error"
-        });
-        stopAgent(tabId, "Planning failed");
-        break;
-      }
-    }
-
-    // 4. Handle "done" action and sub-task progression
-    if (parsedAction.tool === 'done' || parsedAction.done) {
-      const isLastTask = sess.currentTaskIndex >= sess.subTasks.length - 1;
-      emitAgentLog(tabId, {
-        level: LOG_LEVELS.SUCCESS,
-        msg: `Sub-task '${currentSubTask}' completed.`,
-        isLast: isLastTask
-      });
-
-      if (isLastTask) {
-        stopAgent(tabId, "All sub-tasks completed successfully.");
-        break;
-      } else {
-        sess.currentTaskIndex++;
-        sess.history = []; // Clear history for next sub-task
-        emitAgentLog(tabId, {
-          level: LOG_LEVELS.INFO,
-          msg: `Moving to next sub-task: ${sess.subTasks[sess.currentTaskIndex]}`
-        });
-        continue;
-      }
-    }
-
-    // 5. Execute Action
-    const execRes = await executeActionWithContext(tabId, sess, parsedAction, settings);
-
-    // 6. Update Session Context
-    updateSessionContext(tabId, sess, parsedAction, execRes);
-    
-    // 7. Handle Failures with Self-Correction
-    if (!execRes.ok) {
-      sess.failureCount++;
-      sess.consecutiveFailures++;
-      const selfCorrectedAction = await handleActionFailure(tabId, sess, goal, currentSubTask, contextData, parsedAction, execRes);
-
-      if (selfCorrectedAction) {
-        // If correction provides a new action, execute it immediately
-        const correctedExecRes = await executeActionWithContext(tabId, sess, selfCorrectedAction, settings);
-        updateSessionContext(tabId, sess, selfCorrectedAction, correctedExecRes);
-        if (!correctedExecRes.ok) {
-            emitAgentLog(tabId, { level: LOG_LEVELS.ERROR, msg: "Self-correction action also failed. Stopping." });
-            stopAgent(tabId, "Self-correction failed");
-            break;
-        }
-      } else {
-        // If self-correction doesn't produce an action (e.g., max retries), stop
-        stopAgent(tabId, "Self-correction failed to recover");
-        break;
-      }
-    } else {
-      sess.consecutiveFailures = 0; // Reset on success
+    if (reasoningRes.ok && reasoningRes.text.toLowerCase().includes("stop")) {
+      stopAgent(tabId, "Agent decided to stop.");
+      break;
     }
 
     sess.step++;
-
-    // 8. Dynamic Delay
-    const delay = calculateAdaptiveDelay(parsedAction, execRes.ok);
+    sess.currentStepIndex++;
+    const delay = calculateAdaptiveDelay(action, execRes.ok);
     await new Promise(r => setTimeout(r, delay));
   }
 
   if (!sess.stopped) {
-    stopAgent(tabId, `Max steps (${maxSteps}) reached.`);
+    stopAgent(tabId, "Plan completed.");
   }
 
-  // Final session save
   await saveSessionToStorage(tabId, sess);
 }
 
