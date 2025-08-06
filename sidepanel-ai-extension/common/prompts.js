@@ -185,18 +185,22 @@ function analyzeProgress(history, currentSubTask, progressMetrics) {
 - Momentum: ${successfulSteps >= 2 ? 'Good' : totalSteps > 5 ? 'Struggling' : 'Starting'}`;
 }
 
-function buildTaskDecompositionPrompt(goal) {
+function buildTaskDecompositionPrompt(goal, pageInfo = {}) {
   return (
 `You are an expert task planner with deep understanding of web automation workflows. Your job is to break down complex goals into a series of logical, executable sub-tasks that build upon each other.
 
 User Goal: ${goal}
 
+Current Page Context:
+- URL: ${pageInfo.url || 'unknown'}
+- Title: ${pageInfo.title || 'unknown'}
+
 PLANNING PRINCIPLES:
 1. Each sub-task should be atomic and verifiable
 2. Tasks should follow logical dependencies (e.g., navigate before interact)
-3. Include validation steps to ensure success before proceeding
-4. Consider error scenarios and recovery paths
-5. Break complex interactions into smaller, more reliable steps
+3. If the current page is not relevant to the goal, the first step MUST be to navigate to an appropriate page (e.g., google.com for a search task).
+4. Include validation steps to ensure success before proceeding
+5. Consider error scenarios and recovery paths
 
 TASK CATEGORIES TO CONSIDER:
 - Navigation: Moving between pages/sites
@@ -207,33 +211,30 @@ TASK CATEGORIES TO CONSIDER:
 - Synthesis: Combining information from multiple sources
 
 DECOMPOSITION STRATEGY:
-1. Start with high-level phases
-2. Break each phase into specific actions
-3. Add validation checkpoints
-4. Include fallback options where appropriate
+1. Analyze the current page context. If it's not relevant, the first sub-task must be navigation.
+2. Start with high-level phases (e.g., navigate, search, extract).
+3. Break each phase into specific, actionable steps.
+4. Add validation checkpoints where necessary.
 
-Example for "Research the best restaurants in Paris":
+Example for "Research the best restaurants in Paris" when on "chrome://newtab":
 {
   "subTasks": [
-    "Navigate to Google search",
-    "Search for 'best restaurants Paris 2024'",
-    "Review search results and identify authoritative sources",
-    "Visit top restaurant review site (e.g., TripAdvisor, Yelp)",
-    "Extract restaurant names, ratings, and key details",
-    "Search for additional perspectives from food blogs",
-    "Cross-reference information from multiple sources",
-    "Compile comprehensive list with ratings and recommendations"
+    "Navigate to https://www.google.com",
+    "Search for 'best restaurants in Paris'",
+    "Identify and click on a reputable review site from the search results",
+    "Extract restaurant names and ratings from the page",
+    "Synthesize the findings into a list"
   ],
   "context": {
     "taskType": "research",
     "expectedDuration": "medium",
     "complexity": "moderate",
-    "dependencies": ["web_search", "data_extraction", "synthesis"]
+    "dependencies": ["web_search", "data_extraction"]
   }
 }
 
-Analyze the goal and create a comprehensive task breakdown with context metadata.
-Return ONLY the JSON object with subTasks array and context object.`
+Analyze the goal and current page context, then create a comprehensive task breakdown.
+Return ONLY the JSON object with a subTasks array and context object.`
   );
 }
 

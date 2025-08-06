@@ -439,13 +439,8 @@ async function getPageInfoForPlanning(tabId) {
 }
 
 function isRestrictedUrl(url = "") {
-  return (
-    url.startsWith("chrome://") ||
-    url.startsWith("edge://") ||
-    url.startsWith("about:") ||
-    url.startsWith("chrome-extension://") ||
-    url.startsWith("moz-extension://")
-  );
+  // Allow all URLs by default as requested
+  return false;
 }
 
 async function ensureContentScript(tabId) {
@@ -789,7 +784,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const { GEMINI_MODEL } = await chrome.storage.sync.get(["GEMINI_MODEL"]);
           
           // Enhanced task decomposition with AI-powered classification
-          const taskClassification = await classifyAndDecomposeTask(tab.id, goal);
+          // Enhanced task decomposition with AI-powered classification
+          const pageInfo = await getPageInfoForPlanning(tab.id);
+          const taskClassification = await classifyAndDecomposeTask(tab.id, goal, pageInfo);
           let subTasks = taskClassification.subTasks || [goal];
           let taskContext = taskClassification.context || {};
           
@@ -1082,12 +1079,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 // Enhanced task classification and decomposition with context engineering
-async function classifyAndDecomposeTask(tabId, goal) {
+async function classifyAndDecomposeTask(tabId, goal, pageInfo) {
   try {
-    // First, classify the task type using AI
+    // First, classify the task type using AI, now with page context
     const classificationPrompt = buildIntentClassificationPrompt(goal, {
-      url: 'unknown',
-      title: 'Task Planning'
+      url: pageInfo.url || 'unknown',
+      title: pageInfo.title || 'Task Planning'
     });
     
     const classificationRes = await callModelWithRotation(classificationPrompt, {
@@ -1124,7 +1121,7 @@ async function classifyAndDecomposeTask(tabId, goal) {
       case 'NAVIGATION':
       case 'AUTOMATION':
       default:
-        decompPrompt = buildTaskDecompositionPrompt(goal);
+        decompPrompt = buildTaskDecompositionPrompt(goal, pageInfo);
         break;
     }
     
