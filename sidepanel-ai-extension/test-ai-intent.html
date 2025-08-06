@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AI-Driven Intent System Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .test-section { margin: 20px 0; padding: 15px; border: 1px solid #ccc; }
+        .success { color: green; }
+        .error { color: red; }
+        .info { color: blue; }
+        button { padding: 10px 15px; margin: 5px; }
+        h3 { color: #333; margin-top: 20px; }
+        ul { margin: 10px 0; }
+        li { margin: 5px 0; }
+        .example { background: #f5f5f5; padding: 10px; margin: 10px 0; border-left: 4px solid #007bff; }
+        .before-after { display: flex; gap: 20px; }
+        .before, .after { flex: 1; }
+        .before { border-left: 4px solid #dc3545; }
+        .after { border-left: 4px solid #28a745; }
+    </style>
+</head>
+<body>
+    <h1>AI Chrome Extension - AI-Driven Intent System</h1>
+    
+    <div class="test-section">
+        <h2>🎯 Revolutionary Change: From Hardcoded to AI-Driven</h2>
+        <div class="before-after">
+            <div class="before">
+                <h3>❌ Before (Hardcoded Logic)</h3>
+                <ul>
+                    <li>Fixed keyword matching</li>
+                    <li>Rigid pattern recognition</li>
+                    <li>Limited to predefined triggers</li>
+                    <li>No context awareness</li>
+                    <li>Difficult to maintain and extend</li>
+                </ul>
+            </div>
+            <div class="after">
+                <h3>✅ After (AI-Driven Intelligence)</h3>
+                <ul>
+                    <li>Dynamic intent classification</li>
+                    <li>Context-aware decision making</li>
+                    <li>Natural language understanding</li>
+                    <li>Adaptive to user patterns</li>
+                    <li>Self-improving system</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+    
+    <div class="test-section">
+        <h2>🧠 How the AI Intent System Works</h2>
+        <ol>
+            <li><strong>User Input:</strong> User types a message in the sidepanel</li>
+            <li><strong>AI Classification:</strong> System sends message to AI for intent analysis</li>
+            <li><strong>Context Analysis:</strong> AI considers current page, URL, and user context</li>
+            <li><strong>Intent Decision:</strong> AI returns classification with confidence and reasoning</li>
+            <li><strong>Smart Routing:</strong> System routes to appropriate handler based on AI decision</li>
+            <li><strong>Personalized Response:</strong> Handler uses AI's reasoning for better user communication</li>
+        </ol>
+    </div>
+    
+    <div class="test-section">
+        <h2>🎮 Test Cases for AI Intent Classification</h2>
+        
+        <div class="example">
+            <h3>YouTube Intent Examples:</h3>
+            <ul>
+                <li><strong>"youtube find yapweijun1996 and play related video"</strong>
+                    <br><span class="info">Expected: YOUTUBE intent with high confidence</span>
+                </li>
+                <li><strong>"show me cooking videos"</strong>
+                    <br><span class="info">Expected: YOUTUBE intent (AI infers video content)</span>
+                </li>
+                <li><strong>"I want to watch tutorials about machine learning"</strong>
+                    <br><span class="info">Expected: YOUTUBE intent (AI understands "watch" context)</span>
+                </li>
+            </ul>
+        </div>
+        
+        <div class="example">
+            <h3>Navigation Intent Examples:</h3>
+            <ul>
+                <li><strong>"take me to google.com"</strong>
+                    <br><span class="info">Expected: NAVIGATION intent</span>
+                </li>
+                <li><strong>"I need to check my email"</strong>
+                    <br><span class="info">Expected: NAVIGATION intent (AI infers need to go to email site)</span>
+                </li>
+                <li><strong>"open the weather website"</strong>
+                    <br><span class="info">Expected: NAVIGATION intent</span>
+                </li>
+            </ul>
+        </div>
+        
+        <div class="example">
+            <h3>Research Intent Examples:</h3>
+            <ul>
+                <li><strong>"what are the latest developments in AI?"</strong>
+                    <br><span class="info">Expected: RESEARCH intent (question pattern)</span>
+                </li>
+                <li><strong>"I need comprehensive information about climate change"</strong>
+                    <br><span class="info">Expected: RESEARCH intent (comprehensive info request)</span>
+                </li>
+                <li><strong>"compare different programming languages"</strong>
+                    <br><span class="info">Expected: RESEARCH intent (comparison request)</span>
+                </li>
+            </ul>
+        </div>
+        
+        <div class="example">
+            <h3>Automation Intent Examples:</h3>
+            <ul>
+                <li><strong>"click the submit button"</strong>
+                    <br><span class="info">Expected: AUTOMATION intent (direct action)</span>
+                </li>
+                <li><strong>"fill out this form for me"</strong>
+                    <br><span class="info">Expected: AUTOMATION intent (form interaction)</span>
+                </li>
+                <li><strong>"scroll down to find more content"</strong>
+                    <br><span class="info">Expected: AUTOMATION intent (page interaction)</span>
+                </li>
+            </ul>
+        </div>
+        
+        <div class="example">
+            <h3>Conversation Intent Examples:</h3>
+            <ul>
+                <li><strong>"how are you today?"</strong>
+                    <br><span class="info">Expected: CONVERSATION intent (casual chat)</span>
+                </li>
+                <li><strong>"explain the concept of machine learning"</strong>
+                    <br><span class="info">Expected: CONVERSATION intent (explanation without web action)</span>
+                </li>
+                <li><strong>"what's the weather like?"</strong>
+                    <br><span class="info">Expected: Could be CONVERSATION or RESEARCH depending on context</span>
+                </li>
+            </ul>
+        </div>
+    </div>
+    
+    <div class="test-section">
+        <h2>🔧 Technical Implementation</h2>
+        <div id="test-results">
+            <p>✅ <strong>buildIntentClassificationPrompt()</strong> - AI prompt for intent analysis</p>
+            <p>✅ <strong>classifyUserIntent()</strong> - AI-powered classification function</p>
+            <p>✅ <strong>processUserMessage()</strong> - Updated to use AI routing</p>
+            <p>✅ <strong>Handler functions</strong> - Enhanced with AI reasoning integration</p>
+            <p>✅ <strong>Background script</strong> - AI task type classification for agent planning</p>
+            <p>✅ <strong>Removed hardcoded logic</strong> - No more shouldTrigger* functions</p>
+        </div>
+    </div>
+    
+    <div class="test-section">
+        <h2>🚀 Key Benefits of AI-Driven Intent System</h2>
+        <ul>
+            <li><strong>Flexibility:</strong> Handles natural language variations and edge cases</li>
+            <li><strong>Context Awareness:</strong> Considers current page and user situation</li>
+            <li><strong>Confidence Scoring:</strong> AI provides confidence levels for decisions</li>
+            <li><strong>Reasoning Transparency:</strong> AI explains why it chose each intent</li>
+            <li><strong>Adaptability:</strong> Can handle new types of requests without code changes</li>
+            <li><strong>User Experience:</strong> More natural, conversational interactions</li>
+            <li><strong>Maintainability:</strong> No more hardcoded rules to maintain</li>
+        </ul>
+    </div>
+    
+    <div class="test-section">
+        <h2>🧪 Testing the System</h2>
+        <ol>
+            <li>Load the extension in Chrome</li>
+            <li>Open the sidepanel</li>
+            <li>Try the example queries above</li>
+            <li>Check the browser console for AI classification logs</li>
+            <li>Observe how the AI explains its reasoning for each intent</li>
+            <li>Notice more natural, context-aware responses</li>
+        </ol>
+        
+        <h3>What to Look For:</h3>
+        <ul>
+            <li>Console logs showing: "AI Intent Classification: {intent, confidence, reasoning}"</li>
+            <li>More personalized responses using AI's suggested actions</li>
+            <li>Better handling of ambiguous or complex requests</li>
+            <li>Appropriate routing even for unconventional phrasings</li>
+        </ul>
+    </div>
+    
+    <div class="test-section">
+        <h2>🎯 Addressing the Original Issue</h2>
+        <p><strong>Problem:</strong> "youtube find yapweijun1996 and play related video" was giving conversational responses instead of taking action.</p>
+        
+        <p><strong>Solution:</strong> The AI now:</p>
+        <ol>
+            <li>Analyzes the request contextually</li>
+            <li>Recognizes YouTube intent with high confidence</li>
+            <li>Routes to specialized YouTube handler</li>
+            <li>Takes concrete actions instead of providing explanations</li>
+            <li>Uses AI reasoning to provide better user feedback</li>
+        </ol>
+        
+        <p class="success"><strong>Result:</strong> Intelligent, action-oriented behavior that adapts to user intent without hardcoded limitations!</p>
+    </div>
+</body>
+</html>

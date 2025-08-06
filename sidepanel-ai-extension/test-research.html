@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Enhanced AI Assistant Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .test-section { margin: 20px 0; padding: 15px; border: 1px solid #ccc; }
+        .success { color: green; }
+        .error { color: red; }
+        button { padding: 10px 15px; margin: 5px; }
+        h3 { color: #333; margin-top: 20px; }
+        ul { margin: 10px 0; }
+        li { margin: 5px 0; }
+    </style>
+</head>
+<body>
+    <h1>AI Chrome Extension - Enhanced Assistant Test</h1>
+    
+    <div class="test-section">
+        <h2>Test Enhanced Intent Detection</h2>
+        <p>Test various queries to see which specialized mode they trigger:</p>
+        
+        <h3>YouTube Actions (Should trigger YouTube mode):</h3>
+        <ul>
+            <li>"youtube find yapweijun1996 and play related video" - YouTube mode</li>
+            <li>"play video about machine learning on youtube" - YouTube mode</li>
+            <li>"search for cooking videos on youtube" - YouTube mode</li>
+            <li>"watch video tutorial" - YouTube mode</li>
+        </ul>
+        
+        <h3>Navigation Actions (Should trigger Navigation mode):</h3>
+        <ul>
+            <li>"go to google.com" - Navigation mode</li>
+            <li>"navigate to wikipedia" - Navigation mode</li>
+            <li>"visit github.com" - Navigation mode</li>
+            <li>"open facebook" - Navigation mode</li>
+        </ul>
+        
+        <h3>Research Queries (Should trigger Research mode):</h3>
+        <ul>
+            <li>"Research the benefits of renewable energy" - Research mode</li>
+            <li>"Find information about artificial intelligence" - Research mode</li>
+            <li>"What is machine learning?" - Research mode</li>
+            <li>"Investigate climate change effects" - Research mode</li>
+        </ul>
+        
+        <h3>General Agent Tasks (Should trigger General Agent mode):</h3>
+        <ul>
+            <li>"Click the login button" - General Agent mode</li>
+            <li>"Fill out the contact form" - General Agent mode</li>
+            <li>"Scroll down to find more content" - General Agent mode</li>
+        </ul>
+    </div>
+    
+    <div class="test-section">
+        <h2>Enhanced AI Assistant Features</h2>
+        <div id="test-results">
+            <p>✅ YouTube-specific action prompts and intent detection</p>
+            <p>✅ Navigation-specific action prompts and intent detection</p>
+            <p>✅ Research prompts added to common/prompts.js</p>
+            <p>✅ Research intent detection added to sidepanel.js</p>
+            <p>✅ Research task decomposition integrated in background.js</p>
+            <p>✅ Specialized prompt selection based on task type</p>
+            <p>✅ Action-oriented behavior instead of conversational responses</p>
+        </div>
+    </div>
+    
+    <div class="test-section">
+        <h2>How to Test</h2>
+        <ol>
+            <li>Load the extension in Chrome</li>
+            <li>Open the sidepanel</li>
+            <li>Try the example queries above</li>
+            <li>The agent should now:
+                <ul>
+                    <li><strong>For YouTube queries:</strong> Navigate to YouTube, search, and interact with videos</li>
+                    <li><strong>For Navigation queries:</strong> Navigate to websites and perform actions</li>
+                    <li><strong>For Research queries:</strong> Systematically gather information from multiple sources</li>
+                    <li><strong>For General queries:</strong> Use standard agent behavior</li>
+                </ul>
+            </li>
+        </ol>
+    </div>
+    
+    <div class="test-section">
+        <h2>Key Improvements Made</h2>
+        <ul>
+            <li><strong>Action-Oriented Behavior:</strong> Agent now takes concrete actions instead of providing explanations</li>
+            <li><strong>YouTube Integration:</strong> Specialized handling for YouTube searches and video interactions</li>
+            <li><strong>Smart Navigation:</strong> Enhanced website navigation and interaction capabilities</li>
+            <li><strong>Research Excellence:</strong> Multi-source information gathering and synthesis</li>
+            <li><strong>Intent Recognition:</strong> Automatically detects the type of task and uses appropriate strategies</li>
+            <li><strong>Personal Assistant Behavior:</strong> More helpful, comprehensive, and action-focused responses</li>
+        </ul>
+    </div>
+    
+    <div class="test-section">
+        <h2>Expected Behavior for "youtube find yapweijun1996 and play related video"</h2>
+        <p>The agent should now:</p>
+        <ol>
+            <li>Detect this as a YouTube task</li>
+            <li>Navigate to youtube.com if not already there</li>
+            <li>Use the search box to search for "yapweijun1996"</li>
+            <li>Click on relevant video results</li>
+            <li>Attempt to play the video</li>
+            <li>Provide updates on progress rather than just explanations</li>
+        </ol>
+        <p><strong>This addresses the issue from the chat log where the agent was providing explanations instead of taking action.</strong></p>
+    </div>
+</body>
+</html>

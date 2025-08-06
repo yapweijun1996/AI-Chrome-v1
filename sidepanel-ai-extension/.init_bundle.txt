@@ -1,0 +1,16 @@
+This file documents the initial scaffold created by the assistant. You can delete it later.
+Files created:
+- background/background.js
+- sidepanel/sidepanel.html
+- sidepanel/sidepanel.css
+- sidepanel/sidepanel.js
+- options/options.html
+- options/options.css
+- options/options.js
+- content/content.js
+- common/api.js
+- common/prompts.js
+- icons/icon16.png (placeholder - base64 1x1)
+- icons/icon32.png (placeholder - base64 1x1)
+- icons/icon48.png (placeholder - base64 1x1)
+- icons/icon128.png (placeholder - base64 1x1)

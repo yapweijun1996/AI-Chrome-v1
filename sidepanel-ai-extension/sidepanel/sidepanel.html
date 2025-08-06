@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>AI Side Panel Agent</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="../sidepanel/sidepanel.css" />
+</head>
+<body>
+<header class="chat-header">
+  <img src="../icons/icon32.png" alt="icon" class="logo" />
+  <h1>AI Assistant</h1>
+  <div class="header-actions">
+    <button id="toggleActivityBtn" title="Toggle Activity Panel" class="icon-btn" aria-pressed="false" aria-controls="activityPanel" aria-label="Toggle agent activity panel">🧭</button>
+    <button id="clearChatBtn" title="Clear chat history" class="icon-btn" aria-label="Clear chat history">🧹</button>
+    <button id="openOptionsBtn" title="Settings" class="icon-btn" aria-label="Settings">⚙️</button>
+    <button id="agentStopBtn" class="stop-btn" title="Emergency STOP" aria-label="Emergency Stop">STOP</button>
+  </div>
+</header>
+
+<!-- Split layout: left chat pane, right activity drawer -->
+<main class="sp-layout" id="spLayout">
+  <section class="sp-chat" id="chatPane" role="region" aria-label="Chat">
+    <div id="chatMessages" class="chat-messages" role="log" aria-live="polite" aria-relevant="additions text" aria-atomic="false"></div>
+    <div class="chat-input-area">
+      <div class="input-controls">
+        <textarea id="chatInput" placeholder="Ask me anything or give me a task to perform..." rows="2" aria-label="Message input"></textarea>
+        <div class="input-actions">
+          <button id="sendBtn" class="send-btn" title="Send message" aria-label="Send message">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false">
+              <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <aside class="sp-activity collapsed" id="activityPanel" role="region" aria-label="Agent Activity">
+    <header class="sp-activity-header">
+      <strong>Agent Activity</strong>
+      <div class="sp-activity-actions">
+        <select id="activityFilter" class="filter-select" aria-label="Filter logs">
+          <option value="all">All</option>
+          <option value="info">Info</option>
+          <option value="warn">Warnings</option>
+          <option value="error">Errors</option>
+          <option value="success">Success</option>
+        </select>
+        <input id="activitySearch" class="search-input" type="search" placeholder="Search logs..." aria-label="Search logs" />
+        <button id="collapseActivityBtn" class="icon-btn" title="Collapse" aria-label="Collapse activity panel">⮜</button>
+      </div>
+    </header>
+    <div class="sp-activity-body" id="activityBody">
+      <!-- Grouped log container -->
+      <div id="activityGroups"></div>
+    </div>
+    <footer class="sp-activity-footer">
+      <small class="muted">Live updates while agent runs</small>
+    </footer>
+  </aside>
+</main>
+
+  <!-- Agent Mode Modal -->
+  <div id="agentModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>Agent Mode Settings</h3>
+        <button id="closeAgentModal" class="close-btn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="agentGoal">Goal</label>
+          <input id="agentGoal" type="text" placeholder="Describe what you want me to do..." />
+        </div>
+        <div class="toggles">
+          <label class="toggle"><input id="allowCrossDomain" type="checkbox" checked /> Cross-domain navigation</label>
+          <label class="toggle"><input id="allowTabMgmt" type="checkbox" checked /> Tab management</label>
+          <label class="toggle"><input id="autoScreenshots" type="checkbox" /> Auto screenshots</label>
+          <label class="toggle compact">Max steps <input id="maxSteps" type="number" value="12" min="1" max="50" /></label>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="agentStartBtn" class="primary">Start Agent</button>
+        <button id="cancelAgentBtn" class="secondary">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tasks Modal -->
+  <div id="tasksModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>Task Manager</h3>
+        <button id="closeTasksModal" class="close-btn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="todo-inputs">
+          <input id="taskTitle" type="text" placeholder="New task title" />
+          <button id="addTaskBtn">Add</button>
+        </div>
+        <ul id="taskList" class="task-list"></ul>
+      </div>
+    </div>
+  </div>
+
+  <script src="../common/messages.js"></script>
+  <script src="../common/prompts.js"></script>
+  <script src="../sidepanel/sidepanel.js" type="module"></script>
+</body>
+</html>

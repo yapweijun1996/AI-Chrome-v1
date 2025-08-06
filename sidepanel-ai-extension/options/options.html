@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AI Side Panel Options</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <div class="container">
+    <h1>Settings</h1>
+    
+    <!-- API Keys Section -->
+    <section class="api-keys-section">
+      <h2>API Keys</h2>
+      <p class="help-text">Add multiple API keys for automatic rotation when one reaches its limit or fails.</p>
+      
+      <div class="add-key-form">
+        <div class="form-group">
+          <label for="newApiKey">New API Key</label>
+          <input type="password" id="newApiKey" placeholder="Enter Gemini API Key">
+        </div>
+        <div class="form-group">
+          <label for="keyName">Key Name (optional)</label>
+          <input type="text" id="keyName" placeholder="e.g. Personal Key, Work Key">
+        </div>
+        <button id="addKeyBtn" type="button">Add Key</button>
+      </div>
+
+      <div class="keys-list">
+        <h3>Current Keys</h3>
+        <div id="keysList" class="keys-container">
+          <!-- Keys will be populated here -->
+        </div>
+      </div>
+      
+      <div class="key-stats">
+        <h3>Key Statistics</h3>
+        <div id="keyStats" class="stats-container">
+          <!-- Stats will be populated here -->
+        </div>
+        <div class="validation-controls">
+          <button id="validateAllBtn" type="button" class="validate-btn">Validate All Keys</button>
+          <button id="resetAllBtn" type="button" class="reset-btn">Reset All Keys</button>
+          <span id="validationStatus" class="validation-status"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Model Section -->
+    <section class="model-section">
+      <h2>Model Settings</h2>
+      <div class="form-group">
+        <label for="modelSelect">Default Model</label>
+        <select id="modelSelect">
+          <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite</option>
+          <option value="gemini-2.5-flash">gemini-2.5-flash (default)</option>
+          <option value="gemma-3-27b-it">gemma-3-27b-it</option>
+          <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+          <option value="gemini-1.5-flash">gemini-1.5-flash</option>
+          <option value="gemini-1.5-pro">gemini-1.5-pro</option>
+        </select>
+      </div>
+    </section>
+
+    <div class="form-group">
+      <button id="saveBtn">Save Settings</button>
+    </div>
+    <p id="status"></p>
+  </div>
+  <script src="../common/messages.js"></script>
+  <script src="../common/api.js"></script>
+  <script src="../common/api-key-manager.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>
