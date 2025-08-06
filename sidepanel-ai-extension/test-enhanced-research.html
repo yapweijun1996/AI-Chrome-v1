@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Enhanced Research Agent Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        .test-section {
+            background: #f5f5f5;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 5px;
+        }
+        .improvement {
+            background: #e8f5e8;
+            padding: 10px;
+            margin: 10px 0;
+            border-left: 4px solid #4CAF50;
+        }
+        .before-after {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin: 15px 0;
+        }
+        .before, .after {
+            padding: 15px;
+            border-radius: 5px;
+        }
+        .before {
+            background: #ffe6e6;
+            border-left: 4px solid #f44336;
+        }
+        .after {
+            background: #e6f7ff;
+            border-left: 4px solid #2196F3;
+        }
+        code {
+            background: #f0f0f0;
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+        }
+        .feature-list {
+            list-style-type: none;
+            padding: 0;
+        }
+        .feature-list li {
+            padding: 8px 0;
+            border-bottom: 1px solid #eee;
+        }
+        .feature-list li:before {
+            content: "✅ ";
+            color: #4CAF50;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔬 Enhanced AI Research Agent - Test & Validation</h1>
+    
+    <div class="test-section">
+        <h2>🎯 Research Logic Improvements Summary</h2>
+        <p>The AI agent research logic has been significantly enhanced to be more human-like and intelligent with automatic URL reading capabilities.</p>
+    </div>
+
+    <div class="test-section">
+        <h2>🔍 Key Issues Identified & Fixed</h2>
+        
+        <div class="before-after">
+            <div class="before">
+                <h3>❌ Before (Issues)</h3>
+                <ul>
+                    <li>Basic text extraction using only <code>document.body.innerText</code></li>
+                    <li>No automatic URL analysis or discovery</li>
+                    <li>Limited content processing - missed links, metadata</li>
+                    <li>No smart URL reading or content fetching</li>
+                    <li>Not human-like - couldn't follow URLs automatically</li>
+                    <li>Simple prompts without context awareness</li>
+                </ul>
+            </div>
+            
+            <div class="after">
+                <h3>✅ After (Enhanced)</h3>
+                <ul>
+                    <li>Structured content extraction with metadata</li>
+                    <li>Automatic URL discovery and analysis</li>
+                    <li>Smart link extraction and relevance scoring</li>
+                    <li>Intelligent URL content fetching</li>
+                    <li>Human-like research behavior</li>
+                    <li>Context-aware prompts with URL intelligence</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <div class="test-section">
+        <h2>🚀 New Enhanced Features</h2>
+        
+        <ul class="feature-list">
+            <li><strong>Smart Content Extraction</strong> - Enhanced <code>getPageText()</code> now extracts title, description, main content, links, and metadata</li>
+            <li><strong>URL Analysis</strong> - New <code>analyzePageUrls()</code> categorizes and scores URLs for research relevance</li>
+            <li><strong>Link Intelligence</strong> - <code>getPageLinks()</code> extracts and ranks links by research value</li>
+            <li><strong>Automatic URL Reading</strong> - <code>fetchUrlContent()</code> can automatically read content from discovered URLs</li>
+            <li><strong>Smart Navigation</strong> - <code>determineSearchUrl()</code> intelligently chooses the best search strategy</li>
+            <li><strong>Research Tools</strong> - New tools: <code>smart_navigate</code>, <code>research_url</code>, <code>analyze_urls</code>, <code>get_page_links</code></li>
+            <li><strong>Enhanced Prompts</strong> - Context-aware prompts that understand page types and URL patterns</li>
+            <li><strong>Human-like Behavior</strong> - Agent now automatically follows relevant URLs like a human researcher</li>
+        </ul>
+    </div>
+
+    <div class="test-section">
+        <h2>🧠 Intelligent Research Capabilities</h2>
+        
+        <div class="improvement">
+            <h3>🔗 Automatic URL Discovery</h3>
+            <p>The agent now automatically:</p>
+            <ul>
+                <li>Discovers URLs in page content using regex patterns</li>
+                <li>Extracts all links with context and relevance scoring</li>
+                <li>Categorizes URLs by type (academic, news, social, etc.)</li>
+                <li>Identifies research-relevant domains and sources</li>
+            </ul>
+        </div>
+
+        <div class="improvement">
+            <h3>🎯 Smart Content Processing</h3>
+            <p>Enhanced content extraction includes:</p>
+            <ul>
+                <li>Structured content with title, description, main content</li>
+                <li>Metadata extraction from meta tags</li>
+                <li>Clean text processing removing ads and navigation</li>
+                <li>Link context analysis for better understanding</li>
+            </ul>
+        </div>
+
+        <div class="improvement">
+            <h3>🤖 Human-like Research Behavior</h3>
+            <p>The agent now behaves more like a human researcher:</p>
+            <ul>
+                <li>Automatically follows relevant URLs found in content</li>
+                <li>Prioritizes authoritative sources (edu, gov, academic)</li>
+                <li>Cross-references information from multiple sources</li>
+                <li>Adapts search strategy based on content type</li>
+            </ul>
+        </div>
+    </div>
+
+    <div class="test-section">
+        <h2>🔧 Technical Implementation</h2>
+        
+        <h3>📁 Files Modified:</h3>
+        <ul>
+            <li><code>content/content.js</code> - Enhanced content extraction and URL analysis</li>
+            <li><code>background/background.js</code> - New research tools and smart navigation</li>
+            <li><code>common/prompts.js</code> - Intelligent research prompts with context awareness</li>
+            <li><code>common/messages.js</code> - New message types for enhanced functionality</li>
+            <li><code>common/planner.js</code> - Updated planning with new research tools</li>
+        </ul>
+
+        <h3>🛠️ New Functions Added:</h3>
+        <ul>
+            <li><code>extractStructuredContent()</code> - Rich content extraction</li>
+            <li><code>analyzePageUrls()</code> - URL discovery and analysis</li>
+            <li><code>getPageLinks()</code> - Smart link extraction</li>
+            <li><code>fetchUrlContent()</code> - Automatic URL content reading</li>
+            <li><code>determineSearchUrl()</code> - Intelligent search strategy</li>
+            <li><code>categorizePageForResearch()</code> - Page type classification</li>
+        </ul>
+    </div>
+
+    <div class="test-section">
+        <h2>🧪 Testing Instructions</h2>
+        
+        <ol>
+            <li><strong>Load the Extension</strong> - Reload the enhanced extension in Chrome</li>
+            <li><strong>Test Research Query</strong> - Try: "Research the benefits of renewable energy"</li>
+            <li><strong>Observe Behavior</strong> - Watch how the agent:
+                <ul>
+                    <li>Automatically navigates to relevant sources</li>
+                    <li>Extracts structured content from each page</li>
+                    <li>Discovers and follows relevant URLs</li>
+                    <li>Synthesizes information from multiple sources</li>
+                </ul>
+            </li>
+            <li><strong>Compare Results</strong> - Notice the improved depth and quality of research</li>
+        </ol>
+    </div>
+
+    <div class="test-section">
+        <h2>📊 Expected Improvements</h2>
+        
+        <div class="improvement">
+            <h3>🎯 Research Quality</h3>
+            <ul>
+                <li>More comprehensive information gathering</li>
+                <li>Better source diversity and authority</li>
+                <li>Automatic cross-referencing of facts</li>
+                <li>Deeper analysis with multiple perspectives</li>
+            </ul>
+        </div>
+
+        <div class="improvement">
+            <h3>🤖 Agent Intelligence</h3>
+            <ul>
+                <li>Human-like browsing patterns</li>
+                <li>Automatic URL following and exploration</li>
+                <li>Context-aware decision making</li>
+                <li>Adaptive research strategies</li>
+            </ul>
+        </div>
+
+        <div class="improvement">
+            <h3>⚡ Efficiency</h3>
+            <ul>
+                <li>Faster information discovery</li>
+                <li>Reduced manual intervention needed</li>
+                <li>Better resource utilization</li>
+                <li>More targeted search strategies</li>
+            </ul>
+        </div>
+    </div>
+
+    <div class="test-section">
+        <h2>✅ Validation Checklist</h2>
+        
+        <p>Test these scenarios to validate the improvements:</p>
+        
+        <ul>
+            <li>□ Agent automatically discovers URLs in page content</li>
+            <li>□ Agent follows relevant links without manual instruction</li>
+            <li>□ Enhanced content extraction includes metadata and structure</li>
+            <li>□ Smart navigation chooses appropriate search engines/sites</li>
+            <li>□ Research reports are more comprehensive and detailed</li>
+            <li>□ Agent behavior is more human-like and intelligent</li>
+            <li>□ Multiple sources are automatically consulted</li>
+            <li>□ URL content is automatically read and analyzed</li>
+        </ul>
+    </div>
+
+    <div class="test-section">
+        <h2>🎉 Conclusion</h2>
+        <p>The AI agent research logic has been transformed from a basic text extraction system to an intelligent, human-like research assistant that automatically reads URLs, analyzes content, and conducts comprehensive multi-source research. The agent now behaves more like a skilled human researcher, automatically discovering and following relevant information sources.</p>
+    </div>
+
+    <!-- Test Links for Validation -->
+    <div class="test-section">
+        <h2>🔗 Test Links (for URL Discovery Testing)</h2>
+        <p>These links should be automatically discovered and analyzed by the enhanced agent:</p>
+        <ul>
+            <li><a href="https://en.wikipedia.org/wiki/Renewable_energy">Wikipedia: Renewable Energy</a></li>
+            <li><a href="https://www.energy.gov/renewable-energy">US Department of Energy</a></li>
+            <li><a href="https://scholar.google.com/scholar?q=renewable+energy+benefits">Google Scholar Research</a></li>
+            <li><a href="https://www.nature.com/subjects/energy-and-society">Nature: Energy Research</a></li>
+        </ul>
+        
+        <p>URLs in text content: https://www.iea.org/reports/renewable-energy-market-update and https://www.irena.org/publications should also be discovered automatically.</p>
+    </div>
+
+</body>
+</html>

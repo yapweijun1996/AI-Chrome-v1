@@ -18,12 +18,126 @@
     SCROLL_TO_SELECTOR: "SCROLL_TO_SELECTOR",
     WAIT_FOR_SELECTOR: "WAIT_FOR_SELECTOR",
     GET_PAGE_INFO: "GET_PAGE_INFO",
-    GET_INTERACTIVE_ELEMENTS: "GET_INTERACTIVE_ELEMENTS"
+    GET_INTERACTIVE_ELEMENTS: "GET_INTERACTIVE_ELEMENTS",
+    EXTRACT_STRUCTURED_CONTENT: "EXTRACT_STRUCTURED_CONTENT",
+    ANALYZE_PAGE_URLS: "ANALYZE_PAGE_URLS",
+    FETCH_URL_CONTENT: "FETCH_URL_CONTENT",
+    GET_PAGE_LINKS: "GET_PAGE_LINKS"
   };
 
 function getPageText(maxChars = 20000) {
-  // A simple text extraction. A more robust solution would handle invisible elements, etc.
-  return document.body.innerText.trim().slice(0, maxChars);
+  // Enhanced text extraction with structured content
+  const content = extractStructuredContent();
+  const textContent = [
+    content.title ? `Title: ${content.title}` : '',
+    content.description ? `Description: ${content.description}` : '',
+    content.mainContent,
+    content.links.length > 0 ? `\nRelevant Links:\n${content.links.slice(0, 10).map(l => `- ${l.text}: ${l.url}`).join('\n')}` : '',
+    content.metadata.length > 0 ? `\nPage Metadata:\n${content.metadata.join('\n')}` : ''
+  ].filter(Boolean).join('\n\n');
+  
+  return textContent.trim().slice(0, maxChars);
+}
+
+function extractStructuredContent() {
+  const content = {
+    title: document.title || '',
+    description: '',
+    mainContent: '',
+    links: [],
+    metadata: [],
+    urls: []
+  };
+
+  // Extract meta description
+  const metaDesc = document.querySelector('meta[name="description"]');
+  if (metaDesc) {
+    content.description = metaDesc.getAttribute('content') || '';
+  }
+
+  // Extract main content with better text processing
+  const mainContentSelectors = [
+    'main', 'article', '[role="main"]', '.content', '.main-content',
+    '.post-content', '.entry-content', '.article-content'
+  ];
+  
+  let mainElement = null;
+  for (const selector of mainContentSelectors) {
+    mainElement = document.querySelector(selector);
+    if (mainElement) break;
+  }
+  
+  if (!mainElement) {
+    mainElement = document.body;
+  }
+
+  // Get clean text content
+  content.mainContent = getCleanTextContent(mainElement);
+
+  // Extract relevant links
+  const links = Array.from(document.querySelectorAll('a[href]'))
+    .filter(link => {
+      const href = link.href;
+      const text = link.textContent.trim();
+      return href && text &&
+             !href.startsWith('javascript:') &&
+             !href.startsWith('#') &&
+             text.length > 3 &&
+             text.length < 200;
+    })
+    .map(link => ({
+      text: link.textContent.trim(),
+      url: link.href,
+      isExternal: !link.href.startsWith(window.location.origin)
+    }))
+    .slice(0, 20);
+
+  content.links = links;
+
+  // Extract URLs from text content
+  content.urls = extractUrlsFromText(content.mainContent);
+
+  // Extract metadata
+  const metaTags = Array.from(document.querySelectorAll('meta[name], meta[property]'));
+  content.metadata = metaTags
+    .filter(meta => {
+      const name = meta.getAttribute('name') || meta.getAttribute('property');
+      return name && !name.startsWith('twitter:') && !name.startsWith('fb:');
+    })
+    .map(meta => {
+      const name = meta.getAttribute('name') || meta.getAttribute('property');
+      const content = meta.getAttribute('content');
+      return `${name}: ${content}`;
+    })
+    .slice(0, 10);
+
+  return content;
+}
+
+function getCleanTextContent(element) {
+  // Clone the element to avoid modifying the original
+  const clone = element.cloneNode(true);
+  
+  // Remove script and style elements
+  const unwantedElements = clone.querySelectorAll('script, style, nav, header, footer, .ad, .advertisement, .sidebar');
+  unwantedElements.forEach(el => el.remove());
+  
+  // Get text content and clean it up
+  let text = clone.innerText || clone.textContent || '';
+  
+  // Clean up whitespace and formatting
+  text = text
+    .replace(/\s+/g, ' ')  // Replace multiple whitespace with single space
+    .replace(/\n\s*\n/g, '\n')  // Remove empty lines
+    .trim();
+    
+  return text;
+}
+
+function extractUrlsFromText(text) {
+  const urlRegex = /https?:\/\/[^\s<>"{}|\\^`[\]]+/gi;
+  const urls = text.match(urlRegex) || [];
+  return [...new Set(urls)].slice(0, 10); // Remove duplicates and limit
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -64,6 +178,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         case MSG.GET_INTERACTIVE_ELEMENTS: {
           handleGetInteractiveElements(message, sendResponse);
+          break;
+        }
+        case MSG.EXTRACT_STRUCTURED_CONTENT: {
+          handleExtractStructuredContent(message, sendResponse);
+          break;
+        }
+        case MSG.ANALYZE_PAGE_URLS: {
+          handleAnalyzePageUrls(message, sendResponse);
+          break;
+        }
+        case MSG.FETCH_URL_CONTENT: {
+          handleFetchUrlContent(message, sendResponse);
+          break;
+        }
+        case MSG.GET_PAGE_LINKS: {
+          handleGetPageLinks(message, sendResponse);
           break;
         }
         default:
@@ -372,6 +502,289 @@ function generateSelector(element) {
   }
 
   return path || element.tagName.toLowerCase(); // Final fallback
+}
+
+// New enhanced handlers for smart URL processing and research
+
+function handleExtractStructuredContent(message, sendResponse) {
+  try {
+    const content = extractStructuredContent();
+    sendResponse({ ok: true, content });
+  } catch (error) {
+    sendResponse({ ok: false, error: error.message });
+  }
+}
+
+function handleAnalyzePageUrls(message, sendResponse) {
+  try {
+    const analysis = analyzePageUrls();
+    sendResponse({ ok: true, analysis });
+  } catch (error) {
+    sendResponse({ ok: false, error: error.message });
+  }
+}
+
+function handleFetchUrlContent(message, sendResponse) {
+  try {
+    const { url, maxChars = 5000 } = message;
+    if (!url) {
+      return sendResponse({ ok: false, error: "No URL provided" });
+    }
+    
+    // Use fetch to get URL content (subject to CORS)
+    fetchUrlContent(url, maxChars)
+      .then(content => sendResponse({ ok: true, content }))
+      .catch(error => sendResponse({ ok: false, error: error.message }));
+      
+  } catch (error) {
+    sendResponse({ ok: false, error: error.message });
+  }
+}
+
+function handleGetPageLinks(message, sendResponse) {
+  try {
+    const { includeExternal = true, maxLinks = 50 } = message;
+    const links = getPageLinks(includeExternal, maxLinks);
+    sendResponse({ ok: true, links });
+  } catch (error) {
+    sendResponse({ ok: false, error: error.message });
+  }
+}
+
+function analyzePageUrls() {
+  const analysis = {
+    currentUrl: window.location.href,
+    domain: window.location.hostname,
+    urlType: categorizeUrl(window.location.href),
+    discoveredUrls: [],
+    relevantLinks: [],
+    externalDomains: new Set(),
+    urlPatterns: []
+  };
+
+  // Extract all URLs from page content
+  const allText = document.body.innerText || document.body.textContent || '';
+  const urlsInText = extractUrlsFromText(allText);
+  
+  // Get all links from the page
+  const links = Array.from(document.querySelectorAll('a[href]'))
+    .map(link => ({
+      url: link.href,
+      text: link.textContent.trim(),
+      isExternal: !link.href.startsWith(window.location.origin),
+      context: getUrlContext(link)
+    }))
+    .filter(link => link.url && link.text);
+
+  analysis.discoveredUrls = [...new Set([...urlsInText, ...links.map(l => l.url)])];
+  analysis.relevantLinks = links.slice(0, 20);
+  
+  // Analyze external domains
+  links.forEach(link => {
+    if (link.isExternal) {
+      try {
+        const domain = new URL(link.url).hostname;
+        analysis.externalDomains.add(domain);
+      } catch (e) {
+        // Invalid URL, skip
+      }
+    }
+  });
+  
+  analysis.externalDomains = Array.from(analysis.externalDomains);
+  
+  // Identify URL patterns for research
+  analysis.urlPatterns = identifyUrlPatterns(analysis.discoveredUrls);
+  
+  return analysis;
+}
+
+function categorizeUrl(url) {
+  try {
+    const urlObj = new URL(url);
+    const hostname = urlObj.hostname.toLowerCase();
+    const pathname = urlObj.pathname.toLowerCase();
+    
+    // Research-relevant site categories
+    if (hostname.includes('wikipedia.org')) return 'encyclopedia';
+    if (hostname.includes('youtube.com') || hostname.includes('youtu.be')) return 'video';
+    if (hostname.includes('google.com')) return 'search_engine';
+    if (hostname.includes('github.com')) return 'code_repository';
+    if (hostname.includes('stackoverflow.com')) return 'qa_forum';
+    if (hostname.includes('reddit.com')) return 'social_forum';
+    if (hostname.includes('news') || hostname.includes('bbc.com') || hostname.includes('cnn.com')) return 'news';
+    if (hostname.includes('edu')) return 'academic';
+    if (hostname.includes('gov')) return 'government';
+    if (pathname.includes('blog')) return 'blog';
+    if (pathname.includes('article')) return 'article';
+    
+    return 'general';
+  } catch (e) {
+    return 'unknown';
+  }
+}
+
+function getUrlContext(linkElement) {
+  // Get surrounding text context for the link
+  const parent = linkElement.parentElement;
+  if (!parent) return '';
+  
+  const parentText = parent.textContent || '';
+  const linkText = linkElement.textContent || '';
+  const linkIndex = parentText.indexOf(linkText);
+  
+  if (linkIndex === -1) return parentText.substring(0, 100);
+  
+  const start = Math.max(0, linkIndex - 50);
+  const end = Math.min(parentText.length, linkIndex + linkText.length + 50);
+  
+  return parentText.substring(start, end).trim();
+}
+
+function identifyUrlPatterns(urls) {
+  const patterns = {
+    research_sources: [],
+    social_media: [],
+    documentation: [],
+    news_articles: [],
+    academic_papers: []
+  };
+  
+  urls.forEach(url => {
+    try {
+      const urlObj = new URL(url);
+      const hostname = urlObj.hostname.toLowerCase();
+      
+      if (hostname.includes('wikipedia') || hostname.includes('britannica') || hostname.includes('edu')) {
+        patterns.research_sources.push(url);
+      } else if (hostname.includes('twitter') || hostname.includes('facebook') || hostname.includes('linkedin')) {
+        patterns.social_media.push(url);
+      } else if (hostname.includes('docs.') || hostname.includes('documentation') || hostname.includes('api.')) {
+        patterns.documentation.push(url);
+      } else if (hostname.includes('news') || hostname.includes('article') || hostname.includes('blog')) {
+        patterns.news_articles.push(url);
+      } else if (hostname.includes('arxiv') || hostname.includes('scholar') || hostname.includes('researchgate')) {
+        patterns.academic_papers.push(url);
+      }
+    } catch (e) {
+      // Invalid URL, skip
+    }
+  });
+  
+  return patterns;
+}
+
+async function fetchUrlContent(url, maxChars = 5000) {
+  try {
+    // Note: This will be subject to CORS restrictions
+    // For a full implementation, you'd need a proxy or background script
+    const response = await fetch(url, {
+      method: 'GET',
+      mode: 'cors',
+      headers: {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      }
+    });
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+    
+    const text = await response.text();
+    
+    // Parse HTML and extract meaningful content
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(text, 'text/html');
+    
+    // Remove scripts and styles
+    const scripts = doc.querySelectorAll('script, style');
+    scripts.forEach(el => el.remove());
+    
+    const content = {
+      url: url,
+      title: doc.title || '',
+      description: '',
+      text: (doc.body?.innerText || doc.body?.textContent || '').substring(0, maxChars),
+      links: Array.from(doc.querySelectorAll('a[href]')).slice(0, 10).map(a => ({
+        text: a.textContent.trim(),
+        href: a.href
+      }))
+    };
+    
+    // Try to get meta description
+    const metaDesc = doc.querySelector('meta[name="description"]');
+    if (metaDesc) {
+      content.description = metaDesc.getAttribute('content') || '';
+    }
+    
+    return content;
+    
+  } catch (error) {
+    throw new Error(`Failed to fetch URL content: ${error.message}`);
+  }
+}
+
+function getPageLinks(includeExternal = true, maxLinks = 50) {
+  const links = Array.from(document.querySelectorAll('a[href]'))
+    .filter(link => {
+      const href = link.href;
+      const text = link.textContent.trim();
+      
+      if (!href || !text) return false;
+      if (href.startsWith('javascript:') || href.startsWith('#')) return false;
+      if (!includeExternal && !href.startsWith(window.location.origin)) return false;
+      
+      return true;
+    })
+    .map(link => ({
+      text: link.textContent.trim(),
+      url: link.href,
+      isExternal: !link.href.startsWith(window.location.origin),
+      context: getUrlContext(link),
+      category: categorizeUrl(link.href),
+      relevanceScore: calculateLinkRelevance(link)
+    }))
+    .sort((a, b) => b.relevanceScore - a.relevanceScore)
+    .slice(0, maxLinks);
+    
+  return links;
+}
+
+function calculateLinkRelevance(linkElement) {
+  let score = 0;
+  const text = linkElement.textContent.trim().toLowerCase();
+  const href = linkElement.href.toLowerCase();
+  
+  // Higher score for research-relevant keywords
+  const researchKeywords = ['research', 'study', 'analysis', 'report', 'data', 'statistics', 'academic', 'paper', 'article', 'documentation', 'guide', 'tutorial'];
+  researchKeywords.forEach(keyword => {
+    if (text.includes(keyword) || href.includes(keyword)) {
+      score += 2;
+    }
+  });
+  
+  // Higher score for authoritative domains
+  const authoritativeDomains = ['wikipedia.org', 'edu', 'gov', 'scholar.google', 'arxiv.org', 'researchgate.net'];
+  authoritativeDomains.forEach(domain => {
+    if (href.includes(domain)) {
+      score += 3;
+    }
+  });
+  
+  // Lower score for social media and ads
+  const lowValueDomains = ['facebook.com', 'twitter.com', 'instagram.com', 'ads', 'advertisement'];
+  lowValueDomains.forEach(domain => {
+    if (href.includes(domain)) {
+      score -= 2;
+    }
+  });
+  
+  // Higher score for longer, more descriptive text
+  if (text.length > 20 && text.length < 100) {
+    score += 1;
+  }
+  
+  return Math.max(0, score);
 }
 
 })(); // End of IIFE guard

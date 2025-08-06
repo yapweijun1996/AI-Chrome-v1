@@ -47,6 +47,11 @@ const { MSG, PARAM_LIMITS, TIMEOUTS, ERROR_TYPES, LOG_LEVELS, API_KEY_ROTATION }
 // Simple in-memory agent sessions keyed by tabId
 const agentSessions = new Map(); // tabId -> { running, stopped, step, goal, subTasks: [], currentTaskIndex: 0, settings, logs: [], history: [], lastAction, lastObservation }
 
+// Progress message throttling to prevent chat spam
+const progressThrottle = new Map(); // tabId -> { lastProgressTime, messageCount, lastMessage }
+const PROGRESS_THROTTLE_MS = 2000; // Minimum 2 seconds between progress messages
+const MAX_PROGRESS_BURST = 3; // Maximum 3 messages in quick succession
+
 // Session persistence functions for service worker restarts
 async function saveSessionToStorage(tabId, session) {
   try {
@@ -416,6 +421,203 @@ function emitAgentLog(tabId, entry) {
   try {
     chrome.runtime.sendMessage({ type: MSG.AGENT_LOG, tabId, entry: logEntry });
   } catch (_) {}
+
+  // Send progress updates to chat for key events (with throttling)
+  if (shouldSendProgressToChat(entry)) {
+    const progressMessage = formatProgressMessage(entry, sess);
+    // Only send if we have a valid message (formatProgressMessage can return null to skip)
+    if (progressMessage && shouldThrottleProgressMessage(tabId, progressMessage)) {
+      try {
+        chrome.runtime.sendMessage({
+          type: MSG.AGENT_PROGRESS,
+          tabId,
+          message: progressMessage,
+          step: Math.max(1, sess.step ?? 1),
+          timestamp: Date.now()
+        });
+      } catch (_) {}
+    }
+  }
+}
+
+// Throttle progress messages to prevent chat spam
+function shouldThrottleProgressMessage(tabId, message) {
+  const now = Date.now();
+  const throttleData = progressThrottle.get(tabId) || {
+    lastProgressTime: 0,
+    messageCount: 0,
+    lastMessage: ''
+  };
+  
+  // Don't send duplicate messages
+  if (throttleData.lastMessage === message) {
+    return false;
+  }
+  
+  // Reset message count if enough time has passed
+  if (now - throttleData.lastProgressTime > PROGRESS_THROTTLE_MS * 2) {
+    throttleData.messageCount = 0;
+  }
+  
+  // Check if we should throttle based on time and burst limit
+  const timeSinceLastMessage = now - throttleData.lastProgressTime;
+  const shouldThrottle = timeSinceLastMessage < PROGRESS_THROTTLE_MS &&
+                        throttleData.messageCount >= MAX_PROGRESS_BURST;
+  
+  if (!shouldThrottle) {
+    // Update throttle data
+    throttleData.lastProgressTime = now;
+    throttleData.messageCount++;
+    throttleData.lastMessage = message;
+    progressThrottle.set(tabId, throttleData);
+    return true;
+  }
+  
+  return false;
+}
+
+// Determine which log entries should be sent as chat progress updates
+function shouldSendProgressToChat(entry) {
+  // Always send errors (they're important)
+  if (entry.level === LOG_LEVELS.ERROR) return true;
+  
+  // Send progress for key milestones and important events
+  if (entry.level === LOG_LEVELS.INFO && entry.msg) {
+    const msg = entry.msg.toLowerCase();
+    // Key progress indicators - be more selective
+    if (msg.includes('agent started') ||
+        msg.includes('plan generated') ||
+        msg.includes('executing tool') ||
+        msg.includes('multi-search initiated') ||
+        msg.includes('report generated')) {
+      return true;
+    }
+    
+    // Skip generic "completed" messages to reduce noise
+    if (msg.includes('completed') && !msg.includes('plan completed')) {
+      return false;
+    }
+  }
+  
+  // Send success messages for important tools only
+  if (entry.level === LOG_LEVELS.SUCCESS && entry.tool) {
+    const importantTools = ['navigate', 'smart_navigate', 'research_url', 'multi_search', 'generate_report'];
+    if (importantTools.includes(entry.tool)) {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+// Format log entries into user-friendly chat messages
+function formatProgressMessage(entry, sess) {
+  const step = Math.max(1, sess.step ?? 1); // Ensure step starts at 1, not 0
+  const maxSteps = sess.settings?.maxSteps || 12;
+  const stepPrefix = `[Step ${step}/${maxSteps}]`;
+  
+  // Handle different types of progress messages
+  if (entry.level === LOG_LEVELS.ERROR) {
+    return `${stepPrefix} ❌ Error: ${entry.msg || 'Something went wrong'}`;
+  }
+  
+  const msg = entry.msg || '';
+  
+  // Agent lifecycle messages (no step prefix for these)
+  if (msg.includes('Agent started')) {
+    return `🚀 Agent started working on your task...`;
+  }
+  
+  if (msg.includes('plan generated') || msg.includes('Multi-step plan generated')) {
+    const planCount = entry.plan?.length || 'several';
+    return `📋 Generated plan with ${planCount} steps`;
+  }
+  
+  // Tool execution messages - be more specific about what's happening
+  if (msg.includes('Executing Tool')) {
+    const tool = entry.tool || entry.action?.tool || 'action';
+    return `${stepPrefix} 🔧 ${getToolEmoji(tool)} ${getToolDescription(tool)}`;
+  }
+  
+  // Action completion messages - only show for important tools
+  if (entry.level === LOG_LEVELS.SUCCESS && entry.tool) {
+    const importantTools = ['navigate', 'smart_navigate', 'research_url', 'multi_search', 'generate_report'];
+    if (importantTools.includes(entry.tool)) {
+      return `${stepPrefix} ✅ ${getToolDescription(entry.tool)} completed`;
+    }
+  }
+  
+  // Navigation messages
+  if (msg.includes('Navigated to') || msg.includes('Navigation')) {
+    return `${stepPrefix} 🌐 Navigating to new page...`;
+  }
+  
+  // Search and analysis messages
+  if (msg.includes('searching') || msg.includes('Multi-search')) {
+    return `${stepPrefix} 🔍 Searching for information...`;
+  }
+  
+  if (msg.includes('analyzing') || msg.includes('URL analysis')) {
+    return `${stepPrefix} 🔍 Analyzing page content...`;
+  }
+  
+  // Don't show generic "completed" messages to reduce noise
+  if (msg.includes('completed') || msg.includes('finished')) {
+    return null; // Skip generic completion messages
+  }
+  
+  if (msg.includes('found') && entry.observation) {
+    return `${stepPrefix} 📍 Found relevant information`;
+  }
+  
+  if (msg.includes('report generated')) {
+    return `${stepPrefix} 📄 Generated summary report`;
+  }
+  
+  // Generic progress message
+  return `${stepPrefix} ⚡ ${msg}`;
+}
+
+// Get emoji for different tools
+function getToolEmoji(tool) {
+  const emojiMap = {
+    'navigate': '🌐',
+    'click': '👆',
+    'fill': '✏️',
+    'scroll': '📜',
+    'screenshot': '📸',
+    'waitForSelector': '⏳',
+    'tabs.query': '🗂️',
+    'tabs.activate': '🔄',
+    'tabs.close': '❌',
+    'smart_navigate': '🧭',
+    'research_url': '🔬',
+    'multi_search': '🔍',
+    'analyze_urls': '🔍',
+    'generate_report': '📄'
+  };
+  return emojiMap[tool] || '🔧';
+}
+
+// Get user-friendly description for tools
+function getToolDescription(tool) {
+  const descriptionMap = {
+    'navigate': 'Opening webpage',
+    'click': 'Clicking element',
+    'fill': 'Filling form field',
+    'scroll': 'Scrolling page',
+    'screenshot': 'Taking screenshot',
+    'waitForSelector': 'Waiting for element',
+    'tabs.query': 'Searching tabs',
+    'tabs.activate': 'Switching tab',
+    'tabs.close': 'Closing tab',
+    'smart_navigate': 'Smart navigation',
+    'research_url': 'Researching content',
+    'multi_search': 'Multi-source search',
+    'analyze_urls': 'Analyzing links',
+    'generate_report': 'Creating report'
+  };
+  return descriptionMap[tool] || `Using ${tool}`;
 }
 
 function stopAgent(tabId, reason = "STOP requested") {
@@ -584,6 +786,190 @@ async function dispatchAgentAction(tabId, action, settings) {
         return { ok: false, observation: "Failed to generate report" };
       }
     }
+    case "analyze_urls": {
+      if (!(await ensureContentScript(tabId))) {
+        return { ok: false, observation: "Content script unavailable" };
+      }
+      const res = await chrome.tabs.sendMessage(tabId, { type: "ANALYZE_PAGE_URLS" });
+      return res?.ok ? { ok: true, observation: "URL analysis completed", analysis: res.analysis } : { ok: false, observation: res?.error || "URL analysis failed" };
+    }
+    case "get_page_links": {
+      if (!(await ensureContentScript(tabId))) {
+        return { ok: false, observation: "Content script unavailable" };
+      }
+      const includeExternal = params.includeExternal !== false;
+      const maxLinks = params.maxLinks || 20;
+      const res = await chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_LINKS", includeExternal, maxLinks });
+      return res?.ok ? { ok: true, observation: `Found ${res.links?.length || 0} relevant links`, links: res.links } : { ok: false, observation: res?.error || "Link extraction failed" };
+    }
+    case "extract_structured_content": {
+      if (!(await ensureContentScript(tabId))) {
+        return { ok: false, observation: "Content script unavailable" };
+      }
+      const res = await chrome.tabs.sendMessage(tabId, { type: "EXTRACT_STRUCTURED_CONTENT" });
+      return res?.ok ? { ok: true, observation: "Structured content extracted", content: res.content } : { ok: false, observation: res?.error || "Content extraction failed" };
+    }
+    case "smart_navigate": {
+      // Enhanced navigation that analyzes URLs and suggests the best approach
+      const query = String(params.query || "");
+      const currentUrl = (await chrome.tabs.get(tabId)).url;
+      
+      if (!query) {
+        return { ok: false, observation: "No search query provided for smart navigation" };
+      }
+      
+      // Determine the best search strategy
+      const searchUrl = determineSearchUrl(query, currentUrl);
+      await chrome.tabs.update(tabId, { url: searchUrl });
+      return { ok: true, observation: `Smart navigation to: ${searchUrl}` };
+    }
+    case "research_url": {
+      // Automatically research a specific URL by navigating and extracting content
+      const url = String(params.url || "");
+      const depth = Number(params.depth || 1);
+      const maxDepth = Number(params.maxDepth || 2);
+      
+      if (!url || !/^https?:\/\//i.test(url)) {
+        return { ok: false, observation: "Invalid URL for research" };
+      }
+      
+      // Navigate to the URL
+      await chrome.tabs.update(tabId, { url });
+      
+      // Wait for page load
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      
+      // Extract structured content
+      let content = null;
+      if (await ensureContentScript(tabId)) {
+        const res = await chrome.tabs.sendMessage(tabId, { type: "EXTRACT_STRUCTURED_CONTENT" });
+        if (res?.ok) {
+          content = res.content;
+        }
+      }
+      
+      // If depth is less than maxDepth, analyze URLs for deeper research
+      let deeperUrls = [];
+      if (depth < maxDepth && content) {
+        const urlAnalysis = await chrome.tabs.sendMessage(tabId, { type: "ANALYZE_PAGE_URLS" });
+        if (urlAnalysis?.ok && urlAnalysis.analysis?.relevantUrls) {
+          deeperUrls = urlAnalysis.analysis.relevantUrls.slice(0, 3); // Limit to top 3 URLs
+        }
+      }
+      
+      return {
+        ok: true,
+        observation: `Researched URL: ${url} (depth ${depth}/${maxDepth})`,
+        content: content,
+        deeperUrls: deeperUrls,
+        currentDepth: depth
+      };
+    }
+    case "multi_search": {
+      // Perform multiple location-aware searches for comprehensive results
+      const query = String(params.query || "");
+      const userLocation = params.location || getUserLocationFromTimezone();
+      const maxSearches = Number(params.maxSearches || 3);
+      
+      if (!query) {
+        return { ok: false, observation: "No search query provided for multi-search" };
+      }
+      
+      // Generate multiple search terms
+      const searchTerms = generateLocationAwareSearchTerms(query, userLocation);
+      const selectedTerms = searchTerms.slice(0, maxSearches);
+      
+      emitAgentLog(tabId, {
+        level: LOG_LEVELS.INFO,
+        msg: "Multi-search initiated",
+        originalQuery: query,
+        location: userLocation,
+        searchTerms: selectedTerms
+      });
+      
+      // Store search terms for sequential execution
+      const sess = agentSessions.get(tabId);
+      if (sess) {
+        sess.multiSearchTerms = selectedTerms;
+        sess.multiSearchIndex = 0;
+        sess.multiSearchResults = [];
+      }
+      
+      // Start with first search term
+      const firstSearchUrl = determineSearchUrl(selectedTerms[0], "", userLocation);
+      await chrome.tabs.update(tabId, { url: firstSearchUrl });
+      
+      return {
+        ok: true,
+        observation: `Multi-search started: ${selectedTerms.length} searches planned for "${query}" in ${userLocation}`,
+        searchTerms: selectedTerms,
+        currentSearch: selectedTerms[0]
+      };
+    }
+    case "continue_multi_search": {
+      // Continue to next search in multi-search sequence
+      const sess = agentSessions.get(tabId);
+      if (!sess || !sess.multiSearchTerms) {
+        return { ok: false, observation: "No multi-search session found" };
+      }
+      
+      sess.multiSearchIndex = (sess.multiSearchIndex || 0) + 1;
+      
+      if (sess.multiSearchIndex >= sess.multiSearchTerms.length) {
+        return {
+          ok: true,
+          observation: "Multi-search completed - all search terms exhausted",
+          completed: true,
+          totalResults: sess.multiSearchResults?.length || 0
+        };
+      }
+      
+      const nextSearchTerm = sess.multiSearchTerms[sess.multiSearchIndex];
+      const userLocation = getUserLocationFromTimezone();
+      const nextSearchUrl = determineSearchUrl(nextSearchTerm, "", userLocation);
+      
+      await chrome.tabs.update(tabId, { url: nextSearchUrl });
+      
+      return {
+        ok: true,
+        observation: `Continuing multi-search: ${sess.multiSearchIndex + 1}/${sess.multiSearchTerms.length} - "${nextSearchTerm}"`,
+        currentSearch: nextSearchTerm,
+        progress: `${sess.multiSearchIndex + 1}/${sess.multiSearchTerms.length}`
+      };
+    }
+    case "analyze_url_depth": {
+      // Analyze if current page URLs are worth reading deeper
+      if (!(await ensureContentScript(tabId))) {
+        return { ok: false, observation: "Content script unavailable" };
+      }
+      
+      const currentDepth = Number(params.currentDepth || 1);
+      const maxDepth = Number(params.maxDepth || 3);
+      const researchGoal = String(params.researchGoal || "");
+      
+      // Get URL analysis
+      const urlAnalysis = await chrome.tabs.sendMessage(tabId, { type: "ANALYZE_PAGE_URLS" });
+      if (!urlAnalysis?.ok) {
+        return { ok: false, observation: "Failed to analyze page URLs" };
+      }
+      
+      // Get current page content quality
+      const contentRes = await chrome.tabs.sendMessage(tabId, { type: "EXTRACT_STRUCTURED_CONTENT" });
+      const contentQuality = contentRes?.ok ? analyzeContentQuality(contentRes.content, researchGoal) : 'low';
+      
+      // Decision logic for deeper reading
+      const shouldGoDeeper = shouldReadDeeper(urlAnalysis.analysis, contentQuality, currentDepth, maxDepth, researchGoal);
+      
+      return {
+        ok: true,
+        observation: `URL depth analysis completed (depth ${currentDepth}/${maxDepth})`,
+        shouldGoDeeper: shouldGoDeeper.decision,
+        reasoning: shouldGoDeeper.reasoning,
+        recommendedUrls: shouldGoDeeper.urls,
+        contentQuality: contentQuality,
+        currentDepth: currentDepth
+      };
+    }
     default:
       return { ok: false, observation: "Unknown tool: " + String(tool) };
   }
@@ -645,6 +1031,17 @@ async function runAgentLoop(tabId, goal, settings) {
   }
 
   if (!sess.stopped) {
+    // Send completion message before stopping
+    try {
+      chrome.runtime.sendMessage({
+        type: MSG.AGENT_PROGRESS,
+        tabId,
+        message: `✅ Agent completed successfully! Executed ${sess.step} steps.`,
+        step: sess.step,
+        timestamp: Date.now()
+      });
+    } catch (_) {}
+    
     stopAgent(tabId, "Plan completed.");
   }
 
@@ -1323,4 +1720,227 @@ function calculateAdaptiveDelay(action, success) {
     return TIMEOUTS.RETRY_DELAY;
   }
   return TIMEOUTS.ACTION_DELAY;
+}
+// Enhanced location-aware search term generation
+function generateLocationAwareSearchTerms(query, userLocation = 'singapore') {
+  const baseQuery = query.toLowerCase().trim();
+  const searchTerms = [];
+  
+  // Base search term
+  searchTerms.push(baseQuery);
+  
+  // Location-specific variations
+  if (userLocation) {
+    searchTerms.push(`${baseQuery} ${userLocation}`);
+    searchTerms.push(`${baseQuery} price ${userLocation}`);
+    searchTerms.push(`${baseQuery} buy ${userLocation}`);
+    searchTerms.push(`${baseQuery} store ${userLocation}`);
+    searchTerms.push(`${baseQuery} shop ${userLocation}`);
+  }
+  
+  // Product-specific enhancements
+  if (baseQuery.includes('ipad') || baseQuery.includes('iphone') || baseQuery.includes('apple')) {
+    searchTerms.push(`apple ${baseQuery} ${userLocation}`);
+    searchTerms.push(`${baseQuery} official store ${userLocation}`);
+    searchTerms.push(`${baseQuery} authorized dealer ${userLocation}`);
+  }
+  
+  // Price-specific searches
+  if (baseQuery.includes('price') || baseQuery.includes('cost') || baseQuery.includes('buy')) {
+    searchTerms.push(`best price ${baseQuery} ${userLocation}`);
+    searchTerms.push(`cheapest ${baseQuery} ${userLocation}`);
+    searchTerms.push(`${baseQuery} comparison ${userLocation}`);
+  }
+  
+  // Remove duplicates and return unique terms
+  return [...new Set(searchTerms)];
+}
+
+// Get user's location based on timezone
+function getUserLocationFromTimezone() {
+  try {
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    
+    // Map common timezones to locations
+    const timezoneLocationMap = {
+      'Asia/Singapore': 'singapore',
+      'Asia/Kuala_Lumpur': 'malaysia',
+      'Asia/Jakarta': 'indonesia',
+      'Asia/Bangkok': 'thailand',
+      'Asia/Manila': 'philippines',
+      'Asia/Hong_Kong': 'hong kong',
+      'Asia/Tokyo': 'japan',
+      'Asia/Seoul': 'south korea',
+      'America/New_York': 'usa',
+      'America/Los_Angeles': 'usa',
+      'America/Chicago': 'usa',
+      'Europe/London': 'uk',
+      'Europe/Paris': 'france',
+      'Europe/Berlin': 'germany',
+      'Australia/Sydney': 'australia',
+      'Australia/Melbourne': 'australia'
+    };
+    
+    return timezoneLocationMap[timezone] || 'singapore'; // Default to singapore
+  } catch (error) {
+    console.warn('[BG] Failed to detect user location from timezone:', error);
+    return 'singapore'; // Fallback
+  }
+}
+
+// Smart URL determination for research tasks with location awareness
+function determineSearchUrl(query, currentUrl = "", userLocation = null) {
+  const lowerQuery = query.toLowerCase();
+  const location = userLocation || getUserLocationFromTimezone();
+  
+  // If already on Google, return a search URL
+  if (currentUrl.includes('google.com')) {
+    return `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+  }
+  
+  // For specific site searches
+  if (lowerQuery.includes('wikipedia') || lowerQuery.includes('wiki')) {
+    return `https://en.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(query.replace(/wikipedia|wiki/gi, '').trim())}`;
+  }
+  
+  if (lowerQuery.includes('youtube') || lowerQuery.includes('video')) {
+    return `https://www.youtube.com/results?search_query=${encodeURIComponent(query.replace(/youtube|video/gi, '').trim())}`;
+  }
+  
+  if (lowerQuery.includes('github') || lowerQuery.includes('code')) {
+    return `https://github.com/search?q=${encodeURIComponent(query.replace(/github|code/gi, '').trim())}`;
+  }
+  
+  if (lowerQuery.includes('stackoverflow') || lowerQuery.includes('programming')) {
+    return `https://stackoverflow.com/search?q=${encodeURIComponent(query)}`;
+  }
+  
+  if (lowerQuery.includes('reddit')) {
+    return `https://www.reddit.com/search/?q=${encodeURIComponent(query.replace(/reddit/gi, '').trim())}`;
+  }
+  
+  if (lowerQuery.includes('news') || lowerQuery.includes('latest')) {
+    return `https://www.google.com/search?q=${encodeURIComponent(query)}&tbm=nws`;
+  }
+  
+  if (lowerQuery.includes('academic') || lowerQuery.includes('research paper') || lowerQuery.includes('scholar')) {
+    return `https://scholar.google.com/scholar?q=${encodeURIComponent(query)}`;
+  }
+  
+  // For shopping/price queries, use location-aware search
+  if (lowerQuery.includes('price') || lowerQuery.includes('buy') || lowerQuery.includes('shop') ||
+      lowerQuery.includes('ipad') || lowerQuery.includes('iphone') || lowerQuery.includes('product')) {
+    const locationQuery = `${query} ${location}`;
+    return `https://www.google.com/search?q=${encodeURIComponent(locationQuery)}`;
+  }
+  
+  // Default to Google search
+  return `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+}
+
+// Analyze content quality for research purposes
+function analyzeContentQuality(content, researchGoal = "") {
+  if (!content || typeof content !== 'object') {
+    return 'low';
+  }
+  
+  const { title = "", text = "", links = [], metadata = {} } = content;
+  let score = 0;
+  
+  // Content length scoring
+  if (text.length > 2000) score += 2;
+  else if (text.length > 500) score += 1;
+  
+  // Link quality scoring
+  if (links.length > 10) score += 2;
+  else if (links.length > 3) score += 1;
+  
+  // Title relevance scoring
+  if (researchGoal && title.toLowerCase().includes(researchGoal.toLowerCase())) {
+    score += 2;
+  }
+  
+  // Metadata scoring
+  if (metadata.description) score += 1;
+  if (metadata.keywords) score += 1;
+  
+  // Authority scoring based on domain patterns
+  const url = metadata.url || "";
+  if (url.includes('.edu') || url.includes('.gov') || url.includes('wikipedia.org')) {
+    score += 3;
+  } else if (url.includes('.org') || url.includes('scholar.google')) {
+    score += 2;
+  }
+  
+  // Return quality rating
+  if (score >= 7) return 'high';
+  if (score >= 4) return 'medium';
+  return 'low';
+}
+
+// Decision logic for whether to read URLs deeper
+function shouldReadDeeper(urlAnalysis, contentQuality, currentDepth, maxDepth, researchGoal) {
+  const decision = {
+    decision: false,
+    reasoning: "",
+    urls: []
+  };
+  
+  // Don't go deeper if at max depth
+  if (currentDepth >= maxDepth) {
+    decision.reasoning = `Maximum depth (${maxDepth}) reached`;
+    return decision;
+  }
+  
+  // Don't go deeper if no relevant URLs found
+  if (!urlAnalysis?.relevantUrls || urlAnalysis.relevantUrls.length === 0) {
+    decision.reasoning = "No relevant URLs found for deeper analysis";
+    return decision;
+  }
+  
+  // Go deeper if current content quality is low but relevant URLs exist
+  if (contentQuality === 'low' && urlAnalysis.relevantUrls.length > 0) {
+    decision.decision = true;
+    decision.reasoning = "Current content quality is low, exploring better sources";
+    decision.urls = urlAnalysis.relevantUrls.slice(0, 2);
+    return decision;
+  }
+  
+  // Go deeper if high-quality URLs are available and we haven't reached depth limit
+  if (contentQuality === 'medium' && currentDepth < maxDepth - 1) {
+    const highQualityUrls = urlAnalysis.relevantUrls.filter(url =>
+      url.relevanceScore > 0.7 ||
+      url.url.includes('.edu') ||
+      url.url.includes('.gov') ||
+      url.url.includes('wikipedia.org')
+    );
+    
+    if (highQualityUrls.length > 0) {
+      decision.decision = true;
+      decision.reasoning = "High-quality authoritative sources found for deeper research";
+      decision.urls = highQualityUrls.slice(0, 2);
+      return decision;
+    }
+  }
+  
+  // Go deeper if research goal keywords are found in URL titles
+  if (researchGoal) {
+    const goalKeywords = researchGoal.toLowerCase().split(' ');
+    const relevantUrls = urlAnalysis.relevantUrls.filter(url =>
+      goalKeywords.some(keyword =>
+        url.title?.toLowerCase().includes(keyword) ||
+        url.url.toLowerCase().includes(keyword)
+      )
+    );
+    
+    if (relevantUrls.length > 0 && currentDepth < maxDepth) {
+      decision.decision = true;
+      decision.reasoning = "Found URLs highly relevant to research goal";
+      decision.urls = relevantUrls.slice(0, 2);
+      return decision;
+    }
+  }
+  
+  decision.reasoning = "Current content quality sufficient, no compelling reason to go deeper";
+  return decision;
 }

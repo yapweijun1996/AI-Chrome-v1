@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agent Progress Integration Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .section {
+            margin-bottom: 30px;
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        .section h3 {
+            margin-top: 0;
+            color: #333;
+        }
+        .feature {
+            background: #e8f5e8;
+            padding: 10px;
+            margin: 10px 0;
+            border-left: 4px solid #4caf50;
+        }
+        .improvement {
+            background: #fff3cd;
+            padding: 10px;
+            margin: 10px 0;
+            border-left: 4px solid #ffc107;
+        }
+        .code {
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            overflow-x: auto;
+        }
+        .message-flow {
+            display: flex;
+            align-items: center;
+            margin: 10px 0;
+        }
+        .arrow {
+            margin: 0 10px;
+            font-size: 18px;
+            color: #666;
+        }
+        .component {
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        .background {
+            background: #e3f2fd;
+            color: #1976d2;
+        }
+        .sidepanel {
+            background: #f3e5f5;
+            color: #7b1fa2;
+        }
+        .chat {
+            background: #e8f5e8;
+            color: #388e3c;
+        }
+        .activity {
+            background: #fff3e0;
+            color: #f57c00;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔄 Agent Progress Integration Test</h1>
+        <p><strong>Status:</strong> ✅ Implementation Complete</p>
+        
+        <div class="section">
+            <h3>📋 Problem Solved</h3>
+            <p>The issue was that agent activity logs were separated from chat messages, causing a disjointed user experience where users saw agent start/finish messages but no intermediate progress updates in chat.</p>
+        </div>
+
+        <div class="section">
+            <h3>🛠️ Solution Implemented</h3>
+            
+            <div class="feature">
+                <strong>1. New Message Type:</strong> Added <code>AGENT_PROGRESS</code> message type for chat progress updates
+            </div>
+            
+            <div class="feature">
+                <strong>2. Smart Filtering:</strong> Only key progress events are sent to chat (agent start, tool execution, navigation, completion, errors)
+            </div>
+            
+            <div class="feature">
+                <strong>3. Throttling System:</strong> Prevents chat spam with 2-second minimum intervals and burst protection
+            </div>
+            
+            <div class="feature">
+                <strong>4. User-Friendly Messages:</strong> Technical logs are converted to readable progress updates with emojis
+            </div>
+            
+            <div class="feature">
+                <strong>5. Dual Display:</strong> Detailed logs remain in activity panel, progress updates appear in chat
+            </div>
+        </div>
+
+        <div class="section">
+            <h3>🔄 Message Flow</h3>
+            <div class="message-flow">
+                <div class="component background">Background Agent</div>
+                <div class="arrow">→</div>
+                <div class="component sidepanel">Sidepanel Listener</div>
+                <div class="arrow">→</div>
+                <div class="component chat">Chat Messages</div>
+            </div>
+            <div class="message-flow">
+                <div class="component background">Background Agent</div>
+                <div class="arrow">→</div>
+                <div class="component sidepanel">Sidepanel Listener</div>
+                <div class="arrow">→</div>
+                <div class="component activity">Activity Panel</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h3>📝 Key Changes Made</h3>
+            
+            <h4>1. common/messages.js</h4>
+            <div class="code">
+// Added new message type
+AGENT_PROGRESS: "AGENT_PROGRESS"
+            </div>
+            
+            <h4>2. background/background.js</h4>
+            <div class="code">
+// Enhanced emitAgentLog function
+function emitAgentLog(tabId, entry) {
+  // ... existing detailed logging ...
+  
+  // Send progress updates to chat for key events
+  if (shouldSendProgressToChat(entry)) {
+    const progressMessage = formatProgressMessage(entry, sess);
+    if (shouldThrottleProgressMessage(tabId, progressMessage)) {
+      chrome.runtime.sendMessage({ 
+        type: MSG.AGENT_PROGRESS, 
+        tabId, 
+        message: progressMessage,
+        step: sess.step ?? 0,
+        timestamp: Date.now()
+      });
+    }
+  }
+}
+            </div>
+            
+            <h4>3. sidepanel/sidepanel.js</h4>
+            <div class="code">
+// Enhanced message listener
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type === MSG.AGENT_LOG && message.entry) {
+    addAgentLogToChat(message.entry); // Detailed logs to activity panel
+  } else if (message?.type === MSG.AGENT_PROGRESS && message.message) {
+    addMessage('assistant', message.message, message.timestamp); // Progress to chat
+  }
+  // ... other handlers ...
+});
+            </div>
+        </div>
+
+        <div class="section">
+            <h3>🎯 Progress Message Examples</h3>
+            <div class="improvement">
+                <strong>Agent Start:</strong> "🚀 Starting agent: 'Search for iPad prices in Singapore'"
+            </div>
+            <div class="improvement">
+                <strong>Planning:</strong> "[Step 1/12] 📋 Generated plan with 5 steps"
+            </div>
+            <div class="improvement">
+                <strong>Tool Execution:</strong> "[Step 2/12] 🔧 🌐 Opening webpage"
+            </div>
+            <div class="improvement">
+                <strong>Navigation:</strong> "[Step 3/12] 🌐 Navigating to new page..."
+            </div>
+            <div class="improvement">
+                <strong>Search:</strong> "[Step 4/12] 🔍 Searching for information..."
+            </div>
+            <div class="improvement">
+                <strong>Completion:</strong> "✅ Agent completed successfully! Executed 8 steps."
+            </div>
+            <div class="improvement">
+                <strong>Error:</strong> "[Step 5/12] ❌ Error: Unable to find search button"
+            </div>
+        </div>
+
+        <div class="section">
+            <h3>🔧 Throttling Features</h3>
+            <ul>
+                <li><strong>Time-based:</strong> Minimum 2 seconds between progress messages</li>
+                <li><strong>Burst protection:</strong> Maximum 3 messages in quick succession</li>
+                <li><strong>Duplicate prevention:</strong> Same message won't be sent twice</li>
+                <li><strong>Memory cleanup:</strong> Throttle data cleared when agent stops</li>
+            </ul>
+        </div>
+
+        <div class="section">
+            <h3>✅ Benefits Achieved</h3>
+            <div class="feature">
+                <strong>Better UX:</strong> Users see real-time progress in the familiar chat interface
+            </div>
+            <div class="feature">
+                <strong>No Information Loss:</strong> Detailed technical logs still available in activity panel
+            </div>
+            <div class="feature">
+                <strong>Reduced Confusion:</strong> Clear progress indicators prevent users from wondering if agent is working
+            </div>
+            <div class="feature">
+                <strong>Smart Filtering:</strong> Only important events appear in chat, avoiding clutter
+            </div>
+            <div class="feature">
+                <strong>Professional Presentation:</strong> Technical actions translated to user-friendly language
+            </div>
+        </div>
+
+        <div class="section">
+            <h3>🧪 Testing Instructions</h3>
+            <ol>
+                <li>Load the extension in Chrome</li>
+                <li>Open the sidepanel</li>
+                <li>Start an agent task (e.g., "Search for iPad prices")</li>
+                <li>Observe both chat messages (progress updates) and activity panel (detailed logs)</li>
+                <li>Verify throttling by checking that messages don't spam the chat</li>
+                <li>Test error scenarios to ensure error messages appear in chat</li>
+            </ol>
+        </div>
+    </div>
+</body>
+</html>

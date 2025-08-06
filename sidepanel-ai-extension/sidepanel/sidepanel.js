@@ -15,6 +15,7 @@ const MSG = window.MessageTypes?.MSG || {
   AGENT_STOP: "AGENT_STOP",
   AGENT_STATUS: "AGENT_STATUS",
   AGENT_LOG: "AGENT_LOG",
+  AGENT_PROGRESS: "AGENT_PROGRESS",
   SHOW_REPORT: "SHOW_REPORT"
 };
 
@@ -1020,6 +1021,9 @@ function wireBasics() {
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === MSG.AGENT_LOG && message.entry) {
     addAgentLogToChat(message.entry);
+  } else if (message?.type === MSG.AGENT_PROGRESS && message.message) {
+    // Add progress updates to chat
+    addMessage('assistant', message.message, message.timestamp || Date.now());
   } else if (message?.type === MSG.SHOW_REPORT && message.report) {
     addMessage('assistant', message.report, Date.now(), message.format === 'markdown');
   } else if (message?.type === MSG.AGENT_STATUS && message.session?.running) {

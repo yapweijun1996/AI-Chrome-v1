@@ -617,74 +617,111 @@ ${JSON.stringify(interactiveElements.slice(0, 20), null, 2)}
     : "No interactive elements were found.";
 
 
-  return `You are an AI research assistant agent. Your goal is to help the user research information comprehensively.
+  return `You are an intelligent AI research assistant with advanced web analysis capabilities. Your mission is to conduct comprehensive, human-like research by automatically reading and analyzing URLs, extracting meaningful information, and synthesizing findings from multiple sources.
 
 Research Goal: ${researchGoal}
-
 Current Sub-Task: ${currentSubTask}
 
-Current Page:
-- Title: ${title}
-- URL: ${url}
+CURRENT CONTEXT:
+Page: ${title} (${url})
+Page Type: ${categorizePageForResearch(url)}
 
 ${elementsLog}
 
-Page Content (first 4000 chars):
+ENHANCED PAGE ANALYSIS:
+${pageContent ? `Content Preview (${pageContent.length} chars):
 ---
-${pageContent || "(no content extracted)"}
----
+${pageContent.substring(0, 3000)}${pageContent.length > 3000 ? '...' : ''}
+---` : 'No content extracted yet'}
 
-Available Tools (ONLY use these exact tool names):
+DISCOVERED URLS & LINKS:
+${context.interactiveElements ? analyzePageUrls(context.interactiveElements) : 'No URL analysis available'}
+
+AVAILABLE RESEARCH TOOLS:
+- smart_navigate: Intelligently navigate to the best source for your query (location-aware)
+- multi_search: Perform multiple location-aware searches for comprehensive results
+- continue_multi_search: Continue to next search in multi-search sequence
+- research_url: Automatically research a specific URL with depth control (supports recursive reading)
+- analyze_url_depth: Analyze if current page URLs are worth reading deeper
+- analyze_urls: Analyze all URLs on current page for research relevance
+- get_page_links: Extract and rank relevant links from current page
 - navigate: Go to a specific URL
 - click: Click on elements using CSS selectors
 - fill: Fill input fields with text
-- scroll: Scroll to find more content. direction must be "up" or "down" (lowercase). amountPx optional number.
+- scroll: Scroll to find more content
 - waitForSelector: Wait for elements to appear
-- screenshot: Take a screenshot
-- done: Mark task as complete
+- screenshot: Take a screenshot for visual analysis
+- extract_structured_content: Get enhanced content extraction with metadata
+- generate_report: Create a comprehensive research report
+- done: Mark research complete
 
-Research Strategy Guidelines:
-1. If not on Google, navigate to https://www.google.com first
-2. Use the search box to search for your research topic (use "fill" tool)
-3. Click search button or press enter
-4. Visit authoritative sources (Wikipedia, academic sites, official websites)
-5. Look for recent and credible information
-6. Gather multiple perspectives on the topic
-7. Take screenshots of important findings
-8. Navigate between different sources for comprehensive coverage
+INTELLIGENT RESEARCH STRATEGY:
+1. **Location-Aware Search**: Use multi_search to perform multiple location-aware searches based on user's timezone
+2. **URL Discovery**: Automatically identify and analyze relevant URLs on each page
+3. **Smart Navigation**: Use smart_navigate to find the best sources for your research topic (location-aware)
+4. **Deep URL Analysis**: Use analyze_url_depth to decide if URLs are worth reading deeper
+5. **Recursive Reading**: Use research_url with depth control for comprehensive content extraction
+6. **Content Extraction**: Use extract_structured_content to get rich, structured information
+7. **Link Analysis**: Use get_page_links to find the most relevant related sources
+8. **Multi-Source Research**: Visit multiple authoritative sources automatically with intelligent depth control
+9. **Synthesis**: Combine findings from all sources into comprehensive insights
 
-Recent History:
----
-${historyLog || "(no history yet)"}
----
+LOCATION-AWARE FEATURES:
+- Automatically detects user location from timezone (e.g., Singapore from Asia/Singapore)
+- Generates location-specific search terms (e.g., "ipad price singapore", "apple store singapore")
+- Prioritizes local and regional sources for relevant queries
+- Supports multiple search strategies for comprehensive coverage
 
-Last Step:
-- Action: ${JSON.stringify(lastAction) || "(none)"}
-- Observation: ${lastObservation || "(none)"}
+RESEARCH EXECUTION HISTORY:
+${historyLog || "Starting research - no previous actions"}
 
-Analyze the current situation and decide the next action for effective research. Consider:
-1. Have you searched for the main topic yet?
-2. Do you need to visit specific authoritative sources?
-3. Should you gather more diverse perspectives?
-4. Is it time to synthesize findings?
+LAST ACTION ANALYSIS:
+Action: ${JSON.stringify(lastAction) || "None"}
+Result: ${lastObservation || "None"}
+${analyzeLastActionForResearch(lastAction, lastObservation)}
 
-Return ONLY a single JSON object using ONLY the exact tool names listed above:
+INTELLIGENT DECISION FRAMEWORK:
+Consider these factors for your next action:
+1. **Content Quality**: Is the current page providing valuable research information?
+2. **URL Opportunities**: Are there relevant URLs on this page to explore?
+3. **Source Diversity**: Have you gathered information from multiple types of sources?
+4. **Research Depth**: Do you need more specific or general information?
+5. **Synthesis Readiness**: Do you have enough information to provide comprehensive insights?
+
+HUMAN-LIKE RESEARCH BEHAVIOR:
+- Automatically read and follow relevant URLs found in content
+- Prioritize authoritative sources (academic, government, established organizations)
+- Cross-reference information from multiple sources
+- Look for recent and up-to-date information
+- Extract key facts, statistics, and insights
+- Identify contradictions or different perspectives
+
+Return your next intelligent research action:
 {
-  "tool": "navigate|click|fill|scroll|waitForSelector|screenshot|done",
+  "tool": "smart_navigate|multi_search|continue_multi_search|research_url|analyze_url_depth|analyze_urls|get_page_links|navigate|click|fill|scroll|waitForSelector|screenshot|extract_structured_content|generate_report|done",
   "params": {
-    "url": "full URL",                          // navigate only
-    "selector": "CSS selector",                 // click/fill/waitForSelector, optional for scroll
-    "value": "text to type",                    // fill only
-    "direction": "up|down",                     // scroll only (REQUIRED, lowercase)
-    "amountPx": 600,                            // scroll only (OPTIONAL, default 600)
-    "timeoutMs": 5000                           // waitForSelector only (OPTIONAL)
+    "query": "search query for smart_navigate/multi_search",
+    "location": "user location (auto-detected from timezone if not specified)",
+    "maxSearches": 3,
+    "url": "URL to research for research_url",
+    "depth": 1,
+    "maxDepth": 3,
+    "currentDepth": 1,
+    "researchGoal": "research goal for analyze_url_depth",
+    "selector": "CSS selector for click/fill/wait",
+    "value": "text to type for fill",
+    "direction": "up|down for scroll",
+    "includeExternal": true,
+    "maxLinks": 20,
+    "format": "markdown for generate_report"
   },
-  "rationale": "Why this action helps achieve the research goal",
+  "rationale": "Detailed reasoning for this research action based on current context and goals",
+  "confidence": 0.85,
+  "research_strategy": "location_aware_search|multi_source_discovery|deep_analysis|recursive_reading|synthesis|verification",
   "done": false
 }
 
-Use selectors from the 'Available Interactive Elements' list when appropriate.
-Use "done" only when you have gathered comprehensive information from multiple reliable sources.`;
+Focus on taking intelligent, autonomous actions that mimic how a human researcher would naturally explore and analyze information.`;
 }
 
 /**
@@ -780,4 +817,108 @@ Report Generation Guidelines:
 
 Please generate the report in ${format} format.`
   );
+}
+// Helper functions for enhanced research prompts
+function categorizePageForResearch(url) {
+  if (!url) return 'unknown';
+  
+  const lowerUrl = url.toLowerCase();
+  if (lowerUrl.includes('wikipedia.org')) return 'encyclopedia';
+  if (lowerUrl.includes('youtube.com')) return 'video_platform';
+  if (lowerUrl.includes('google.com/search')) return 'search_results';
+  if (lowerUrl.includes('scholar.google')) return 'academic_search';
+  if (lowerUrl.includes('github.com')) return 'code_repository';
+  if (lowerUrl.includes('stackoverflow.com')) return 'qa_forum';
+  if (lowerUrl.includes('reddit.com')) return 'social_forum';
+  if (lowerUrl.includes('.edu')) return 'academic_institution';
+  if (lowerUrl.includes('.gov')) return 'government';
+  if (lowerUrl.includes('news') || lowerUrl.includes('bbc.com') || lowerUrl.includes('cnn.com')) return 'news_source';
+  if (lowerUrl.includes('blog')) return 'blog';
+  
+  return 'general_website';
+}
+
+function analyzePageUrls(interactiveElements) {
+  if (!interactiveElements || !Array.isArray(interactiveElements)) {
+    return 'No interactive elements to analyze';
+  }
+  
+  const links = interactiveElements.filter(el => el.tag === 'a' && el.text);
+  if (links.length === 0) {
+    return 'No links found on current page';
+  }
+  
+  const categorizedLinks = {
+    research_sources: [],
+    external_sites: [],
+    related_content: []
+  };
+  
+  links.forEach(link => {
+    const text = link.text.toLowerCase();
+    if (text.includes('research') || text.includes('study') || text.includes('paper') || text.includes('academic')) {
+      categorizedLinks.research_sources.push(`"${link.text}"`);
+    } else if (text.includes('more') || text.includes('related') || text.includes('similar')) {
+      categorizedLinks.related_content.push(`"${link.text}"`);
+    } else if (link.text.length > 10) {
+      categorizedLinks.external_sites.push(`"${link.text}"`);
+    }
+  });
+  
+  const analysis = [];
+  if (categorizedLinks.research_sources.length > 0) {
+    analysis.push(`Research Sources: ${categorizedLinks.research_sources.slice(0, 3).join(', ')}`);
+  }
+  if (categorizedLinks.related_content.length > 0) {
+    analysis.push(`Related Content: ${categorizedLinks.related_content.slice(0, 3).join(', ')}`);
+  }
+  if (categorizedLinks.external_sites.length > 0) {
+    analysis.push(`External Links: ${categorizedLinks.external_sites.slice(0, 3).join(', ')}`);
+  }
+  
+  return analysis.length > 0 ? analysis.join('\n') : `Found ${links.length} links but none categorized as highly relevant`;
+}
+
+function analyzeLastActionForResearch(lastAction, lastObservation) {
+  if (!lastAction || !lastObservation) {
+    return 'No previous action to analyze - starting fresh research';
+  }
+  
+  const analysis = [];
+  const obs = lastObservation.toLowerCase();
+  
+  if (lastAction.tool === 'navigate' || lastAction.tool === 'smart_navigate') {
+    if (obs.includes('navigated')) {
+      analysis.push('✓ Successfully navigated to new page - ready to extract content');
+    } else {
+      analysis.push('⚠ Navigation may have failed - consider alternative approach');
+    }
+  } else if (lastAction.tool === 'extract_structured_content') {
+    if (obs.includes('extracted')) {
+      analysis.push('✓ Content extraction successful - analyze for research value');
+    } else {
+      analysis.push('⚠ Content extraction failed - try different approach');
+    }
+  } else if (lastAction.tool === 'get_page_links') {
+    if (obs.includes('found')) {
+      analysis.push('✓ Links discovered - consider following most relevant ones');
+    } else {
+      analysis.push('⚠ No links found - may need to search elsewhere');
+    }
+  } else if (lastAction.tool === 'research_url') {
+    if (obs.includes('researched')) {
+      analysis.push('✓ URL research completed - content should be available');
+    } else {
+      analysis.push('⚠ URL research incomplete - may need retry or alternative');
+    }
+  }
+  
+  // Check for research progress indicators
+  if (obs.includes('comprehensive') || obs.includes('detailed')) {
+    analysis.push('📊 Good research depth achieved');
+  } else if (obs.includes('basic') || obs.includes('limited')) {
+    analysis.push('📊 Research depth could be improved');
+  }
+  
+  return analysis.length > 0 ? analysis.join('\n') : 'Action completed - continue research strategy';
 }
