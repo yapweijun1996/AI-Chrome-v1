@@ -439,8 +439,7 @@ async function getPageInfoForPlanning(tabId) {
 }
 
 function isRestrictedUrl(url = "") {
-  // Allow all URLs by default as requested
-  return false;
+  return url.startsWith("chrome://") || url.startsWith("about:") || url.startsWith("edge://");
 }
 
 async function ensureContentScript(tabId) {
@@ -559,6 +558,23 @@ async function dispatchAgentAction(tabId, action, settings) {
     }
     case "done": {
       return { ok: true, observation: "Goal marked done" };
+    }
+    case "generate_report": {
+      const { format = 'markdown', content = '' } = params;
+      const reportPrompt = buildReportGenerationPrompt(sess.goal, content, format);
+      
+      const reportRes = await callModelWithRotation(reportPrompt, { model: sess.selectedModel, tabId: tabId });
+      
+      if (reportRes.ok) {
+        emitAgentLog(tabId, {
+          level: LOG_LEVELS.SUCCESS,
+          msg: "User-facing report generated",
+          report: reportRes.text
+        });
+        return { ok: true, observation: "Report generated successfully", report: reportRes.text };
+      } else {
+        return { ok: false, observation: "Failed to generate report" };
+      }
     }
     default:
       return { ok: false, observation: "Unknown tool: " + String(tool) };
@@ -680,7 +696,7 @@ async function runAgentLoop(tabId, goal, settings) {
     const execRes = await executeActionWithContext(tabId, sess, parsedAction, settings);
 
     // 6. Update Session Context
-    updateSessionContext(sess, parsedAction, execRes);
+    updateSessionContext(tabId, sess, parsedAction, execRes);
     
     // 7. Handle Failures with Self-Correction
     if (!execRes.ok) {
@@ -691,7 +707,7 @@ async function runAgentLoop(tabId, goal, settings) {
       if (selfCorrectedAction) {
         // If correction provides a new action, execute it immediately
         const correctedExecRes = await executeActionWithContext(tabId, sess, selfCorrectedAction, settings);
-        updateSessionContext(sess, selfCorrectedAction, correctedExecRes);
+        updateSessionContext(tabId, sess, selfCorrectedAction, correctedExecRes);
         if (!correctedExecRes.ok) {
             emitAgentLog(tabId, { level: LOG_LEVELS.ERROR, msg: "Self-correction action also failed. Stopping." });
             stopAgent(tabId, "Self-correction failed");
@@ -858,7 +874,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
           if (!tab?.id) return sendResponse({ ok: false, error: "No active tab" });
 
-          // URL restriction logic has been disabled by user request.
+          if (isRestrictedUrl(tab.url)) {
+            return sendResponse({ ok: false, error: "Cannot access this page. Content scripts are blocked on this URL." });
+          }
 
           try {
             // Try sending first
@@ -898,7 +916,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
           if (!tab?.id) return sendResponse({ ok: false, error: "No active tab" });
 
-          // URL restriction logic has been disabled by user request.
+          if (isRestrictedUrl(tab.url)) {
+            return sendResponse({ ok: false, error: "Cannot access this page. Content scripts are blocked on this URL." });
+          }
 
           // 1) Extract page text with fallback injection
           let extract;
@@ -1321,7 +1341,7 @@ async function executeActionWithContext(tabId, sess, action, settings) {
 }
 
 // [CONTEXT ENGINEERING] Session state update logic
-function updateSessionContext(sess, action, execRes) {
+function updateSessionContext(tabId, sess, action, execRes) {
   sess.lastAction = action;
   sess.lastObservation = execRes?.observation || "";
 
@@ -1329,6 +1349,12 @@ function updateSessionContext(sess, action, execRes) {
   sess.history.push({ action, observation: execRes?.observation || "" });
   if (sess.history.length > 10) {
     sess.history.shift();
+  }
+
+  // Invalidate cache after successful navigation
+  if (action.tool === 'navigate' && execRes.ok) {
+    sess.contextCache = {};
+    emitAgentLog(tabId, { level: LOG_LEVELS.DEBUG, msg: "Context cache invalidated after navigation." });
   }
 }
 

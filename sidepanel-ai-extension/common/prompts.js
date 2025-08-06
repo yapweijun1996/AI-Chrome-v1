@@ -2,13 +2,23 @@
 // Stores and builds prompts for the Gemini API
 
 function buildSummarizePrompt(pageText, userPrompt = "") {
-  let prompt = `Analyze the following text from a webpage and provide a concise summary.`;
+  let prompt = `You are an intelligent assistant. Your task is to analyze the provided text from a webpage and respond to the user's request.
 
-  if (userPrompt) {
-    prompt += `\n\nThe user also provided the following instruction: "${userPrompt}"\n\n`;
-  }
+First, provide a concise, neutral summary of the text.
 
-  prompt += `Here is the text to analyze:\n\n---\n\n${pageText}`;
+Second, analyze the user's follow-up request: "${userPrompt}"
+
+Follow these rules:
+1.  If the user's request can be answered using the provided text, answer it directly.
+2.  If the user's request is unrelated to the provided text, clearly state that the text does not contain the requested information and suggest how the user can find it (e.g., by searching online, visiting a specific website).
+3.  If no user request is provided, just return the summary.
+
+Here is the text to analyze:
+---
+${pageText}
+---
+
+Present your response in two parts: a "Concise Summary of the Text" and then your "Response to User Request".`;
 
   return prompt;
 }
@@ -124,7 +134,7 @@ ${(pageContent || "").substring(0, 2000)}${pageContent && pageContent.length > 2
 
 Return ONLY a JSON object with your next action:
 {
-  "tool": "navigate|click|fill|scroll|waitForSelector|screenshot|tabs.query|tabs.activate|tabs.close|done",
+  "tool": "navigate|click|fill|scroll|waitForSelector|screenshot|tabs.query|tabs.activate|tabs.close|generate_report|done",
   "params": { /* tool-specific parameters */ },
   "rationale": "Clear reasoning for this action based on context and progress",
   "confidence": 0.85, // 0.0-1.0 confidence in this action
@@ -748,4 +758,26 @@ Examples:
 - "click the login button" → {"intent": "AUTOMATION", "confidence": 0.95, "reasoning": "Specific UI interaction request", "suggestedAction": "Locate and click the login button on current page"}
 
 Analyze the user's message and return the classification.`;
+}
+function buildReportGenerationPrompt(goal, content, format) {
+  return (
+`You are an AI assistant tasked with generating a user-facing report based on a completed goal and gathered information.
+
+User's Goal: "${goal}"
+
+Gathered Information:
+---
+${content}
+---
+
+Report Generation Guidelines:
+1. Synthesize the gathered information into a coherent report.
+2. Structure the report logically with clear headings, lists, and paragraphs.
+3. Ensure the tone is helpful, professional, and easy to understand.
+4. If the requested format is "markdown", use appropriate Markdown syntax for formatting (e.g., # for headings, * for lists, ** for bold).
+5. If the requested format is "story", weave the information into a narrative.
+6. The report should directly address the user's original goal.
+
+Please generate the report in ${format} format.`
+  );
 }

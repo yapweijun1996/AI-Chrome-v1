@@ -291,7 +291,7 @@ async function clearChatHistory() {
   addMessage('assistant', 'Chat cleared.');
 }
 
-function addMessage(role, content, timestamp = Date.now()) {
+function addMessage(role, content, timestamp = Date.now(), isMarkdown = false) {
   const messageDiv = document.createElement('div');
   messageDiv.className = `message ${role}`;
   
@@ -301,7 +301,12 @@ function addMessage(role, content, timestamp = Date.now()) {
   
   const messageContent = document.createElement('div');
   messageContent.className = 'content';
-  messageContent.textContent = content;
+  
+  if (isMarkdown) {
+    messageContent.innerHTML = marked.parse(content);
+  } else {
+    messageContent.textContent = content;
+  }
   
   const timestampDiv = document.createElement('div');
   timestampDiv.className = 'timestamp';
@@ -412,6 +417,7 @@ async function processUserMessage(message) {
       case 'RESEARCH':
         return await handleResearchIntent(message, intent);
       case 'AUTOMATION':
+      case 'NAVIGATION':
         return await handleAgentIntent(message, intent);
       case 'CONVERSATION':
         // Check for specific conversation types
@@ -423,7 +429,7 @@ async function processUserMessage(message) {
         }
         return await handleGeneralChat(message);
       default:
-        return await handleGeneralChat(message);
+        return await handleAgentIntent(message);
     }
   } catch (error) {
     console.error('Intent classification error:', error);
@@ -781,7 +787,12 @@ function renderLogItem(entry) {
   logItem.appendChild(msg);
   logItem.appendChild(badges);
 
-  if (entry.data || entry.result || entry.action || entry.observation || entry.error) {
+  if (entry.report) {
+    const reportDiv = document.createElement('div');
+    reportDiv.className = 'report';
+    reportDiv.innerHTML = marked.parse(entry.report);
+    logItem.appendChild(reportDiv);
+  } else if (entry.data || entry.result || entry.action || entry.observation || entry.error) {
     const details = document.createElement('details');
     const summary = document.createElement('summary');
     summary.textContent = 'Details';
