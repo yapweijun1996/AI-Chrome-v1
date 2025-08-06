@@ -758,10 +758,16 @@ function passesFilter(entry) {
 }
 
 function renderLogItem(entry) {
-  const logItem = document.createElement('div');
+  const logItem = document.createElement('details');
   logItem.className = `log-item log-${entry.level || 'info'}`;
   logItem.dataset.level = (entry.level || 'info').toLowerCase();
   logItem.dataset.msg = (entry.msg || '').toLowerCase();
+  if (entry.level === 'error' || entry.level === 'warn') {
+    logItem.open = true; // Auto-expand errors and warnings
+  }
+
+  const summary = document.createElement('summary');
+  summary.className = 'log-summary';
 
   const ts = new Date(entry.ts || Date.now()).toLocaleTimeString();
   const meta = document.createElement('span');
@@ -775,27 +781,32 @@ function renderLogItem(entry) {
   const badges = document.createElement('span');
   badges.className = 'badges';
   if (entry.tool) {
-    const b = document.createElement('span'); b.className = 'badge'; b.textContent = entry.tool;
+    const b = document.createElement('span');
+    b.className = 'badge tool';
+    b.textContent = entry.tool;
     badges.appendChild(b);
   }
   if (typeof entry.success === 'boolean') {
-    const b = document.createElement('span'); b.className = 'badge'; b.textContent = entry.success ? 'ok' : 'fail';
+    const b = document.createElement('span');
+    b.className = `badge ${entry.success ? 'success' : 'fail'}`;
+    b.textContent = entry.success ? 'OK' : 'FAIL';
     badges.appendChild(b);
   }
 
-  logItem.appendChild(meta);
-  logItem.appendChild(msg);
-  logItem.appendChild(badges);
+  summary.appendChild(meta);
+  summary.appendChild(msg);
+  summary.appendChild(badges);
+  logItem.appendChild(summary);
+
+  const logBody = document.createElement('div');
+  logBody.className = 'log-body';
 
   if (entry.report) {
     const reportDiv = document.createElement('div');
     reportDiv.className = 'report';
     reportDiv.innerHTML = marked.parse(entry.report);
-    logItem.appendChild(reportDiv);
+    logBody.appendChild(reportDiv);
   } else if (entry.data || entry.result || entry.action || entry.observation || entry.error) {
-    const details = document.createElement('details');
-    const summary = document.createElement('summary');
-    summary.textContent = 'Details';
     const pre = document.createElement('pre');
     pre.textContent = JSON.stringify({
       data: entry.data,
@@ -804,16 +815,17 @@ function renderLogItem(entry) {
       observation: entry.observation,
       error: entry.error
     }, null, 2);
-    details.appendChild(summary);
-    details.appendChild(pre);
-    logItem.appendChild(details);
+    logBody.appendChild(pre);
   }
+
   if (entry.error) {
     const err = document.createElement('span');
     err.className = 'error-msg';
     err.textContent = String(entry.error);
-    logItem.appendChild(err);
+    logBody.appendChild(err);
   }
+
+  logItem.appendChild(logBody);
   return logItem;
 }
 
