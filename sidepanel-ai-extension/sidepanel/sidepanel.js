@@ -4,16 +4,18 @@
 // Import centralized message types (in browser context)
 const MSG = window.MessageTypes?.MSG || {
   PING: "PING",
-  GET_ACTIVE_TAB: "GET_ACTIVE_TAB", 
+  GET_ACTIVE_TAB: "GET_ACTIVE_TAB",
   EXTRACT_PAGE_TEXT: "EXTRACT_PAGE_TEXT",
   SUMMARIZE_PAGE: "SUMMARIZE_PAGE",
+  CLASSIFY_INTENT: "CLASSIFY_INTENT",
   OPEN_SIDE_PANEL: "OPEN_SIDE_PANEL",
   READ_API_KEY: "READ_API_KEY",
   // Agent
   AGENT_RUN: "AGENT_RUN",
   AGENT_STOP: "AGENT_STOP",
-  AGENT_STATUS: "AGENT_STATUS", 
-  AGENT_LOG: "AGENT_LOG"
+  AGENT_STATUS: "AGENT_STATUS",
+  AGENT_LOG: "AGENT_LOG",
+  SHOW_REPORT: "SHOW_REPORT"
 };
 
 const ERROR_TYPES = window.MessageTypes?.ERROR_TYPES || {
@@ -1018,8 +1020,9 @@ function wireBasics() {
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === MSG.AGENT_LOG && message.entry) {
     addAgentLogToChat(message.entry);
-  }
-  if (message?.type === MSG.AGENT_STATUS && message.session?.running) {
+  } else if (message?.type === MSG.SHOW_REPORT && message.report) {
+    addMessage('assistant', message.report, Date.now(), message.format === 'markdown');
+  } else if (message?.type === MSG.AGENT_STATUS && message.session?.running) {
     // Ensure drawer visible while running
     ensureActivityOpen();
   }

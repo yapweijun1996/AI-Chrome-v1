@@ -572,6 +572,13 @@ async function dispatchAgentAction(tabId, action, settings) {
           msg: "User-facing report generated",
           report: reportRes.text
         });
+        // Send the report to the sidepanel for display
+        chrome.runtime.sendMessage({
+          type: MSG.SHOW_REPORT,
+          tabId: tabId,
+          report: reportRes.text,
+          format: format
+        });
         return { ok: true, observation: "Report generated successfully", report: reportRes.text };
       } else {
         return { ok: false, observation: "Failed to generate report" };
@@ -611,10 +618,11 @@ async function runAgentLoop(tabId, goal, settings) {
     return;
   }
 
-  sess.currentPlan = planResult.plan;
+  sess.currentPlan = planResult.plan.steps;
   emitAgentLog(tabId, {
     level: LOG_LEVELS.INFO,
     msg: "Multi-step plan generated",
+    thought: planResult.plan.thought,
     plan: sess.currentPlan
   });
 
