@@ -629,14 +629,6 @@ async function runAgentLoop(tabId, goal, settings) {
       break;
     }
 
-    // New "reasoning" step
-    const reasoningPrompt = `Given the goal "${goal}", the last action "${JSON.stringify(action)}", and the observation "${execRes.observation}", should I continue with the plan? Respond with "continue" or "stop".`;
-    const reasoningRes = await callModelWithRotation(reasoningPrompt, { model: "gemini-1.5-flash" });
-
-    if (reasoningRes.ok && reasoningRes.text.toLowerCase().includes("stop")) {
-      stopAgent(tabId, "Agent decided to stop.");
-      break;
-    }
 
     sess.step++;
     sess.currentStepIndex++;

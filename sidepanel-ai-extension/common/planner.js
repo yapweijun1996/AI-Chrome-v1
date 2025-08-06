@@ -33,22 +33,42 @@
     }
 
     buildMultiStepPrompt(goal, context) {
-      // This prompt will be designed to generate a multi-step plan
-      // instead of a single action.
+      // This prompt is designed to generate a complete, end-to-end, multi-step plan.
       return `
-        You are an expert planner. Given the goal and context, create a multi-step plan to achieve the goal.
-        Goal: ${goal}
-        Context: ${JSON.stringify(context, null, 2)}
+        You are an expert web automation agent. Your task is to create a complete, multi-step plan to achieve a user's goal.
 
-        Return a JSON object with an array of steps. Each step should be an action with a tool and parameters.
-        Example:
+        **Goal:** ${goal}
+
+        **Context:**
+        - Current URL: ${context.pageInfo.url}
+        - Page Title: ${context.pageInfo.title}
+        - History (last 3 actions): ${JSON.stringify(context.history.slice(-3), null, 2)}
+        - Interactive Elements (first 20): ${JSON.stringify(context.interactiveElements.slice(0, 20), null, 2)}
+
+        **Instructions:**
+        1.  **Think Step-by-Step:** Analyze the goal and the current context. Create a complete plan from start to finish.
+        2.  **Anticipate Changes:** Your plan should account for page navigations and new information. For example, after a search, the next step should be to analyze the results, not just stop.
+        3.  **Be Comprehensive:** Do not create a partial plan. The plan must include all steps necessary to fully achieve the goal.
+        4.  **Use Available Tools:** The available tools are: navigate, click, fill, scroll, waitForSelector, screenshot, tabs.query, tabs.activate, tabs.close, and done.
+        5.  **Output JSON:** Your response must be a single JSON object containing a "steps" array.
+
+        **Example of a COMPLETE Plan:**
+        If the goal is "find the price of an iPad", a good plan would be:
         {
           "steps": [
-            { "tool": "navigate", "params": { "url": "https://google.com" } },
-            { "tool": "fill", "params": { "selector": "input[name=q]", "value": "ipad price" } },
-            { "tool": "click", "params": { "selector": "input[type=submit]" } }
+            { "tool": "navigate", "params": { "url": "https://www.google.com" } },
+            { "tool": "fill", "params": { "selector": "input[name=q]", "value": "iPad price" } },
+            { "tool": "click", "params": { "selector": "input[type=submit]" } },
+            { "tool": "waitForSelector", "params": { "selector": "#search" } },
+            { "tool": "screenshot", "params": {} },
+            { "tool": "generate_report", "params": { "format": "markdown", "content": "Analyze the search results to find the price of the iPad." } },
+            { "tool": "done", "params": { "reason": "Price found and reported." } }
           ]
         }
+
+        Now, generate the complete plan for the user's goal.
+
+        **Your Plan:**
       `;
     }
 
