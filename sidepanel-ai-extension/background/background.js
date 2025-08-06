@@ -465,32 +465,7 @@ async function dispatchAgentAction(tabId, action, settings) {
   const sess = agentSessions.get(tabId);
   if (!sess) throw new Error("No agent session");
 
-  // Guard restricted URLs for any DOM action with detailed feedback
-  const { url } = await getPageInfoForPlanning(tabId);
-  if (isRestrictedUrl(url) && tool !== "navigate" && !tool.startsWith("tabs.")) {
-    const restrictedType = url.startsWith("chrome://") ? "Chrome system page" :
-                          url.startsWith("edge://") ? "Edge system page" :
-                          url.startsWith("about:") ? "Browser about page" :
-                          url.startsWith("chrome-extension://") ? "Chrome extension page" :
-                          url.startsWith("moz-extension://") ? "Firefox extension page" :
-                          "Restricted page";
-    
-    emitAgentLog(tabId, { 
-      level: LOG_LEVELS.ERROR, 
-      msg: "Restricted URL: DOM tools blocked by browser security", 
-      url: url,
-      pageType: restrictedType,
-      tool: tool,
-      allowedActions: "Only 'navigate' and 'tabs.*' actions work on this page",
-      suggestion: "Navigate to a regular http:// or https:// website to use DOM tools",
-      errorType: ERROR_TYPES.RESTRICTED_URL
-    });
-    return { 
-      ok: false, 
-      observation: `${restrictedType}: Cannot use DOM tools like ${tool}. Navigate to a regular website (http/https) or use 'tabs.*' actions only.`,
-      errorType: ERROR_TYPES.RESTRICTED_URL
-    };
-  }
+  // URL restriction logic has been disabled by user request.
 
   switch (tool) {
     case "navigate": {
@@ -883,24 +858,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
           if (!tab?.id) return sendResponse({ ok: false, error: "No active tab" });
 
-          // Disallow restricted pages where content scripts cannot run
-          try {
-            const url = tab.url || "";
-            if (isRestrictedUrl(url)) {
-              const restrictedType = url.startsWith("chrome://") ? "Chrome system page" :
-                                    url.startsWith("edge://") ? "Edge system page" :
-                                    url.startsWith("about:") ? "Browser about page" :
-                                    url.startsWith("chrome-extension://") ? "Chrome extension page" :
-                                    url.startsWith("moz-extension://") ? "Firefox extension page" :
-                                    "Restricted page";
-              return sendResponse({ 
-                ok: false, 
-                error: `${restrictedType}: Content extraction blocked by browser security. Navigate to a regular http:// or https:// website.`,
-                pageType: restrictedType,
-                suggestion: "Try navigating to google.com, wikipedia.org, or any regular website"
-              });
-            }
-          } catch {}
+          // URL restriction logic has been disabled by user request.
 
           try {
             // Try sending first
@@ -940,24 +898,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
           if (!tab?.id) return sendResponse({ ok: false, error: "No active tab" });
 
-          // Disallow restricted pages where content scripts cannot run
-          try {
-            const url = tab.url || "";
-            if (isRestrictedUrl(url)) {
-              const restrictedType = url.startsWith("chrome://") ? "Chrome system page" :
-                                    url.startsWith("edge://") ? "Edge system page" :
-                                    url.startsWith("about:") ? "Browser about page" :
-                                    url.startsWith("chrome-extension://") ? "Chrome extension page" :
-                                    url.startsWith("moz-extension://") ? "Firefox extension page" :
-                                    "Restricted page";
-              return sendResponse({ 
-                ok: false, 
-                error: `${restrictedType}: Page summarization blocked by browser security. Navigate to a regular http:// or https:// website.`,
-                pageType: restrictedType,
-                suggestion: "Try navigating to news.com, wikipedia.org, or any article page"
-              });
-            }
-          } catch {}
+          // URL restriction logic has been disabled by user request.
 
           // 1) Extract page text with fallback injection
           let extract;
@@ -1046,30 +987,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     } catch (err) {
       // Avoid throwing for restricted pages; surface friendly message if detectable
       const msg = String(err?.message || err);
-      const restricted = /Cannot access a (chrome|edge):\/\//i.test(msg) ||
-                         /Cannot access a chrome-extension:\/\//i.test(msg) ||
-                         /Cannot access a moz-extension:\/\//i.test(msg) ||
-                         /Cannot access an about:/i.test(msg) ||
-                         /cannot access.*(chrome|edge):\/\//i.test(msg);
-      if (restricted) {
-        console.warn("[BG] Restricted page access blocked:", msg);
-        try {
-          sendResponse({ 
-            ok: false, 
-            error: "Browser security restriction: Cannot access system pages. Navigate to a regular http:// or https:// website to use AI agent features.",
-            errorType: ERROR_TYPES.RESTRICTED_URL,
-            suggestion: "Try visiting google.com, github.com, or any public website"
-          });
-        } catch (_) {
-          // ignore if channel closed
-        }
-      } else {
-        console.error("[BG] Error:", err);
-        try {
-          sendResponse({ ok: false, error: msg });
-        } catch (_) {
-          // ignore if channel closed
-        }
+      console.error("[BG] Error:", err);
+      try {
+        sendResponse({ ok: false, error: msg });
+      } catch (_) {
+        // ignore if channel closed
       }
     }
   })();
