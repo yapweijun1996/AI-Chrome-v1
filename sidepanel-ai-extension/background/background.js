@@ -26,6 +26,7 @@
   safeImport("../common/enhanced-planner.js");            // Enhanced multi-step planner
   safeImport("../common/pricing-research-tools.js");      // Pricing research tools
   safeImport("../common/clarification-manager.js");       // Clarification management
+  safeImport("../common/storage.js");           // IndexedDB session storage
   // api-key-manager.js is optional; guard its absence
   try {
     safeImport("../common/api-key-manager.js");  // API key rotation/manager (if present)
@@ -96,28 +97,26 @@ const progressThrottle = new Map(); // tabId -> { lastProgressTime, messageCount
 const PROGRESS_THROTTLE_MS = 2000; // Minimum 2 seconds between progress messages
 const MAX_PROGRESS_BURST = 3; // Maximum 3 messages in quick succession
 
-// Session persistence functions for service worker restarts
+// Session persistence functions using IndexedDB
 async function saveSessionToStorage(tabId, session) {
   try {
-    const storageKey = `agent_session_${tabId}`;
+    // Ensure the session object has the key for IndexedDB
     const sessionData = {
       ...session,
-      // Convert logs array to a limited size to avoid storage quota issues
-      logs: session.logs ? session.logs.slice(-50) : [],
-      // Store timestamp for cleanup
-      lastSaved: Date.now()
+      sessionId: tabId,
+      // Limit logs to avoid excessive storage usage
+      logs: session.logs ? session.logs.slice(-100) : [],
+      history: session.history ? session.history.slice(-20) : [],
     };
-    await chrome.storage.local.set({ [storageKey]: sessionData });
+    await saveSession(sessionData);
   } catch (e) {
-    console.warn('[BG] Failed to save session to storage:', e);
+    console.warn('[BG] Failed to save session to IndexedDB:', e);
   }
 }
 
 async function restoreSessionFromStorage(tabId) {
   try {
-    const storageKey = `agent_session_${tabId}`;
-    const result = await chrome.storage.local.get(storageKey);
-    const sessionData = result[storageKey];
+    const sessionData = await loadSession(tabId);
     
     if (sessionData) {
       // Restore session but mark as not running (service worker restart)
@@ -127,33 +126,20 @@ async function restoreSessionFromStorage(tabId) {
         stopped: true   // Mark as stopped to prevent auto-continuation
       };
       agentSessions.set(tabId, restoredSession);
+      console.log(`[BG] Restored session for tab ${tabId} from IndexedDB`);
       return restoredSession;
     }
   } catch (e) {
-    console.warn('[BG] Failed to restore session from storage:', e);
+    console.warn(`[BG] Failed to restore session for tab ${tabId} from IndexedDB:`, e);
   }
   return null;
 }
 
+// No cleanup needed for now with IndexedDB, but can be added later if necessary.
 async function cleanupOldSessions() {
-  try {
-    const result = await chrome.storage.local.get();
-    const cutoffTime = Date.now() - (24 * 60 * 60 * 1000); // 24 hours
-    const keysToRemove = [];
-    
-    for (const [key, value] of Object.entries(result)) {
-      if (key.startsWith('agent_session_') && value.lastSaved && value.lastSaved < cutoffTime) {
-        keysToRemove.push(key);
-      }
-    }
-    
-    if (keysToRemove.length > 0) {
-      await chrome.storage.local.remove(keysToRemove);
-      console.log(`[BG] Cleaned up ${keysToRemove.length} old agent sessions`);
-    }
-  } catch (e) {
-    console.warn('[BG] Failed to cleanup old sessions:', e);
-  }
+    // This function is now a no-op but kept for structural integrity.
+    // In a production scenario, you might implement a cleanup based on session timestamps.
+    console.log("[BG] Skipping session cleanup for IndexedDB implementation.");
 }
 
 // Timeout wrapper functions
@@ -713,10 +699,8 @@ function emitAgentLog(tabId, entry) {
 
   sess.logs.push(logEntry);
   
-  // Persist session after significant changes
-  if (entry.level === LOG_LEVELS.ERROR || entry.level === LOG_LEVELS.INFO || sess.logs.length % 5 === 0) {
-    saveSessionToStorage(tabId, sess);
-  }
+  // Session is now persisted after each action in updateSessionContext.
+  // The call here is removed to avoid redundant writes.
   
   try {
     chrome.runtime.sendMessage({ type: MSG.AGENT_LOG, tabId, entry: logEntry });
@@ -886,6 +870,8 @@ function getToolEmoji(tool) {
     'fill': '✏️',
     'scroll': '📜',
     'screenshot': '📸',
+    'scrape': '✂️',
+    'think': '🤔',
     'waitForSelector': '⏳',
     'tabs.query': '🗂️',
     'tabs.activate': '🔄',
@@ -906,6 +892,8 @@ function getToolDescription(tool) {
     'click': 'Clicking element',
     'fill': 'Filling form field',
     'scroll': 'Scrolling page',
+    'scrape': 'Scraping content',
+    'think': 'Thinking',
     'screenshot': 'Taking screenshot',
     'waitForSelector': 'Waiting for element',
     'tabs.query': 'Searching tabs',
@@ -927,8 +915,14 @@ function stopAgent(tabId, reason = "STOP requested") {
   sess.running = false;
   emitAgentLog(tabId, { level: "warn", msg: "Agent stopped", reason });
   
-  // Persist session when stopped
+  // Persist final session state
   saveSessionToStorage(tabId, sess);
+
+  // If the agent is stopping because the goal is achieved, clear the session from DB
+  if (reason.includes("Goal achieved") || reason.includes("done")) {
+    console.log(`[BG] Task for tab ${tabId} is complete. Clearing session from IndexedDB.`);
+    clearSession(tabId).catch(e => console.warn(`[BG] Failed to clear session ${tabId}:`, e));
+  }
 }
 
 async function getPageInfoForPlanning(tabId) {
@@ -1032,6 +1026,24 @@ async function dispatchAgentAction(tabId, action, settings) {
       }
       const res = await chrome.tabs.sendMessage(tabId, { type: "WAIT_FOR_SELECTOR", selector: resolvedParams.selector || "", timeoutMs: resolvedParams.timeoutMs || 5000 });
       return res?.ok ? { ok: true, observation: res.msg || "Selector found" } : { ok: false, observation: res?.error || "Wait failed" };
+    }
+    case "scrape": {
+        if (!(await ensureContentScript(tabId))) {
+            return { ok: false, observation: "Content script unavailable" };
+        }
+        const res = await chrome.tabs.sendMessage(tabId, { type: MSG.SCRAPE_SELECTOR, selector: resolvedParams.selector || "" });
+        
+        if (res?.ok) {
+            // Truncate potentially large scraped data for the observation log
+            const observationText = `Scraped ${res.data?.length} items. Content: ${JSON.stringify(res.data).substring(0, 500)}...`;
+            return { ok: true, observation: observationText, data: res.data };
+        } else {
+            return { ok: false, observation: res?.error || "Scrape failed" };
+        }
+    }
+    case "think": {
+        const thought = String(resolvedParams.thought || "...");
+        return { ok: true, observation: `Thought recorded: ${thought}` };
     }
     case "screenshot": {
       try {
@@ -1326,70 +1338,100 @@ async function runAgentLoop(tabId, goal, settings) {
   sess.running = true;
   sess.stopped = false;
   sess.step = 0;
-  sess.currentPlan = [];
-  sess.currentStepIndex = 0;
 
   emitAgentLog(tabId, {
     level: LOG_LEVELS.INFO,
-    msg: "Agent started with multi-step planning",
+    msg: "Agentic loop started",
     goal,
     model: sess.selectedModel,
-    requestId: sess.requestId,
-    maxSteps: Math.min(Number(settings?.maxSteps || 12), 50),
-    initialTaskContext: sess.taskContext
+    settings
   });
 
-  const planner = new AIPlanner({ model: sess.selectedModel });
-  const contextData = await gatherEnhancedContext(tabId, sess, goal);
-  const planResult = await planner.generatePlan(goal, contextData);
+  // Start the agentic loop
+  agenticLoop(tabId, goal, settings);
+}
 
-  if (!planResult.ok) {
-    stopAgent(tabId, "Failed to generate a plan.");
+async function agenticLoop(tabId, goal, settings) {
+  const sess = agentSessions.get(tabId);
+  if (!sess || sess.stopped) {
     return;
   }
 
-  sess.currentPlan = planResult.plan.steps;
-  emitAgentLog(tabId, {
-    level: LOG_LEVELS.INFO,
-    msg: "Multi-step plan generated",
-    thought: planResult.plan.thought,
-    plan: sess.currentPlan
-  });
+  // Perceive
+  const context = await gatherContextForReasoning(tabId, sess);
 
-  while (!sess.stopped && sess.currentStepIndex < sess.currentPlan.length) {
-    const action = sess.currentPlan[sess.currentStepIndex];
-    const execRes = await executeActionWithContext(tabId, sess, action, settings);
-    updateSessionContext(tabId, sess, action, execRes);
+  // Reason
+  const reasoningPrompt = buildReasoningPrompt(goal, context, sess.history);
+  const modelResponse = await callModelWithRotation(reasoningPrompt, { model: sess.selectedModel, tabId });
 
-    if (!execRes.ok) {
-      // Handle failure (simplified for now)
-      stopAgent(tabId, `Action failed: ${execRes.observation}`);
-      break;
+  if (!modelResponse.ok) {
+    emitAgentLog(tabId, { level: LOG_LEVELS.ERROR, msg: "Reasoning failed", error: modelResponse.error });
+    stopAgent(tabId, "Reasoning failed");
+    return;
+  }
+
+  const { action, rationale } = parseModelResponse(modelResponse.text);
+
+  if (!action || !action.tool) {
+    emitAgentLog(tabId, { level: LOG_LEVELS.ERROR, msg: "Failed to parse action from model response", response: modelResponse.text });
+    stopAgent(tabId, "Failed to parse action");
+    return;
+  }
+
+  // Act
+  const execRes = await executeActionWithContext(tabId, sess, action, settings);
+
+  // Observe
+  updateSessionContext(tabId, sess, action, execRes);
+
+  if (action.tool === 'done' || sess.step >= settings.maxSteps) {
+    stopAgent(tabId, "Goal achieved or max steps reached.");
+    return;
+  }
+
+  // Continue the loop
+  sess.step++;
+  const delay = calculateAdaptiveDelay(action, execRes.ok);
+  await new Promise(r => setTimeout(r, delay));
+  agenticLoop(tabId, goal, settings);
+}
+
+function parseModelResponse(responseText) {
+  try {
+    const jsonResult = extractJSONWithRetry(responseText, 'model response');
+    if (jsonResult.success) {
+      return { action: jsonResult.data.action, rationale: jsonResult.data.rationale };
     }
+  } catch (e) {
+    // Fallback for non-json response
+  }
+  return { action: null, rationale: null };
+}
 
+async function gatherContextForReasoning(tabId, sess) {
+  const pageInfo = await getPageInfoForPlanning(tabId);
+  let pageContent = "";
+  let interactiveElements = [];
 
-    sess.step++;
-    sess.currentStepIndex++;
-    const delay = calculateAdaptiveDelay(action, execRes.ok);
-    await new Promise(r => setTimeout(r, delay));
+  if (!isRestrictedUrl(pageInfo.url)) {
+    if (await ensureContentScript(tabId)) {
+      try {
+        const textExtract = await chrome.tabs.sendMessage(tabId, { type: MSG.EXTRACT_PAGE_TEXT, maxChars: 8000 });
+        if (textExtract?.ok) pageContent = textExtract.text;
+
+        const elementsExtract = await chrome.tabs.sendMessage(tabId, { type: MSG.GET_INTERACTIVE_ELEMENTS });
+        if (elementsExtract?.ok) interactiveElements = elementsExtract.elements;
+      } catch (e) {
+        console.warn("Failed to get page context", e);
+      }
+    }
   }
 
-  if (!sess.stopped) {
-    // Send completion message before stopping
-    try {
-      chrome.runtime.sendMessage({
-        type: MSG.AGENT_PROGRESS,
-        tabId,
-        message: `✅ Agent completed successfully! Executed ${sess.step} steps.`,
-        step: sess.step,
-        timestamp: Date.now()
-      });
-    } catch (_) {}
-    
-    stopAgent(tabId, "Plan completed.");
-  }
-
-  await saveSessionToStorage(tabId, sess);
+  return {
+    pageInfo,
+    pageContent,
+    interactiveElements,
+  };
 }
 
 // Initialize enhanced features on startup
@@ -2091,7 +2133,7 @@ function updateSessionContext(tabId, sess, action, execRes) {
 
   // Add to history and keep it trimmed
   sess.history.push({ action, observation: execRes?.observation || "" });
-  if (sess.history.length > 10) {
+  if (sess.history.length > 20) { // Increased history size for better context
     sess.history.shift();
   }
 
@@ -2100,6 +2142,9 @@ function updateSessionContext(tabId, sess, action, execRes) {
     sess.contextCache = {};
     emitAgentLog(tabId, { level: LOG_LEVELS.DEBUG, msg: "Context cache invalidated after navigation." });
   }
+
+  // Persist session state after each action
+  saveSessionToStorage(tabId, sess);
 }
 
 // [CONTEXT ENGINEERING] Adaptive failure handling and self-correction

@@ -402,35 +402,8 @@ async function sendMessage() {
 }
 
 async function processUserMessage(message) {
-  // Use enhanced AI-powered intent classification with ambiguity detection
-  try {
-    const enhancedResult = await classifyUserIntentEnhanced(message);
-    
-    if (!enhancedResult) {
-      // Fallback to basic classification
-      const basicIntent = await classifyUserIntent(message);
-      return await routeBasedOnIntent(message, basicIntent);
-    }
-
-    // Handle clarification requests
-    if (enhancedResult.needsClarification) {
-      return await handleClarificationRequest(message, enhancedResult);
-    }
-
-    // Route to appropriate handler based on enhanced classification
-    return await routeBasedOnIntent(message, enhancedResult.classification);
-    
-  } catch (error) {
-    console.error('Enhanced intent classification error:', error);
-    // Fallback to basic classification
-    try {
-      const basicIntent = await classifyUserIntent(message);
-      return await routeBasedOnIntent(message, basicIntent);
-    } catch (fallbackError) {
-      console.error('Fallback classification also failed:', fallbackError);
-      return await handleGeneralChat(message);
-    }
-  }
+  // All user messages are now treated as goals for the agent
+  return await handleAgentIntent(message);
 }
 
 /**

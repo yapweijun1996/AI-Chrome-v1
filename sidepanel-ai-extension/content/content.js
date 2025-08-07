@@ -22,7 +22,8 @@
     EXTRACT_STRUCTURED_CONTENT: "EXTRACT_STRUCTURED_CONTENT",
     ANALYZE_PAGE_URLS: "ANALYZE_PAGE_URLS",
     FETCH_URL_CONTENT: "FETCH_URL_CONTENT",
-    GET_PAGE_LINKS: "GET_PAGE_LINKS"
+    GET_PAGE_LINKS: "GET_PAGE_LINKS",
+    SCRAPE_SELECTOR: "SCRAPE_SELECTOR"
   };
 
 function getPageText(maxChars = 20000) {
@@ -141,64 +142,93 @@ function extractUrlsFromText(text) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  (async () => {
-    try {
-      // Validate message shape early to avoid "undefined" type logs
-      if (!message || typeof message.type === 'undefined') {
-        console.warn("[ContentScript] Received message without type:", JSON.stringify(message || {}));
-        sendResponse({ ok: false, error: "Unknown message type in content script: undefined" });
-        return;
-      }
+(async () => {
+  try {
+    // Validate message shape early to avoid "undefined" type logs
+    if (!message || typeof message.type === 'undefined') {
+      console.warn("[ContentScript] Received message without type:", JSON.stringify(message || {}));
+      sendResponse({ ok: false, error: "Unknown message type in content script: undefined" });
+      return;
+    }
 
-      switch (message.type) {
-        case MSG.EXTRACT_PAGE_TEXT: {
-          const text = getPageText(message.maxChars);
-          sendResponse({ ok: true, text });
-          break;
+    switch (message.type) {
+      case MSG.AGENT_EXECUTE_TOOL: {
+        const { tool, params } = message;
+        let result;
+        switch (tool) {
+          case "click":
+            result = await new Promise(resolve => handleClickSelector({ selector: params.selector }, resolve));
+            break;
+          case "fill":
+            result = await new Promise(resolve => handleFillSelector({ selector: params.selector, value: params.value }, resolve));
+            break;
+          case "scroll":
+            result = await new Promise(resolve => handleScrollToSelector({ selector: params.selector, direction: params.direction }, resolve));
+            break;
+          case "waitForSelector":
+            result = await new Promise(resolve => handleWaitForSelector({ selector: params.selector, timeoutMs: params.timeoutMs }, resolve));
+            break;
+          case "scrape":
+            result = await new Promise(resolve => handleScrapeSelector({ selector: params.selector }, resolve));
+            break;
+          default:
+            result = { ok: false, error: `Unknown tool: ${tool}` };
         }
-        case MSG.CLICK_SELECTOR: {
-          handleClickSelector(message, sendResponse);
-          break;
-        }
-        case MSG.FILL_SELECTOR: {
-          handleFillSelector(message, sendResponse);
-          break;
-        }
-        case MSG.SCROLL_TO_SELECTOR: {
-          handleScrollToSelector(message, sendResponse);
-          break;
-        }
-        case MSG.WAIT_FOR_SELECTOR: {
-          handleWaitForSelector(message, sendResponse);
-          break;
-        }
-        case MSG.GET_PAGE_INFO: {
-          handleGetPageInfo(message, sendResponse);
-          break;
-        }
-        case MSG.GET_INTERACTIVE_ELEMENTS: {
-          handleGetInteractiveElements(message, sendResponse);
-          break;
-        }
-        case MSG.EXTRACT_STRUCTURED_CONTENT: {
-          handleExtractStructuredContent(message, sendResponse);
-          break;
-        }
-        case MSG.ANALYZE_PAGE_URLS: {
-          handleAnalyzePageUrls(message, sendResponse);
-          break;
-        }
-        case MSG.FETCH_URL_CONTENT: {
-          handleFetchUrlContent(message, sendResponse);
-          break;
-        }
-        case MSG.GET_PAGE_LINKS: {
-          handleGetPageLinks(message, sendResponse);
-          break;
-        }
-        default:
-          sendResponse({ ok: false, error: "Unknown message type in content script: " + message.type });
+        sendResponse(result);
+        break;
       }
+      case MSG.EXTRACT_PAGE_TEXT: {
+        const text = getPageText(message.maxChars);
+        sendResponse({ ok: true, text });
+        break;
+      }
+      case MSG.CLICK_SELECTOR: {
+        handleClickSelector(message, sendResponse);
+        break;
+      }
+      case MSG.FILL_SELECTOR: {
+        handleFillSelector(message, sendResponse);
+        break;
+      }
+      case MSG.SCROLL_TO_SELECTOR: {
+        handleScrollToSelector(message, sendResponse);
+        break;
+      }
+      case MSG.WAIT_FOR_SELECTOR: {
+        handleWaitForSelector(message, sendResponse);
+        break;
+      }
+      case MSG.GET_PAGE_INFO: {
+        handleGetPageInfo(message, sendResponse);
+        break;
+      }
+      case MSG.GET_INTERACTIVE_ELEMENTS: {
+        handleGetInteractiveElements(message, sendResponse);
+        break;
+      }
+      case MSG.EXTRACT_STRUCTURED_CONTENT: {
+        handleExtractStructuredContent(message, sendResponse);
+        break;
+      }
+      case MSG.ANALYZE_PAGE_URLS: {
+        handleAnalyzePageUrls(message, sendResponse);
+        break;
+      }
+      case MSG.FETCH_URL_CONTENT: {
+        handleFetchUrlContent(message, sendResponse);
+        break;
+      }
+      case MSG.GET_PAGE_LINKS: {
+        handleGetPageLinks(message, sendResponse);
+        break;
+      }
+      case MSG.SCRAPE_SELECTOR: {
+        handleScrapeSelector(message, sendResponse);
+        break;
+      }
+      default:
+        sendResponse({ ok: false, error: "Unknown message type in content script: " + message.type });
+    }
     } catch (err) {
       console.error("[ContentScript] Error:", err);
       sendResponse({ ok: false, error: String(err?.message || err) });
@@ -785,6 +815,38 @@ function calculateLinkRelevance(linkElement) {
   }
   
   return Math.max(0, score);
+}
+
+function handleScrapeSelector(message, sendResponse) {
+  try {
+    const selector = message.selector;
+    if (!selector) {
+      return sendResponse({ ok: false, error: "No selector provided for scrape" });
+    }
+
+    const elements = Array.from(document.querySelectorAll(selector));
+    if (elements.length === 0) {
+      return sendResponse({ ok: false, error: `No elements found for selector: ${selector}` });
+    }
+
+    const scrapedData = elements.map(el => {
+      // Return a structured representation of the element
+      return {
+        tag: el.tagName.toLowerCase(),
+        text: el.innerText || el.textContent || '',
+        html: el.innerHTML,
+        attributes: Array.from(el.attributes).reduce((acc, attr) => {
+          acc[attr.name] = attr.value;
+          return acc;
+        }, {})
+      };
+    });
+
+    sendResponse({ ok: true, msg: `Scraped ${scrapedData.length} element(s)`, data: scrapedData });
+
+  } catch (error) {
+    sendResponse({ ok: false, error: `Scrape failed: ${error.message}` });
+  }
 }
 
 })(); // End of IIFE guard
