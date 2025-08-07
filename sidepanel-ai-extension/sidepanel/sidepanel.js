@@ -227,7 +227,7 @@ function updateAgentStatusUI(session, wasRunning) {
     // Agent is running
     stopBtn.style.display = 'block';
     stopBtn.classList.add('active');
-    stopBtn.title = `Agent running (step ${session.step || 0}/${session.settings?.maxSteps || 12}) - Click to stop`;
+    stopBtn.title = `Agent running (step ${session.step || 0}/${session.settings?.maxSteps || 'N/A'}) - Click to stop`;
     
     // Start status monitoring if not already running
     if (!statusCheckInterval) {
@@ -1331,4 +1331,43 @@ function ensureActivityOpen() {
   if (window.matchMedia('(min-width: 721px)').matches) {
     setActivityOpen(true);
   }
+}
+/* ---------- Plan Visualization helpers ---------- */
+function renderPlan(container, subTasks) {
+  if (!container) return;
+
+  container.innerHTML = ''; // Clear previous plan
+  const planList = document.createElement('ul');
+  planList.className = 'plan-list';
+  
+  const title = document.createElement('div');
+  title.className = 'plan-title';
+  title.textContent = 'Agent Plan';
+  container.appendChild(title);
+
+  subTasks.forEach((task, index) => {
+    const item = document.createElement('li');
+    item.className = 'plan-step';
+    item.dataset.index = index;
+    item.innerHTML = `<span class="plan-icon"></span><span class="plan-text">${escapeHtml(task)}</span>`;
+    planList.appendChild(item);
+  });
+
+  container.appendChild(planList);
+}
+
+function updatePlan(currentTaskIndex) {
+  if (!currentPlanMessage) return;
+
+  const steps = currentPlanMessage.querySelectorAll('.plan-step');
+  steps.forEach((step, index) => {
+    step.classList.remove('completed', 'in-progress', 'pending');
+    if (index < currentTaskIndex) {
+      step.classList.add('completed');
+    } else if (index === currentTaskIndex) {
+      step.classList.add('in-progress');
+    } else {
+      step.classList.add('pending');
+    }
+  });
 }

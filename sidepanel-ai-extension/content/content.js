@@ -41,7 +41,27 @@ function getPageText(maxChars = 20000) {
 }
 
 function extractStructuredContent() {
+  // 1. Prioritize JSON-LD for structured data
+  const jsonLdScripts = document.querySelectorAll('script[type="application/ld+json"]');
+  if (jsonLdScripts.length > 0) {
+    try {
+      const jsonLdData = Array.from(jsonLdScripts).map(script => JSON.parse(script.textContent));
+      // If we found JSON-LD, we can return it as the primary structured content
+      // We can add more processing here later to normalize it
+      return {
+        source: 'json-ld',
+        data: jsonLdData,
+        title: document.title,
+        mainContent: getCleanTextContent(document.body) // Still provide main text as fallback
+      };
+    } catch (e) {
+      console.warn("Failed to parse JSON-LD script:", e);
+    }
+  }
+
+  // 2. Fallback to existing HTML structure analysis if no JSON-LD
   const content = {
+    source: 'html',
     title: document.title || '',
     description: '',
     mainContent: '',
@@ -107,11 +127,12 @@ function extractStructuredContent() {
     })
     .map(meta => {
       const name = meta.getAttribute('name') || meta.getAttribute('property');
-      const content = meta.getAttribute('content');
-      return `${name}: ${content}`;
+      const contentValue = meta.getAttribute('content');
+      return `${name}: ${contentValue}`;
     })
     .slice(0, 10);
 
+  content.sections = getSemanticSections();
   return content;
 }
 
@@ -139,6 +160,33 @@ function extractUrlsFromText(text) {
   const urlRegex = /https?:\/\/[^\s<>"{}|\\^`[\]]+/gi;
   const urls = text.match(urlRegex) || [];
   return [...new Set(urls)].slice(0, 10); // Remove duplicates and limit
+}
+
+function getSemanticSections() {
+  const sections = [];
+  const selectors = [
+    { tag: 'article', role: 'article' },
+    { tag: 'section', role: 'section' },
+    { tag: 'nav', role: 'navigation' },
+    { tag: 'aside', role: 'complementary' },
+    { tag: 'header', role: 'banner' },
+    { tag: 'footer', role: 'contentinfo' },
+  ];
+
+  selectors.forEach(({ tag, role }) => {
+    document.querySelectorAll(tag).forEach((el, index) => {
+      const text = getCleanTextContent(el);
+      if (text.length > 100) { // Only include sections with substantial content
+        sections.push({
+          role: role,
+          id: el.id || `${tag}-${index}`,
+          text: text.substring(0, 2000), // Truncate for brevity
+        });
+      }
+    });
+  });
+
+  return sections;
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

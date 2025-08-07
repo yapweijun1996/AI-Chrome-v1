@@ -59,18 +59,34 @@ function buildAgentPlanPrompt(fullGoal, currentSubTask, context = {}) {
     lastAction = "",
     lastObservation = "",
     history = [],
+    scratchpad = [],
     taskContext = {},
     progressMetrics = {},
-    failurePatterns = []
+    failurePatterns = [],
+    successCriteria = {},
+    chatSummary = ""
   } = context || {};
-  
-  const historyLog = history.map((h, i) => {
-    const success = h.observation && !h.observation.toLowerCase().includes('failed') && !h.observation.toLowerCase().includes('error');
-    return `Step ${i + 1}: ${success ? '✓' : '✗'}
-- Action: ${JSON.stringify(h.action)}
-- Observation: ${h.observation}
-- Success: ${success}`;
-  }).join("\n\n");
+
+  const chatSummaryLog = chatSummary
+    ? `CHAT SUMMARY (Recent conversation with user):
+---
+${chatSummary}
+---`
+    : "";
+
+  const scratchpadLog = scratchpad.length > 0
+    ? `AGENT'S SCRATCHPAD (Working Memory):
+---
+${scratchpad.join("\n\n")}
+---`
+    : "AGENT'S SCRATCHPAD (Working Memory):\n---No notes taken yet.---\n";
+
+  const successCriteriaLog = successCriteria
+    ? `SUCCESS CRITERIA (Your goal is to populate this structure):
+---
+${JSON.stringify(successCriteria, null, 2)}
+---`
+    : "";
 
   const elementsLog = interactiveElements.length > 0
     ? `Available Interactive Elements (prioritized by relevance):
@@ -102,10 +118,11 @@ ${elementsLog}
 EXECUTION CONTEXT:
 ${progressAnalysis}
 
-RECENT HISTORY (last ${Math.min(history.length, 10)} steps):
----
-${historyLog || "No previous actions taken"}
----
+${scratchpadLog}
+
+${chatSummaryLog}
+
+${successCriteriaLog}
 
 LAST ACTION ANALYSIS:
 Action: ${JSON.stringify(lastAction) || "None"}
@@ -134,7 +151,7 @@ ${(pageContent || "").substring(0, 2000)}${pageContent && pageContent.length > 2
 
 Return ONLY a JSON object with your next action:
 {
-  "tool": "navigate|click|fill|scroll|waitForSelector|screenshot|tabs.query|tabs.activate|tabs.close|generate_report|done",
+  "tool": "read_page_content|navigate|click|fill|scroll|waitForSelector|screenshot|tabs.query|tabs.activate|tabs.close|generate_report|done|record_finding",
   "params": { /* tool-specific parameters */ },
   "rationale": "Clear reasoning for this action based on context and progress",
   "confidence": 0.85, // 0.0-1.0 confidence in this action
@@ -629,10 +646,15 @@ Page Type: ${categorizePageForResearch(url)}
 
 ${elementsLog}
 
+SEMANTIC SECTIONS (A structured overview of the page):
+---
+${context.sections ? JSON.stringify(context.sections.slice(0, 5), null, 2) : "No semantic sections found."}
+---
+
 ENHANCED PAGE ANALYSIS:
 ${pageContent ? `Content Preview (${pageContent.length} chars):
 ---
-${pageContent.substring(0, 3000)}${pageContent.length > 3000 ? '...' : ''}
+${pageContent.substring(0, 2000)}${pageContent.length > 2000 ? '...' : ''}
 ---` : 'No content extracted yet'}
 
 DISCOVERED URLS & LINKS:
@@ -653,15 +675,17 @@ AVAILABLE RESEARCH TOOLS:
 - waitForSelector: Wait for elements to appear
 - screenshot: Take a screenshot for visual analysis
 - extract_structured_content: Get enhanced content extraction with metadata
-- generate_report: Create a comprehensive research report
-- done: Mark research complete
+- extract_with_regex: Extract specific information from text using a regex pattern.
+- record_finding: Saves a piece of structured data to your findings. Use this after extracting information to build up your final answer.
+- generate_report: Create a comprehensive research report. You can only use this when the success criteria are met.
+- done: Mark research complete. You can only use this when the success criteria are met.
 
-// CORE RESEARCH STRATEGY:
-// 1. **Search**: Use \`multi_search\` or \`smart_navigate\` to find a relevant page.
-// 2. **Read**: Use \`read_page_content\` to understand the page's content. This is a mandatory step after navigation.
-// 3. **Analyze & Extract**: Based on the content you just read, use \`extract_structured_content\`, \`get_page_links\`, or \`analyze_urls\` to gather specific information.
-// 4. **Synthesize**: Once enough information is gathered from 2-3 sources, use \`generate_report\`.
-// 5. **Repeat**: If more information is needed, repeat from step 1 or 2 with a new source.
+// CORE_ACTION_LOOP:
+// 1. **Sense**: After navigating, ALWAYS use \`read_page_content\` to understand the environment.
+// 2. **Extract**: Use tools like \`extract_structured_content\` to get specific data.
+// 3. **Validate**: Check if the extracted data fits the SUCCESS CRITERIA.
+// 4. **Record**: Use \`record_finding\` to save the validated data.
+// 5. **Repeat**: Continue until all success criteria are met.
 
 LOCATION-AWARE FEATURES:
 - Automatically detects user location from timezone (e.g., Singapore from Asia/Singapore)
@@ -696,30 +720,17 @@ HUMAN-LIKE RESEARCH BEHAVIOR:
 - Extract key facts, statistics, and insights
 - Identify contradictions or different perspectives
 
-Return your next intelligent research action:
+Return a single, valid JSON object that conforms to the action schema.
+Example:
 {
-  "tool": "read_page_content|smart_navigate|multi_search|research_url|analyze_url_depth|analyze_urls|get_page_links|navigate|click|fill|scroll|waitForSelector|screenshot|extract_structured_content|generate_report|done",
-  "params": {
-    "query": "search query for smart_navigate/multi_search",
-    "location": "user location (auto-detected from timezone if not specified)",
-    "maxSearches": 3,
-    "url": "URL to research for research_url",
-    "depth": 1,
-    "maxDepth": 3,
-    "currentDepth": 1,
-    "researchGoal": "research goal for analyze_url_depth",
-    "selector": "CSS selector for click/fill/wait",
-    "value": "text to type for fill",
-    "direction": "up|down for scroll",
-    "includeExternal": true,
-    "maxLinks": 20,
-    "format": "markdown for generate_report"
-  },
-  "rationale": "Detailed reasoning for this research action based on current context and goals",
-  "confidence": 0.85,
-  "research_strategy": "location_aware_search|multi_source_discovery|deep_analysis|recursive_reading|synthesis|verification",
-  "done": false // true ONLY when the current sub-task is complete. This moves to the next sub-task.
+  "tool": "smart_navigate",
+  "params": { "query": "best laptops 2024" },
+  "rationale": "The current page is not relevant, so I will start by searching for the research goal.",
+  "confidence": 0.9,
+  "done": false
 }
+
+Your response MUST be a valid JSON object.
 
 Focus on taking intelligent, autonomous actions that mimic how a human researcher would naturally explore and analyze information.`;
 }
@@ -802,7 +813,7 @@ function buildReportGenerationPrompt(goal, content, format) {
 
 User's Goal: "${goal}"
 
-Gathered Information:
+Structured Findings (JSON):
 ---
 ${content}
 ---
@@ -921,4 +932,16 @@ function analyzeLastActionForResearch(lastAction, lastObservation) {
   }
   
   return analysis.length > 0 ? analysis.join('\n') : 'Action completed - continue research strategy';
+}
+
+function buildChatSummaryPrompt(transcript) {
+  const formattedTranscript = transcript.map(m => `${m.role}: ${m.content}`).join('\n');
+  return `Summarize the key points and user intent from the following chat transcript. Focus on the most recent user requests and any critical information provided by the agent.
+
+Transcript:
+---
+${formattedTranscript}
+---
+
+Summary:`;
 }

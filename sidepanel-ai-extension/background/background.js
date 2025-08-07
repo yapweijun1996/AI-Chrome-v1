@@ -27,6 +27,8 @@
   safeImport("../common/pricing-research-tools.js");      // Pricing research tools
   safeImport("../common/clarification-manager.js");       // Clarification management
   safeImport("../common/storage.js");           // IndexedDB session storage
+  safeImport("../common/success-criteria.js");  // Success criteria schemas and validator
+  safeImport("../common/action-schema.js");     // Action validation schema
   // api-key-manager.js is optional; guard its absence
   try {
     safeImport("../common/api-key-manager.js");  // API key rotation/manager (if present)
@@ -322,6 +324,35 @@ function extractJSONWithRetry(text, context = 'JSON') {
   };
 }
 
+// Deep merge utility for findings
+function deepMerge(target, source) {
+  const output = { ...target };
+
+  if (isObject(target) && isObject(source)) {
+    Object.keys(source).forEach(key => {
+      if (isObject(source[key])) {
+        if (!(key in target)) {
+          Object.assign(output, { [key]: source[key] });
+        } else {
+          output[key] = deepMerge(target[key], source[key]);
+        }
+      } else if (Array.isArray(source[key])) {
+        const targetArray = target[key] || [];
+        // Simple concat, can be improved with unique checks if needed
+        output[key] = targetArray.concat(source[key]);
+      } else {
+        Object.assign(output, { [key]: source[key] });
+      }
+    });
+  }
+
+  return output;
+}
+
+function isObject(item) {
+  return (item && typeof item === 'object' && !Array.isArray(item));
+}
+
 // Template variable resolution system
 function resolveTemplateVariables(params, sess, tabId) {
   if (!params || typeof params !== 'object') {
@@ -578,57 +609,80 @@ function getFallbackValue(variableName, context) {
   }
 }
 
-// Input validation
-function validateToolParams(action) {
+// [SCHEMA VALIDATION] Validate an action against the defined schema
+function validateAction(action) {
   const errors = [];
-  
+  const schema = globalThis.ACTION_SCHEMA;
+
   if (!action || typeof action !== 'object') {
-    return ['Invalid action object'];
+    return { valid: false, errors: ['Action must be an object.'] };
   }
-  
-  if (!action.tool || typeof action.tool !== 'string') {
-    errors.push('Missing or invalid tool name');
+
+  // Check for required top-level properties
+  for (const key of schema.required) {
+    if (!(key in action)) {
+      errors.push(`Missing required property: '${key}'`);
+    }
   }
-  
+
+  if (errors.length > 0) {
+    return { valid: false, errors };
+  }
+
+  // Validate 'tool'
+  if (!schema.properties.tool.enum.includes(action.tool)) {
+    errors.push(`Invalid tool: '${action.tool}'. Must be one of: ${schema.properties.tool.enum.join(', ')}`);
+  }
+
+  // Validate 'params'
   if (action.params && typeof action.params === 'object') {
-    const params = action.params;
-    
-    // Check selector length
-    if (params.selector && typeof params.selector === 'string') {
-      if (params.selector.length > PARAM_LIMITS.MAX_SELECTOR_LENGTH) {
-        errors.push(`Selector too long (${params.selector.length} > ${PARAM_LIMITS.MAX_SELECTOR_LENGTH})`);
+    for (const [param, value] of Object.entries(action.params)) {
+      const paramSchema = schema.properties.params.properties[param];
+      if (!paramSchema) {
+        // Allow extra params but log a warning
+        console.warn(`[VALIDATION] Unknown parameter '${param}' for tool '${action.tool}'.`);
+        continue;
       }
-      if (params.selector.includes('\0')) {
-        errors.push('Selector contains null bytes');
+      if (typeof value !== paramSchema.type && paramSchema.type !== 'integer') { // Allow number for integer
+        errors.push(`Invalid type for param '${param}'. Expected ${paramSchema.type}, got ${typeof value}.`);
       }
-    }
-    
-    // Check value length
-    if (params.value && typeof params.value === 'string') {
-      if (params.value.length > PARAM_LIMITS.MAX_VALUE_LENGTH) {
-        errors.push(`Value too long (${params.value.length} > ${PARAM_LIMITS.MAX_VALUE_LENGTH})`);
+      if (paramSchema.maxLength && value.length > paramSchema.maxLength) {
+        errors.push(`Parameter '${param}' is too long.`);
       }
-      if (params.value.includes('\0')) {
-        errors.push('Value contains null bytes');
-      }
-    }
-    
-    // Check URL length
-    if (params.url && typeof params.url === 'string') {
-      if (params.url.length > PARAM_LIMITS.MAX_URL_LENGTH) {
-        errors.push(`URL too long (${params.url.length} > ${PARAM_LIMITS.MAX_URL_LENGTH})`);
-      }
-    }
-    
-    // Check reason length
-    if (params.reason && typeof params.reason === 'string') {
-      if (params.reason.length > PARAM_LIMITS.MAX_REASON_LENGTH) {
-        errors.push(`Reason too long (${params.reason.length} > ${PARAM_LIMITS.MAX_REASON_LENGTH})`);
+       if (paramSchema.enum && !paramSchema.enum.includes(value)) {
+        errors.push(`Invalid value for param '${param}'. Must be one of: ${paramSchema.enum.join(', ')}`);
       }
     }
   }
+
+  return {
+    valid: errors.length === 0,
+    errors: errors
+  };
+}
+
+// [SUCCESS CRITERIA] Check if the agent has met the goal's success criteria
+function checkSuccessCriteria(sess, tabId) {
+  if (!sess || !sess.successCriteria) {
+    return { success: false, errors: ["Success criteria not defined for this session."] };
+  }
   
-  return errors;
+  const { isValid, errors } = globalThis.validateFindings(sess.findings, sess.successCriteria);
+  
+  if (isValid) {
+    emitAgentLog(tabId, {
+      level: LOG_LEVELS.SUCCESS,
+      msg: "Success criteria met."
+    });
+    return { success: true };
+  } else {
+    emitAgentLog(tabId, {
+      level: LOG_LEVELS.WARN,
+      msg: "Success criteria not yet met.",
+      errors: errors
+    });
+    return { success: false, errors };
+  }
 }
 
 // Side panel open helper (MV3 sidePanel API)
@@ -712,6 +766,13 @@ function emitAgentLog(tabId, entry) {
     // Only send if we have a valid message (formatProgressMessage can return null to skip)
     if (progressMessage && shouldThrottleProgressMessage(tabId, progressMessage)) {
       try {
+        // Add agent message to transcript
+        sess.chatTranscript.push({
+          role: 'agent',
+          content: progressMessage,
+          timestamp: Date.now()
+        });
+
         chrome.runtime.sendMessage({
           type: MSG.AGENT_PROGRESS,
           tabId,
@@ -957,7 +1018,7 @@ async function ensureContentScript(tabId) {
 }
 
 async function dispatchAgentAction(tabId, action, settings) {
-  const { tool, params = {} } = action || {};
+  const { tool, params = {}, rationale = "" } = action || {};
   const sess = agentSessions.get(tabId);
   if (!sess) throw new Error("No agent session");
 
@@ -1075,21 +1136,38 @@ async function dispatchAgentAction(tabId, action, settings) {
       return { ok: true, observation: `Closed tab ${tgt}` };
     }
     case "done": {
-      return { ok: true, observation: "Goal marked done" };
+      const { success, errors } = checkSuccessCriteria(sess, tabId);
+      if (success) {
+        return { ok: true, observation: "Goal marked done after meeting success criteria." };
+      } else {
+        return {
+          ok: false,
+          observation: `Cannot mark as done. Success criteria not met: ${errors.join(', ')}`,
+          errorType: ERROR_TYPES.CRITERIA_NOT_MET
+        };
+      }
     }
     case "generate_report": {
-      const { format = 'markdown', content = '' } = resolvedParams;
-      const reportPrompt = buildReportGenerationPrompt(sess.goal, content, format);
-      
-      const reportRes = await callModelWithRotation(reportPrompt, { model: sess.selectedModel, tabId: tabId });
-      
+      const { format = 'markdown' } = resolvedParams;
+      const { success, errors } = checkSuccessCriteria(sess, tabId);
+
+      if (!success) {
+        return {
+          ok: false,
+          observation: `Cannot generate report. Success criteria not met: ${errors.join(', ')}`,
+          errorType: ERROR_TYPES.CRITERIA_NOT_MET
+        };
+      }
+
+      const reportPrompt = buildReportGenerationPrompt(sess.goal, JSON.stringify(sess.findings, null, 2), format);
+      const reportRes = await callModelWithRotation(reportPrompt, { model: sess.selectedModel, tabId });
+
       if (reportRes.ok) {
         emitAgentLog(tabId, {
           level: LOG_LEVELS.SUCCESS,
-          msg: "User-facing report generated",
+          msg: "User-facing report generated from validated findings",
           report: reportRes.text
         });
-        // Send the report to the sidepanel for display
         chrome.runtime.sendMessage({
           type: MSG.SHOW_REPORT,
           tabId: tabId,
@@ -1098,7 +1176,7 @@ async function dispatchAgentAction(tabId, action, settings) {
         });
         return { ok: true, observation: "Report generated successfully", report: reportRes.text };
       } else {
-        return { ok: false, observation: "Failed to generate report" };
+        return { ok: false, observation: "Failed to generate report from findings" };
       }
     }
     case "analyze_urls": {
@@ -1153,11 +1231,46 @@ async function dispatchAgentAction(tabId, action, settings) {
       }
     }
     case "extract_structured_content": {
-      if (!(await ensureContentScript(tabId))) {
-        return { ok: false, observation: "Content script unavailable" };
-      }
-      const res = await chrome.tabs.sendMessage(tabId, { type: "EXTRACT_STRUCTURED_CONTENT" });
-      return res?.ok ? { ok: true, observation: "Structured content extracted", content: res.content } : { ok: false, observation: res?.error || "Content extraction failed" };
+        if (!(await ensureContentScript(tabId))) {
+            return { ok: false, observation: "Content script unavailable" };
+        }
+        const res = await chrome.tabs.sendMessage(tabId, { type: "EXTRACT_STRUCTURED_CONTENT" });
+        // Handle new structured content format
+        if (res?.ok && res.content) {
+            const { source, data, ...rest } = res.content;
+            let findingToRecord = source === 'json-ld' ? data : rest;
+
+            // If data from JSON-LD is an array, merge each item
+            if (Array.isArray(findingToRecord)) {
+                findingToRecord.forEach(item => {
+                    sess.findings = deepMerge(sess.findings, item);
+                });
+            } else {
+                sess.findings = deepMerge(sess.findings, findingToRecord);
+            }
+
+            emitAgentLog(tabId, {
+                level: LOG_LEVELS.INFO,
+                msg: `Automatically recorded finding from structured extraction (source: ${source})`,
+                finding: findingToRecord
+            });
+            return { ok: true, observation: `Structured content extracted via ${source}`, content: res.content };
+        }
+        return { ok: false, observation: res?.error || "Content extraction failed" };
+    }
+    case "record_finding": {
+        const { finding } = resolvedParams;
+        if (typeof finding !== 'object' || finding === null) {
+            return { ok: false, observation: "Invalid finding object provided." };
+        }
+        // Deep merge the new finding with existing findings
+        sess.findings = deepMerge(sess.findings, finding);
+        emitAgentLog(tabId, {
+            level: LOG_LEVELS.SUCCESS,
+            msg: "Recorded finding to session",
+            finding: finding
+        });
+        return { ok: true, observation: "Finding recorded successfully." };
     }
     case "smart_navigate": {
       // Enhanced navigation that analyzes URLs and suggests the best approach
@@ -1338,6 +1451,19 @@ async function dispatchAgentAction(tabId, action, settings) {
         currentDepth: currentDepth
       };
     }
+    case "extract_with_regex": {
+      const { pattern, text } = resolvedParams;
+      if (!pattern || !text) {
+        return { ok: false, observation: "Missing pattern or text for regex extraction." };
+      }
+      try {
+        const regex = new RegExp(pattern, 'g');
+        const matches = [...text.matchAll(regex)].map(match => match[1] || match[0]);
+        return { ok: true, observation: `Found ${matches.length} matches.`, matches };
+      } catch (e) {
+        return { ok: false, observation: `Invalid regex pattern: ${e.message}` };
+      }
+    }
     default:
       return { ok: false, observation: "Unknown tool: " + String(tool) };
   }
@@ -1414,12 +1540,9 @@ async function agenticLoop(tabId, goal, settings) {
     } else {
       emitAgentLog(tabId, { level: LOG_LEVELS.ERROR, msg: "Failed to parse valid action", error: validationResult.error, rawText: validationResult.rawText });
       // Attempt recovery planning
-      const recoveryResponse = await attemptRecoveryPlanning(tabId, sess, goal, currentSubTask, contextData);
-      if (recoveryResponse?.ok) {
-        const recoveryValidation = parseAndValidateAction(tabId, sess, recoveryResponse.text);
-        if (recoveryValidation.success) {
-          action = recoveryValidation.action;
-        }
+      const recoveryResult = await attemptRecoveryPlanning(tabId, sess, goal, currentSubTask, contextData);
+      if (recoveryResult?.success) {
+        action = recoveryResult.action;
       }
     }
   }
@@ -1462,6 +1585,14 @@ async function agenticLoop(tabId, goal, settings) {
   if (action.tool === 'done' || action.done === true) {
     emitAgentLog(tabId, { level: LOG_LEVELS.INFO, msg: `Sub-task "${currentSubTask}" completed.` });
     sess.currentTaskIndex++;
+    sess.subTaskStep = 0; // Reset sub-task step counter
+    sess.noProgressCounter = 0; // Reset no-progress counter
+    // Send a step update to the sidepanel
+    chrome.runtime.sendMessage({
+      type: MSG.AGENT_STEP_UPDATE,
+      tabId: tabId,
+      currentTaskIndex: sess.currentTaskIndex
+    });
   }
 
   // 8. Check for overall completion or max steps
@@ -1472,8 +1603,20 @@ async function agenticLoop(tabId, goal, settings) {
     return;
   }
 
-  // 9. Continue the loop
+  // 9. Increment step counters
   sess.step++;
+  sess.subTaskStep = (sess.subTaskStep || 0) + 1;
+
+  // 10. Run Watchdogs
+  const watchdogTriggered = runWatchdogs(tabId, sess, action, execRes);
+  if (watchdogTriggered) {
+    // If a watchdog forces a 'think' action, we skip the normal delay and loop immediately
+    // to re-evaluate with the new context.
+    agenticLoop(tabId, goal, settings);
+    return;
+  }
+
+  // 11. Continue the loop
   const delay = calculateAdaptiveDelay(action, execRes.ok);
   await new Promise(r => setTimeout(r, delay));
   agenticLoop(tabId, goal, settings);
@@ -1520,19 +1663,14 @@ async function gatherContextForReasoning(tabId, sess) {
 async function generateFinalReport(tabId, sess) {
   emitAgentLog(tabId, { level: LOG_LEVELS.INFO, msg: "Generating final report for user." });
 
-  const historySummary = sess.history.map((h, i) =>
-    `Step ${i + 1}: Action: ${h.action.tool}, Observation: ${(h.observation || "").substring(0, 150)}...`
-  ).join('\n');
+  // Use the structured findings for a more reliable report
+  const findingsSummary = JSON.stringify(sess.findings, null, 2);
 
-  const reportPrompt = `You are an AI assistant. You have just completed a task for a user. Your goal was: "${sess.goal}".
-Review your action history and provide a concise, user-friendly summary of what you accomplished.
-
-Your Action History:
----
-${historySummary}
----
-
-Based on this history, write a final response to the user that summarizes the outcome of the task.`;
+  const reportPrompt = buildReportGenerationPrompt(
+    sess.goal,
+    findingsSummary,
+    'markdown'
+  );
 
   const reportRes = await callModelWithRotation(reportPrompt, { model: sess.selectedModel, tabId });
 
@@ -1596,7 +1734,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           break;
 
         case MSG.AGENT_RUN: {
-          const { goal = "", settings = {} } = message || {};
+          const { goal = "", settings: userSettings = {} } = message || {};
+          const settings = {
+            maxSteps: 120, // Increased default max steps
+            ...userSettings
+          };
           const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
           if (!tab?.id) return sendResponse({ ok: false, error: "No active tab" });
 
@@ -1654,11 +1796,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             lastAction: "",
             lastObservation: "",
             history: [],
+            scratchpad: [], // Working memory for the agent
             requestId: `agent_${tab.id}_${Date.now()}`, // For correlation
             taskContext: taskContext, // Enhanced task context
             contextCache: {}, // Context caching
             failureCount: 0,
-            consecutiveFailures: 0
+            consecutiveFailures: 0,
+            findings: {}, // For storing structured data
+            successCriteria: {}, // Schema for required findings
+            // Watchdog timers and counters
+            subTaskStep: 0, // For per-subtask step budget
+            maxSubTaskSteps: 15, // Default per-subtask step limit
+            domainVisitCount: {}, // For per-domain cap
+            maxDomainVisits: 5, // Default per-domain visit limit
+            noProgressCounter: 0, // For no-progress detector
+            maxNoProgressSteps: 4, // Default no-progress step limit
+            lastProgressObservation: "", // Store last meaningful observation
+            chatTranscript: [], // For persisting chat history
+            sessionId: tab.id,
           };
           agentSessions.set(tab.id, newSession);
           
@@ -1670,7 +1825,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             msg: "Enhanced goal decomposition completed",
             subTasks,
             taskContext: taskContext,
-            enhancedFeatures: ["context_caching", "failure_tracking", "adaptive_planning"]
+            enhancedFeatures: ["context_caching", "failure_tracking", "adaptive_planning", "success_criteria"]
+          });
+
+          // Determine and set the success criteria schema for the session
+          const schemaKey = taskContext.taskType?.toLowerCase() || 'default';
+          newSession.successCriteria = globalThis.SUCCESS_CRITERIA_SCHEMAS[schemaKey] || globalThis.SUCCESS_CRITERIA_SCHEMAS.default;
+          emitAgentLog(tab.id, {
+            level: LOG_LEVELS.INFO,
+            msg: `Success criteria schema set to '${schemaKey}'`,
+            schema: newSession.successCriteria
           });
 
           // 3. Start loop but don't block sendResponse
@@ -1678,7 +1842,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             console.error("[BG] Agent loop error:", e);
             emitAgentLog(tab.id, { level: "error", msg: "Agent loop error", error: String(e?.message || e) });
           });
-
+        
+          // Send the generated plan to the sidepanel
+          chrome.runtime.sendMessage({
+            type: MSG.AGENT_PLAN_GENERATED,
+            tabId: tab.id,
+            plan: subTasks
+          });
+        
           sendResponse({ ok: true });
           break;
         }
@@ -1907,6 +2078,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           break;
         }
 
+        case MSG.CHAT_MESSAGE: {
+          const { tabId, message } = message;
+          const sess = agentSessions.get(tabId);
+          if (sess) {
+            sess.chatTranscript.push({
+              role: 'user',
+              content: message,
+              timestamp: Date.now()
+            });
+          }
+          sendResponse({ ok: true });
+          break;
+        }
+
         default:
           sendResponse({ ok: false, error: "Unknown message type" });
       }
@@ -2050,62 +2235,96 @@ async function classifyAndDecomposeTask(tabId, goal, pageInfo) {
   }
 }
 
-// Enhanced JSON parsing with better error handling
+// [SCHEMA VALIDATION] New parse and validate function using the schema
 function parseAndValidateAction(tabId, sess, responseText) {
-  // Try multiple parsing strategies
-  const strategies = [
-    () => extractJSONWithRetry(responseText, 'planning response'),
-    () => {
-      // Try to find JSON in code blocks
-      const codeBlockMatch = responseText.match(/```(?:json)?\s*\n([\s\S]*?)\n\s*```/i);
-      if (codeBlockMatch) {
-        return { success: true, data: JSON.parse(codeBlockMatch[1]) };
-      }
-      return { success: false, error: 'No code block found' };
-    },
-    () => {
-      // Try to extract from the last complete JSON object
-      const matches = responseText.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g);
-      if (matches && matches.length > 0) {
-        const lastMatch = matches[matches.length - 1];
-        return { success: true, data: JSON.parse(lastMatch) };
-      }
-      return { success: false, error: 'No JSON objects found' };
-    }
-  ];
-  
-  for (let i = 0; i < strategies.length; i++) {
-    try {
-      const result = strategies[i]();
-      if (result.success && result.data) {
-        // Validate the action structure
-        const action = result.data;
-        if (action.tool && typeof action.tool === 'string') {
-          // Set default confidence if not provided
-          if (typeof action.confidence !== 'number') {
-            action.confidence = 0.8;
-          }
-          
-          emitAgentLog(tabId, {
-            level: LOG_LEVELS.INFO,
-            msg: `Action parsed successfully (strategy ${i + 1})`,
-            tool: action.tool,
-            confidence: action.confidence
-          });
-          
-          return { success: true, action: action };
-        }
-      }
-    } catch (error) {
-      // Continue to next strategy
-      continue;
-    }
+  const jsonResult = extractJSONWithRetry(responseText, 'planning response');
+
+  if (!jsonResult.success) {
+    return {
+      success: false,
+      error: 'Failed to extract JSON from response.',
+      rawText: responseText.substring(0, 500)
+    };
   }
-  
+
+  const action = jsonResult.data.action || jsonResult.data; // Handle cases where 'action' is nested
+  const { valid, errors } = validateAction(action);
+
+  if (valid) {
+    // Set default confidence if not provided
+    if (typeof action.confidence !== 'number') {
+      action.confidence = 0.8;
+    }
+    emitAgentLog(tabId, {
+      level: LOG_LEVELS.INFO,
+      msg: `Action parsed and validated successfully`,
+      tool: action.tool,
+      confidence: action.confidence
+    });
+    return { success: true, action: action };
+  } else {
+    emitAgentLog(tabId, {
+      level: LOG_LEVELS.ERROR,
+      msg: `Action validation failed`,
+      errors: errors,
+      rawText: responseText.substring(0, 500)
+    });
+    return {
+      success: false,
+      error: `Validation failed: ${errors.join(', ')}`,
+      rawText: responseText.substring(0, 500)
+    };
+  }
+}
+
+// [FALLBACK LOGIC] Generate a deterministic fallback action when planning fails
+function generateFallbackAction(sess, contextData) {
+  const { pageContent, interactiveElements, taskContext } = contextData;
+
+  // 1. If the page is empty or just loaded, the best action is to read it.
+  if (!pageContent) {
+    return {
+      tool: 'read_page_content',
+      params: {},
+      rationale: 'Fallback: The page content is unknown. Reading the page to gain context.',
+      confidence: 0.95,
+      done: false,
+    };
+  }
+
+  // 2. If the task is research and there are links, analyze them.
+  if (taskContext?.taskType === 'RESEARCH' && interactiveElements?.some(el => el.tag === 'A')) {
+    return {
+      tool: 'analyze_urls',
+      params: {},
+      rationale: 'Fallback: In a research task, analyzing links is a good next step to find relevant information.',
+      confidence: 0.9,
+      done: false,
+    };
+  }
+
+  // 3. If there are input fields and the goal involves filling something, try to fill.
+  const goal = sess.goal.toLowerCase();
+  const inputs = interactiveElements?.filter(el => el.tag === 'INPUT' && el.type !== 'hidden');
+  if (inputs?.length > 0 && (goal.includes('fill') || goal.includes('enter') || goal.includes('search'))) {
+    return {
+      tool: 'smart_navigate',
+      params: { query: sess.goal },
+      rationale: 'Fallback: The page has input fields and the goal suggests searching or filling. Attempting a smart navigation to perform a search.',
+      confidence: 0.85,
+      done: false,
+    };
+  }
+
+  // 4. Default fallback: If all else fails, use 'think' to re-evaluate.
   return {
-    success: false,
-    error: 'Failed to parse valid action from response',
-    rawText: responseText.substring(0, 500)
+    tool: 'think',
+    params: {
+      thought: 'Planning failed. The model returned an invalid action, and no deterministic fallback was suitable. Re-evaluating the state to find a new path.'
+    },
+    rationale: 'Fallback: Critical planning failure. Pausing to re-evaluate the situation.',
+    confidence: 0.98,
+    done: false,
   };
 }
 
@@ -2113,43 +2332,19 @@ function parseAndValidateAction(tabId, sess, responseText) {
 async function attemptRecoveryPlanning(tabId, sess, goal, currentSubTask, contextData) {
   emitAgentLog(tabId, {
     level: LOG_LEVELS.WARN,
-    msg: "Attempting recovery planning with simplified prompt"
+    msg: "Attempting recovery with deterministic fallback action."
   });
-  
-  const simplePrompt = `You are a web automation agent. Your goal: ${goal}
-Current sub-task: ${currentSubTask}
-Current page: ${contextData.pageInfo.title} (${contextData.pageInfo.url})
 
-Choose the next action to progress toward your goal. Return ONLY valid JSON:
-{
-  "tool": "navigate|click|fill|scroll|waitForSelector|screenshot|done",
-  "params": {},
-  "rationale": "Why this action helps",
-  "done": false
-}`;
+  const fallbackAction = generateFallbackAction(sess, contextData);
 
-  try {
-    const recoveryRes = await callModelWithRotation(simplePrompt, {
-      model: "gemini-1.5-flash",
-      tabId: tabId
-    });
-    
-    if (recoveryRes?.ok) {
-      emitAgentLog(tabId, {
-        level: LOG_LEVELS.INFO,
-        msg: "Recovery planning succeeded"
-      });
-      return recoveryRes;
-    }
-  } catch (error) {
-    emitAgentLog(tabId, {
-      level: LOG_LEVELS.ERROR,
-      msg: "Recovery planning also failed",
-      error: error.message
-    });
-  }
-  
-  return null;
+  emitAgentLog(tabId, {
+    level: LOG_LEVELS.INFO,
+    msg: "Generated fallback action",
+    action: fallbackAction
+  });
+
+  // We return the action object directly, not a model response
+  return { success: true, action: fallbackAction };
 }
 // [CONTEXT ENGINEERING] Enhanced context gathering from session state
 async function gatherEnhancedContext(tabId, sess, currentSubTask) {
@@ -2160,14 +2355,18 @@ async function gatherEnhancedContext(tabId, sess, currentSubTask) {
 
     // Context is now primarily built from session history, not active polling.
     // The agent must explicitly use tools like `read_page_content` or `get_interactive_elements`.
+    const chatSummary = await summarizeChatTranscript(sess.chatTranscript, sess.selectedModel, tabId);
+
     const contextData = {
       pageInfo,
       pageContent: sess.currentPageContent || "", // Get content from session
       interactiveElements: sess.currentInteractiveElements || [], // Get elements from session
       history: sess.history || [],
+      scratchpad: sess.scratchpad || [],
       lastAction: sess.lastAction,
       lastObservation: sess.lastObservation,
       taskContext: sess.taskContext,
+      chatSummary: chatSummary, // Add chat summary to context
       progress: {
         step: sess.step,
         currentSubTask,
@@ -2183,6 +2382,7 @@ async function gatherEnhancedContext(tabId, sess, currentSubTask) {
     emitAgentLog(tabId, { level: LOG_LEVELS.ERROR, msg: "Failed to gather enhanced context", error: error.message });
     return null;
   }
+  
 }
 
 // [CONTEXT ENGINEERING] Enhanced action execution
@@ -2202,6 +2402,7 @@ async function executeActionWithContext(tabId, sess, action, settings) {
     level: LOG_LEVELS.INFO,
     msg: `Executing Tool: ${action.tool}`,
     action: redactedAction,
+    rationale: action.rationale, // Add rationale to the log
     requestId: sess.requestId
   });
 
@@ -2217,6 +2418,24 @@ async function executeActionWithContext(tabId, sess, action, settings) {
     requestId: sess.requestId
   });
 
+  // Auto-sense: if navigation was successful, immediately read the new page content
+  if (execRes.ok && ['navigate', 'smart_navigate', 'research_url'].includes(action.tool)) {
+    emitAgentLog(tabId, {
+      level: LOG_LEVELS.INFO,
+      msg: "Auto-sensing new page content after navigation",
+      triggeringTool: action.tool
+    });
+    const readAction = { tool: 'read_page_content', params: {} };
+    const readRes = await dispatchActionWithTimeout(tabId, readAction, settings);
+    if (readRes.ok && readRes.pageContent) {
+      sess.currentPageContent = readRes.pageContent;
+      emitAgentLog(tabId, {
+        level: LOG_LEVELS.DEBUG,
+        msg: `Auto-read successful, stored page content in session (length: ${readRes.pageContent.length})`
+      });
+    }
+  }
+
   return execRes;
 }
 
@@ -2226,9 +2445,21 @@ function updateSessionContext(tabId, sess, action, execRes) {
   sess.lastObservation = execRes?.observation || "";
 
   // Add to history and keep it trimmed
-  sess.history.push({ action, observation: execRes?.observation || "" });
+  const historyEntry = { action, observation: execRes?.observation || "" };
+  sess.history.push(historyEntry);
   if (sess.history.length > 20) {
     sess.history.shift();
+  }
+
+  // Add a concise summary to the scratchpad
+  const scratchpadEntry = `Step ${sess.step}:
+- Tool: ${action.tool}
+- Params: ${JSON.stringify(action.params)}
+- Result: ${execRes.ok ? 'SUCCESS' : 'FAILURE'}
+- Observation: ${(execRes.observation || "").substring(0, 4000)}...`;
+  sess.scratchpad.push(scratchpadEntry);
+  if (sess.scratchpad.length > 15) { // Keep scratchpad from getting too long
+      sess.scratchpad.shift();
   }
 
   // If the page content was read, store it in the session
@@ -2246,6 +2477,27 @@ function updateSessionContext(tabId, sess, action, execRes) {
 
   // Persist session state after each action
   saveSessionToStorage(tabId, sess);
+
+  // Update domain visit count for the watchdog
+  if (execRes.ok && ['navigate', 'smart_navigate', 'research_url'].includes(action.tool)) {
+    try {
+      const url = new URL(action.params.url);
+      const domain = url.hostname;
+      sess.domainVisitCount[domain] = (sess.domainVisitCount[domain] || 0) + 1;
+    } catch (e) {
+      // Ignore invalid URLs
+    }
+  }
+
+  // Update no-progress detector state
+  const observation = execRes?.observation || "";
+  // Consider progress made if the observation is new and substantive
+  if (observation.length > 50 && observation !== sess.lastProgressObservation) {
+      sess.noProgressCounter = 0;
+      sess.lastProgressObservation = observation;
+  } else {
+      sess.noProgressCounter = (sess.noProgressCounter || 0) + 1;
+  }
 }
 
 // [CONTEXT ENGINEERING] Adaptive failure handling and self-correction
@@ -2522,6 +2774,73 @@ function shouldReadDeeper(urlAnalysis, contentQuality, currentDepth, maxDepth, r
   
   decision.reasoning = "Current content quality sufficient, no compelling reason to go deeper";
   return decision;
+}
+
+// [WATCHDOGS] Monitor agent's progress and intervene if it gets stuck
+function runWatchdogs(tabId, sess, lastAction, lastExecRes) {
+  // 1. Per-subtask step budget
+  if (sess.subTaskStep >= sess.maxSubTaskSteps) {
+    emitAgentLog(tabId, {
+      level: LOG_LEVELS.WARN,
+      msg: `Watchdog: Sub-task step budget reached (${sess.maxSubTaskSteps}). Advancing to next sub-task.`
+    });
+    sess.currentTaskIndex++;
+    sess.subTaskStep = 0; // Reset for next sub-task
+    sess.noProgressCounter = 0;
+    return true; // Indicates intervention
+  }
+
+  // 2. Per-domain visit cap
+  if (['navigate', 'smart_navigate', 'research_url'].includes(lastAction.tool) && lastExecRes.ok) {
+    try {
+      const url = new URL(lastAction.params.url);
+      const domain = url.hostname;
+      if (sess.domainVisitCount[domain] > sess.maxDomainVisits) {
+        emitAgentLog(tabId, {
+          level: LOG_LEVELS.WARN,
+          msg: `Watchdog: Domain visit limit reached for ${domain} (${sess.maxDomainVisits}). Forcing a 'think' action.`
+        });
+        // Force a think action by modifying the session history to guide the next step
+        sess.lastAction = { tool: 'think', params: { thought: `I seem to be stuck on ${domain}. I need to try a different approach or domain.` } };
+        sess.lastObservation = `Forced to rethink strategy due to excessive visits to the same domain.`;
+        return true;
+      }
+    } catch (e) { /* ignore invalid URLs */ }
+  }
+
+  // 3. No-progress detector
+  if (sess.noProgressCounter >= sess.maxNoProgressSteps) {
+    emitAgentLog(tabId, {
+      level: LOG_LEVELS.WARN,
+      msg: `Watchdog: No significant progress detected for ${sess.noProgressCounter} steps. Forcing a 'think' action.`
+    });
+    sess.lastAction = { tool: 'think', params: { thought: `I seem to be stuck. My last few actions resulted in similar observations. I need to re-evaluate my plan.` } };
+    sess.lastObservation = `Forced to rethink strategy due to lack of progress.`;
+    sess.noProgressCounter = 0; // Reset after intervention
+    return true;
+  }
+
+  return false; // No intervention
+}
+
+// [CONTEXT ENGINEERING] Summarize the chat transcript for prompt injection
+async function summarizeChatTranscript(transcript, model, tabId) {
+  if (!transcript || transcript.length === 0) {
+    return "";
+  }
+
+  // Keep the last 10 messages for context
+  const recentMessages = transcript.slice(-10);
+  const summaryPrompt = buildChatSummaryPrompt(recentMessages);
+
+  const summaryRes = await callModelWithRotation(summaryPrompt, { model, tabId });
+
+  if (summaryRes.ok) {
+    return summaryRes.text;
+  }
+
+  // Fallback to a simple concatenation if summarization fails
+  return recentMessages.map(m => `${m.role}: ${m.content}`).join('\n');
 }
 // DEBUG: Manual test function for template substitution
 function testTemplateSubstitution() {
