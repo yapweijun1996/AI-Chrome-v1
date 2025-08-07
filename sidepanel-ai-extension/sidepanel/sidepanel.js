@@ -49,6 +49,8 @@ const els = {
   collapseActivityBtn: document.getElementById("collapseActivityBtn"),
   activityFilter: document.getElementById("activityFilter"),
   activitySearch: document.getElementById("activitySearch"),
+  successCriteria: document.getElementById("successCriteria"),
+  findingsTable: document.getElementById("findingsTable"),
 
   // Chat
   chatMessages: document.getElementById("chatMessages"),
@@ -92,6 +94,8 @@ let currentAgentSession = null;
 let statusCheckInterval = null;
 let isAgentRunning = false;
 let currentPlanMessage = null;
+let currentStatusBubble = null; // Phase 3: Single status bubble for progress updates
+let clarificationContext = null; // For handling ambiguous query clarification
 
 function uid() {
   return Math.random().toString(36).slice(2, 10);
@@ -203,6 +207,16 @@ async function checkAgentStatus() {
         }
         updatePlan(session.currentTaskIndex || 0);
       }
+
+      // Render success criteria
+      if (session.successCriteria) {
+        renderSuccessCriteria(session.successCriteria, session.findings);
+      }
+
+      // Render findings table
+      if (session.findings) {
+        renderFindings(session.findings);
+      }
       
       return session;
     } else {
@@ -273,7 +287,16 @@ function stopStatusMonitoring() {
 async function checkApiKeyWarn() {
   const { ok, apiKey } = await bgSend({ type: MSG.READ_API_KEY });
   if (!ok || !apiKey) {
-    setOutput("Gemini API key not set. Open settings (gear icon) to configure.");
+    // Phase 4: Better API key error message with visual cue
+    addMessage('assistant', '🔑 **API Key Required**\n\nTo use AI features, you need to set up your Gemini API key.\n\n**How to get started:**\n1. Click the ⚙️ gear icon in the header\n2. Enter your Gemini API key\n3. Save and try again\n\n[Get a free API key at makersuite.google.com](https://makersuite.google.com/app/apikey)');
+    
+    // Add visual highlight to settings button
+    if (els.openOptionsBtn) {
+      els.openOptionsBtn.classList.add('highlight-attention');
+      setTimeout(() => {
+        els.openOptionsBtn.classList.remove('highlight-attention');
+      }, 3000);
+    }
     return false;
   }
   return true;
@@ -411,13 +434,89 @@ async function sendMessage() {
     
   } catch (error) {
     hideTypingIndicator();
-    addMessage('assistant', `Error: ${error.message || 'Something went wrong'}`);
+    // Phase 4: Better error formatting in chat
+    const errorMsg = formatChatError(error);
+    addMessage('assistant', errorMsg);
   }
 }
 
 async function processUserMessage(message) {
-  // All user messages are now treated as goals for the agent
-  return await handleAgentIntent(message);
+  // If we are waiting for a clarification response, handle that first.
+  if (clarificationContext) {
+    return await handleClarificationResponse(message);
+  }
+
+  // Phase 1 (Refined): Heuristic-first routing
+  const messageLower = message.toLowerCase().trim();
+  
+  // Define verbs that strongly suggest agent/automation mode
+  const automationVerbs = [
+    'run', 'automate', 'click', 'fill', 'submit', 'navigate', 'open',
+    'go to', 'search for', 'register', 'login', 'checkout', 'buy',
+    'scrape', 'extract', 'book', 'purchase', 'download'
+  ];
+
+  const hasAutomationIntent = automationVerbs.some(verb => messageLower.startsWith(verb));
+  const isUrl = messageLower.match(/^(https?:\/\/|www\.)/);
+
+  // If intent is clearly automation, use the agent.
+  if (hasAutomationIntent || isUrl) {
+    return await handleAgentIntent(message);
+  }
+
+  // For queries that don't start with a clear chat verb, they might be ambiguous.
+  // e.g., "sgd myr" vs "what is sgd to myr"
+  const chatVerbs = [
+    'what', 'why', 'how', 'explain', 'summarize', 'summary', 'list',
+    'compare', 'outline', 'describe', 'tell me', 'help', 'can you',
+    'should i', 'is it', 'are there', 'do you', 'when', 'where', 'who'
+  ];
+  const hasClearChatIntent = chatVerbs.some(verb => messageLower.startsWith(verb));
+
+  // Special case for summarize
+  if (messageLower.includes('summarize') && (messageLower.includes('page') || messageLower.includes('this'))) {
+      return await handleSummarizeChat();
+  }
+
+  if (!hasClearChatIntent && message.length < 20 && message.split(' ').length < 4) {
+    // Short, non-verb queries are often ambiguous. Let's clarify.
+    return await handleAmbiguousClarification(message);
+  }
+
+  // Default to general chat for everything else.
+  return await handleGeneralChat(message);
+}
+
+// New function to handle ambiguous messages with clarification
+async function handleAmbiguousClarification(message) {
+  // Set the context that we are waiting for a choice
+  clarificationContext = {
+    originalMessage: message,
+  };
+
+  // Phase 4: Enhanced clarification with better UX
+  const clarificationMsg = `🤔 **I need a bit more clarity**\n\nYour request: "${message}"\n\n**Choose an option by typing the number:**\n\n1. **Quick Answer** - I'll provide information without browsing\n   *Example: "What is JavaScript?"*\n\n2. **Web Automation** - I'll navigate and interact with websites\n   *Example: "Navigate to GitHub and search for React"*\n\n**Tip:** Start with action words like:\n• "Explain..." or "What is..." for information\n• "Navigate to..." or "Click on..." for automation`;
+  
+  return clarificationMsg;
+}
+
+async function handleClarificationResponse(choice) {
+  const originalMessage = clarificationContext.originalMessage;
+  clarificationContext = null; // Reset context immediately
+  
+  const choiceLower = choice.toLowerCase().trim();
+  
+  if (choiceLower === '1' || choiceLower.includes('quick answer')) {
+    addMessage('user', `(Clarification for "${originalMessage}") -> Quick Answer`);
+    return await handleGeneralChat(originalMessage);
+  } else if (choiceLower === '2' || choiceLower.includes('web automation')) {
+    addMessage('user', `(Clarification for "${originalMessage}") -> Web Automation`);
+    return await handleAgentIntent(originalMessage);
+  } else {
+    // Invalid choice, ask again.
+    addMessage('assistant', "That wasn't a valid choice. Please try again.");
+    return await handleAmbiguousClarification(originalMessage); // This will re-set the context and return the prompt.
+  }
 }
 
 /**
@@ -868,15 +967,16 @@ async function handleAgentIntent(message, intent = null) {
   }
   
   function getErrorMessage(error, errorType) {
+    // Phase 4: User-friendly error messages with actionable guidance
     switch (errorType) {
       case ERROR_TYPES.AGENT_ALREADY_RUNNING:
-        return "An agent is already running on this tab. Please wait for it to finish or use the STOP button to halt it first.";
+        return "🔄 **Agent already active**\n\nI'm currently working on another task. You can:\n• Wait for the current task to complete\n• Click the STOP button (red button in header) to halt the current task\n• Check the activity panel for progress details";
       case ERROR_TYPES.RESTRICTED_URL:
-        return "Cannot run automation on this page due to browser security restrictions. Try navigating to a regular website first.";
+        return "🚫 **Browser restrictions**\n\nI can't automate browser system pages (chrome://, about:, etc).\n\n**What to do:**\n• Navigate to any regular website (e.g., google.com)\n• Then try your automation request again";
       case ERROR_TYPES.CONTENT_SCRIPT_UNAVAILABLE:
-        return "Unable to access this page for automation. Please refresh the page or navigate to a different site.";
+        return "⚠️ **Page access issue**\n\nI can't interact with this page right now.\n\n**Quick fixes:**\n• Refresh the page (Ctrl/Cmd + R)\n• Wait a moment for the page to fully load\n• Try navigating to a different website";
       default:
-        return `I couldn't start the automation: ${error || "unknown error"}`;
+        return `❌ **Something went wrong**\n\nI couldn't start the automation.\n\n**Error details:** ${error || "Unknown error"}\n\n**Try:**\n• Refreshing the page\n• Checking your internet connection\n• Restarting the extension`;
     }
   }
 }
@@ -890,11 +990,47 @@ async function handleSummarizeChat() {
 }
 
 async function handleGeneralChat(message) {
-  // Use the existing prompt system with page context
+  // Phase 2: Check if page context is actually needed for this query
+  const messageLower = message.toLowerCase();
+  
+  // Keywords that indicate page context is needed
+  const pageContextKeywords = [
+    'this page', 'current page', 'this site', 'this website',
+    'above', 'below', 'here', 'this article', 'this content',
+    'what does it say', 'on this page', 'in this document'
+  ];
+  
+  const needsPageContext = pageContextKeywords.some(keyword =>
+    messageLower.includes(keyword)
+  );
+  
+  if (!needsPageContext) {
+    // Use fast chat without page extraction
+    return await handleFastChat(message);
+  }
+  
+  // Original behavior: Use the existing prompt system with page context
   const res = await bgSend({
     type: MSG.SUMMARIZE_PAGE,
     maxChars: 20000,
     userPrompt: `Please respond to this message in a helpful and conversational way: "${message}"`
+  });
+  
+  if (!res?.ok) {
+    return `I'm having trouble processing your request: ${res?.error || "unknown error"}`;
+  }
+  return res.summary || "I'm not sure how to respond to that.";
+}
+
+/**
+ * Fast chat handler that bypasses page content extraction
+ * Responds in <3 seconds for simple Q&A
+ */
+async function handleFastChat(message) {
+  // Use the new MSG.CHAT_DIRECT for fast responses without page context
+  const res = await bgSend({
+    type: MSG.CHAT_DIRECT,
+    userPrompt: `Please provide a direct, helpful response to this question: "${message}"`
   });
   
   if (!res?.ok) {
@@ -992,6 +1128,12 @@ function renderLogItem(entry) {
     b.textContent = entry.tool;
     badges.appendChild(b);
   }
+  if (entry.confidence) {
+    const b = document.createElement('span');
+    b.className = 'badge confidence';
+    b.textContent = `${Math.round(entry.confidence * 100)}%`;
+    badges.appendChild(b);
+  }
   if (typeof entry.success === 'boolean') {
     const b = document.createElement('span');
     b.className = `badge ${entry.success ? 'success' : 'fail'}`;
@@ -1006,6 +1148,13 @@ function renderLogItem(entry) {
 
   const logBody = document.createElement('div');
   logBody.className = 'log-body';
+
+  if (entry.rationale) {
+    const rationaleDiv = document.createElement('div');
+    rationaleDiv.className = 'rationale';
+    rationaleDiv.textContent = entry.rationale;
+    logBody.appendChild(rationaleDiv);
+  }
 
   if (entry.report) {
     const reportDiv = document.createElement('div');
@@ -1229,14 +1378,19 @@ chrome.runtime.onMessage.addListener((message) => {
       updatePlan(message.entry.step);
     }
   } else if (message?.type === MSG.AGENT_PROGRESS && message.message) {
-    // Add progress updates to chat
-    addMessage('assistant', message.message, message.timestamp || Date.now());
+    // Phase 3: Update status bubble instead of adding new messages
+    updateStatusBubble(message.message, message.step, message.timestamp);
   } else if (message?.type === MSG.SHOW_REPORT && message.report) {
+    // Clear status bubble when showing final report
+    clearStatusBubble();
     addMessage('assistant', message.report, Date.now(), message.format === 'markdown');
   } else if (message?.type === MSG.AGENT_STATUS) {
     if (message.session?.running) {
       // Ensure drawer visible while running
       ensureActivityOpen();
+    } else if (!message.session?.running && currentStatusBubble) {
+      // Clear status bubble when agent stops
+      clearStatusBubble();
     }
     // Handle plan updates from status messages
     if (message.session?.subTasks?.length > 0) {
@@ -1370,4 +1524,85 @@ function updatePlan(currentTaskIndex) {
       step.classList.add('pending');
     }
   });
+}
+
+/* ---------- Success Criteria Visualization helpers ---------- */
+function renderSuccessCriteria(schema, findings) {
+  const container = els.successCriteria;
+  if (!container) return;
+
+  container.innerHTML = ''; // Clear previous checklist
+  const title = document.createElement('div');
+  title.className = 'success-criteria-title';
+  title.textContent = 'Success Criteria';
+  container.appendChild(title);
+
+  const list = document.createElement('ul');
+  list.className = 'success-criteria-list';
+
+  const properties = schema.properties || {};
+  for (const key in properties) {
+    const item = document.createElement('li');
+    item.className = 'success-criteria-item';
+    const isMet = findings && findings[key];
+    item.innerHTML = `<span class="criteria-icon">${isMet ? '✅' : '🔲'}</span><span class="criteria-text">${key}</span>`;
+    list.appendChild(item);
+  }
+
+  container.appendChild(list);
+}
+
+/* ---------- Findings Table Visualization helpers ---------- */
+function renderFindings(findings) {
+  const container = els.findingsTable;
+  if (!container) return;
+
+  container.innerHTML = ''; // Clear previous table
+  const title = document.createElement('div');
+  title.className = 'findings-title';
+  title.textContent = 'Findings';
+  container.appendChild(title);
+
+  const table = document.createElement('table');
+  table.className = 'findings-table';
+
+  const thead = document.createElement('thead');
+  thead.innerHTML = '<tr><th>Key</th><th>Value</th></tr>';
+  table.appendChild(thead);
+
+  const tbody = document.createElement('tbody');
+  for (const key in findings) {
+    const value = findings[key];
+    const row = document.createElement('tr');
+    row.innerHTML = `<td>${escapeHtml(key)}</td><td>${escapeHtml(JSON.stringify(value))}</td>`;
+    tbody.appendChild(row);
+  }
+  table.appendChild(tbody);
+
+  container.appendChild(table);
+}
+
+/* ---------- Error Formatting Helper (Phase 4) ---------- */
+function formatChatError(error) {
+  const errorMessage = error?.message || String(error) || 'Unknown error';
+  
+  // Check for specific error patterns and provide helpful guidance
+  if (errorMessage.includes('API key') || errorMessage.includes('authentication')) {
+    return '🔑 **Authentication Error**\n\nYour API key might be invalid or expired.\n\n**Fix:** Click the ⚙️ gear icon to update your API key.';
+  }
+  
+  if (errorMessage.includes('network') || errorMessage.includes('fetch')) {
+    return '🌐 **Connection Issue**\n\nI couldn\'t connect to the AI service.\n\n**Check:**\n• Your internet connection\n• Any firewall or VPN settings\n• Try again in a moment';
+  }
+  
+  if (errorMessage.includes('timeout')) {
+    return '⏱️ **Request Timed Out**\n\nThe request took too long to complete.\n\n**Try:**\n• Simplifying your request\n• Checking if the website is responsive\n• Waiting a moment and trying again';
+  }
+  
+  if (errorMessage.includes('quota') || errorMessage.includes('limit')) {
+    return '📊 **Rate Limit Reached**\n\nYou\'ve hit the API usage limit.\n\n**Options:**\n• Wait a few minutes before trying again\n• Check your API usage in the Google Cloud Console\n• Consider upgrading your API plan';
+  }
+  
+  // Default error message with the actual error for debugging
+  return `❌ **Unexpected Error**\n\nSomething went wrong while processing your request.\n\n**Error details:** ${errorMessage}\n\n**You can try:**\n• Refreshing the page\n• Restarting the extension\n• Checking the browser console for more details`;
 }

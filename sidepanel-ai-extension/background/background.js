@@ -1269,9 +1269,11 @@ async function dispatchAgentAction(tabId, action, settings) {
             level: LOG_LEVELS.SUCCESS,
             msg: "Recorded finding to session",
             finding: finding
-        });
-        return { ok: true, observation: "Finding recorded successfully." };
-    }
+          });
+          // Persist session after recording a finding
+          saveSessionToStorage(tabId, sess);
+          return { ok: true, observation: "Finding recorded successfully." };
+        }
     case "smart_navigate": {
       // Enhanced navigation that analyzes URLs and suggests the best approach
       const query = String(resolvedParams.query || "");
@@ -1742,15 +1744,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
           if (!tab?.id) return sendResponse({ ok: false, error: "No active tab" });
 
+          // Check for a restorable session
+          const restoredSession = await restoreSessionFromStorage(tab.id);
+          if (restoredSession && restoredSession.subTasks && restoredSession.currentTaskIndex < restoredSession.subTasks.length) {
+            emitAgentLog(tab.id, {
+              level: LOG_LEVELS.INFO,
+              msg: "Resuming agent from a previous session.",
+              goal: restoredSession.goal,
+              currentTaskIndex: restoredSession.currentTaskIndex
+            });
+            agentSessions.set(tab.id, restoredSession);
+            runAgentLoop(tab.id, restoredSession.goal, restoredSession.settings);
+            return sendResponse({ ok: true, resumed: true });
+          }
+
           // Prevent concurrent runs on the same tab
           const existingSession = agentSessions.get(tab.id);
           if (existingSession?.running) {
-            emitAgentLog(tab.id, { 
-              level: LOG_LEVELS.WARN, 
-              msg: "Agent run blocked: already running on this tab" 
+            emitAgentLog(tab.id, {
+              level: LOG_LEVELS.WARN,
+              msg: "Agent run blocked: already running on this tab"
             });
-            return sendResponse({ 
-              ok: false, 
+            return sendResponse({
+              ok: false,
               error: "Agent already running on this tab. Press STOP first.",
               errorType: ERROR_TYPES.AGENT_ALREADY_RUNNING
             });
@@ -1934,6 +1950,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
         case MSG.SUMMARIZE_PAGE: {
           const { maxChars = 20000, userPrompt = "" } = message;
+          
+          // Phase 2: Fast path - if maxChars is 0, skip page extraction entirely
+          if (maxChars === 0) {
+            // Fast chat mode - no page context needed
+            await apiKeyManager.initialize();
+            const currentKey = apiKeyManager.getCurrentKey();
+            if (!currentKey) {
+              return sendResponse({ ok: false, error: "No available API keys. Please add valid keys in settings." });
+            }
+            
+            const { GEMINI_MODEL } = await chrome.storage.sync.get("GEMINI_MODEL");
+            const selectedModel = (GEMINI_MODEL || "gemini-1.5-flash");
+            
+            // Build a direct prompt without page context
+            const prompt = userPrompt || "Please provide a helpful response.";
+            const result = await callModelWithRotation(prompt, { model: selectedModel });
+            
+            sendResponse({ ok: true, summary: result.text || result.raw || "(no output)" });
+            break;
+          }
+          
+          // Original behavior: Extract page content when maxChars > 0
           const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
           if (!tab?.id) return sendResponse({ ok: false, error: "No active tab" });
 
@@ -2019,6 +2057,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           } catch (error) {
             return sendResponse({ ok: false, error: error.message || "Classification error" });
           }
+          break;
+        }
+
+        case MSG.CHAT_DIRECT: {
+          // Phase 2: Direct chat without page context for fast responses
+          const { userPrompt = "" } = message;
+          
+          // Check API key availability
+          await apiKeyManager.initialize();
+          const currentKey = apiKeyManager.getCurrentKey();
+          if (!currentKey) {
+            return sendResponse({ ok: false, error: "No available API keys. Please add valid keys in settings." });
+          }
+          
+          const { GEMINI_MODEL } = await chrome.storage.sync.get("GEMINI_MODEL");
+          const selectedModel = (GEMINI_MODEL || "gemini-1.5-flash");
+          
+          // Build a direct prompt without page context
+          const prompt = userPrompt || "Please provide a helpful response.";
+          const result = await callModelWithRotation(prompt, { model: selectedModel });
+          
+          sendResponse({ ok: true, summary: result.text || result.raw || "(no output)" });
           break;
         }
 

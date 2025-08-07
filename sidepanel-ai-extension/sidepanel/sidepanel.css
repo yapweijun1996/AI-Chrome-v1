@@ -474,3 +474,201 @@ html,body{
     box-shadow: 0 0 0 0 rgba(79, 140, 255, 0);
   }
 }
+/* Success Criteria Checklist */
+.success-criteria-container {
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.success-criteria-title {
+  font-weight: 600;
+  color: var(--accent-2);
+  margin-bottom: 8px;
+}
+
+.success-criteria-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.success-criteria-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.criteria-icon {
+  font-size: 14px;
+}
+.badge.confidence {
+  background-color: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+
+.rationale {
+  padding: 8px;
+  background-color: #2d3748;
+  border-radius: 4px;
+  margin-bottom: 8px;
+  font-style: italic;
+  color: var(--muted);
+}
+/* Findings Table */
+.findings-container {
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.findings-title {
+  font-weight: 600;
+  color: var(--accent-2);
+  margin-bottom: 8px;
+}
+
+.findings-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.findings-table th,
+.findings-table td {
+  border: 1px solid var(--border);
+  padding: 6px 8px;
+  text-align: left;
+}
+
+.findings-table th {
+  background-color: var(--chip);
+}
+
+/* Attention highlight for buttons (Phase 4) */
+.highlight-attention {
+  animation: attention-pulse 1.5s ease-out 2;
+  box-shadow: 0 0 0 0 rgba(255, 215, 0, 0.7);
+}
+
+@keyframes attention-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(255, 215, 0, 0.7);
+  }
+  70% {
+    box-shadow: 0 0 0 10px rgba(255, 215, 0, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(255, 215, 0, 0);
+  }
+}
+
+/* Status Bubble for Progress Updates (Phase 3) */
+.status-bubble {
+  background: linear-gradient(135deg, var(--panel), var(--chip));
+  border: 1px solid var(--accent);
+  box-shadow: 0 2px 8px rgba(79, 140, 255, 0.2);
+  transition: all 0.3s ease;
+}
+
+.status-bubble.updating {
+  animation: statusPulse 0.3s ease-out;
+}
+
+.status-bubble.fade-out {
+  opacity: 0;
+  transform: translateY(-10px);
+  transition: all 0.3s ease-out;
+}
+
+.status-content-wrapper {
+  flex: 1;
+}
+
+.status-content {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.status-icon {
+  font-size: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  animation: iconRotate 2s linear infinite;
+}
+
+.status-icon:has-text('⚡') {
+  animation: iconPulse 1s ease-in-out infinite;
+}
+
+.status-text {
+  flex: 1;
+  font-size: 13px;
+  color: var(--text);
+  opacity: 0.95;
+}
+
+@keyframes statusPulse {
+  0% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.02);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+@keyframes iconRotate {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes iconPulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.6;
+  }
+}
+
+/* Ensure status bubble is visually distinct */
+#agent-status-bubble {
+  position: relative;
+  margin: 8px 0;
+}
+
+#agent-status-bubble::before {
+  content: '';
+  position: absolute;
+  top: -4px;
+  left: 44px;
+  right: 12px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  opacity: 0.5;
+}
+
+#agent-status-bubble::after {
+  content: '';
+  position: absolute;
+  bottom: -4px;
+  left: 44px;
+  right: 12px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  opacity: 0.5;
+}
