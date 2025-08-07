@@ -22,6 +22,10 @@
   safeImport("../common/api.js");             // API wrapper (classic script)
   safeImport("../common/prompts.js");         // Prompt builders (classic script)
   safeImport("../common/planner.js");         // New multi-step planner
+  safeImport("../common/enhanced-intent-classifier.js");  // Enhanced intent classification
+  safeImport("../common/enhanced-planner.js");            // Enhanced multi-step planner
+  safeImport("../common/pricing-research-tools.js");      // Pricing research tools
+  safeImport("../common/clarification-manager.js");       // Clarification management
   // api-key-manager.js is optional; guard its absence
   try {
     safeImport("../common/api-key-manager.js");  // API key rotation/manager (if present)
@@ -46,6 +50,46 @@ const { MSG, PARAM_LIMITS, TIMEOUTS, ERROR_TYPES, LOG_LEVELS, API_KEY_ROTATION }
 
 // Simple in-memory agent sessions keyed by tabId
 const agentSessions = new Map(); // tabId -> { running, stopped, step, goal, subTasks: [], currentTaskIndex: 0, settings, logs: [], history: [], lastAction, lastObservation }
+
+// Enhanced functionality instances
+let enhancedIntentClassifier = null;
+let enhancedPlanner = null;
+let pricingResearchTools = null;
+let clarificationManager = null;
+
+// Initialize enhanced functionality
+function initializeEnhancedFeatures() {
+  try {
+    enhancedIntentClassifier = new EnhancedIntentClassifier({
+      confidenceThreshold: 0.7,
+      ambiguityThreshold: 0.3,
+      maxClarificationAttempts: 2
+    });
+    
+    enhancedPlanner = new EnhancedPlanner({
+      model: "gemini-1.5-flash",
+      maxRetries: 3,
+      searchAPIs: ['google', 'bing', 'duckduckgo'],
+      pricingAPIs: ['google_shopping', 'amazon', 'local_stores']
+    });
+    
+    pricingResearchTools = new PricingResearchTools({
+      userLocation: getUserLocationFromTimezone(),
+      currency: 'SGD',
+      maxRetries: 3,
+      timeout: 30000
+    });
+    
+    clarificationManager = new ClarificationManager({
+      maxClarificationAttempts: 3,
+      clarificationTimeout: 300000
+    });
+    
+    console.log('[BG] Enhanced features initialized successfully');
+  } catch (error) {
+    console.error('[BG] Failed to initialize enhanced features:', error);
+  }
+}
 
 // Progress message throttling to prevent chat spam
 const progressThrottle = new Map(); // tabId -> { lastProgressTime, messageCount, lastMessage }
@@ -290,6 +334,262 @@ function extractJSONWithRetry(text, context = 'JSON') {
     error: `Failed to extract valid JSON from ${context}`,
     rawText: text.substring(0, 500) + (text.length > 500 ? '...' : '')
   };
+}
+
+// Template variable resolution system
+function resolveTemplateVariables(params, sess, tabId) {
+  if (!params || typeof params !== 'object') {
+    return params;
+  }
+
+  const resolvedParams = { ...params };
+  const context = buildTemplateContext(sess, tabId);
+
+  // DEBUG: Log template resolution process
+  console.log("[TEMPLATE DEBUG] Original params:", params);
+  console.log("[TEMPLATE DEBUG] Substitution context:", context);
+
+  // Recursively resolve template variables in all string parameters
+  for (const [key, value] of Object.entries(resolvedParams)) {
+    if (typeof value === 'string') {
+      const originalValue = value;
+      resolvedParams[key] = substituteTemplateVariables(value, context);
+      
+      // DEBUG: Log each substitution
+      if (originalValue !== resolvedParams[key]) {
+        console.log(`[TEMPLATE DEBUG] Substituted ${key}: "${originalValue}" -> "${resolvedParams[key]}"`);
+      } else if (originalValue.includes('{{')) {
+        console.log(`[TEMPLATE DEBUG] No substitution for ${key}: "${originalValue}" (contains template variables)`);
+      }
+    }
+  }
+
+  console.log("[TEMPLATE DEBUG] Resolved params:", resolvedParams);
+  return resolvedParams;
+}
+
+// Build context for template variable substitution
+function buildTemplateContext(sess, tabId) {
+  const context = {
+    // Current page context
+    CURRENT_URL: '',
+    CURRENT_TITLE: '',
+    
+    // Research context
+    PREVIOUS_RESEARCHED_URL: '',
+    PREVIOUS_STEP_RESULT_URL_1: '', // Support for numbered URL variables
+    PREVIOUS_STEP_RESULT_URL_2: '',
+    PREVIOUS_STEP_RESULT_URL_3: '',
+    
+    // URL analysis results
+    url_from_analyze_urls_result_1: '',
+    url_from_analyze_urls_result_2: '',
+    url_from_analyze_urls_result_3: '',
+    
+    LAST_SEARCH_QUERY: '',
+    CURRENT_SEARCH_RESULTS: '',
+    
+    // Multi-search context
+    CURRENT_SEARCH_TERM: '',
+    NEXT_SEARCH_TERM: '',
+    
+    // Session context
+    CURRENT_GOAL: sess?.goal || '',
+    CURRENT_SUBTASK: sess?.subTasks?.[sess?.currentTaskIndex] || '',
+    USER_LOCATION: getUserLocationFromTimezone()
+  };
+
+  // DEBUG: Log session state for context building
+  console.log("[CONTEXT DEBUG] Building context for tabId:", tabId);
+  console.log("[CONTEXT DEBUG] Session state:", {
+    hasHistory: !!(sess?.history && sess.history.length > 0),
+    historyLength: sess?.history?.length || 0,
+    hasAnalyzedUrls: !!(sess?.analyzedUrls && Array.isArray(sess.analyzedUrls)),
+    analyzedUrlsLength: sess?.analyzedUrls?.length || 0,
+    goal: sess?.goal,
+    currentTaskIndex: sess?.currentTaskIndex
+  });
+
+  // Extract research context from session history
+  if (sess?.history && sess.history.length > 0) {
+    const recentActions = sess.history.slice(-5);
+    
+    // DEBUG: Log recent actions
+    console.log("[CONTEXT DEBUG] Recent actions:", recentActions.map(h => ({
+      tool: h.action?.tool,
+      url: h.action?.params?.url,
+      observation: h.observation?.substring(0, 100)
+    })));
+    
+    // Find multiple researched URLs for numbered variables
+    const researchActions = recentActions.filter(h =>
+      h.action?.tool === 'research_url' ||
+      h.action?.tool === 'navigate' ||
+      h.action?.tool === 'smart_navigate'
+    ).reverse(); // Most recent first
+    
+    // DEBUG: Log research actions found
+    console.log("[CONTEXT DEBUG] Research actions found:", researchActions.map(h => ({
+      tool: h.action?.tool,
+      url: h.action?.params?.url
+    })));
+    
+    // Populate numbered URL variables
+    if (researchActions.length > 0) {
+      context.PREVIOUS_RESEARCHED_URL = researchActions[0].action?.params?.url || '';
+      context.PREVIOUS_STEP_RESULT_URL_1 = researchActions[0].action?.params?.url || '';
+      console.log("[CONTEXT DEBUG] Set PREVIOUS_STEP_RESULT_URL_1:", context.PREVIOUS_STEP_RESULT_URL_1);
+    }
+    if (researchActions.length > 1) {
+      context.PREVIOUS_STEP_RESULT_URL_2 = researchActions[1].action?.params?.url || '';
+      console.log("[CONTEXT DEBUG] Set PREVIOUS_STEP_RESULT_URL_2:", context.PREVIOUS_STEP_RESULT_URL_2);
+    }
+    if (researchActions.length > 2) {
+      context.PREVIOUS_STEP_RESULT_URL_3 = researchActions[2].action?.params?.url || '';
+      console.log("[CONTEXT DEBUG] Set PREVIOUS_STEP_RESULT_URL_3:", context.PREVIOUS_STEP_RESULT_URL_3);
+    }
+    
+    // Find URLs from analyze_urls results stored in session
+    if (sess.analyzedUrls && Array.isArray(sess.analyzedUrls)) {
+      console.log("[CONTEXT DEBUG] Found analyzedUrls:", sess.analyzedUrls);
+      // Populate the url_from_analyze_urls_result_* variables
+      if (sess.analyzedUrls.length > 0) {
+        context.url_from_analyze_urls_result_1 = sess.analyzedUrls[0];
+      }
+      if (sess.analyzedUrls.length > 1) {
+        context.url_from_analyze_urls_result_2 = sess.analyzedUrls[1];
+      }
+      if (sess.analyzedUrls.length > 2) {
+        context.url_from_analyze_urls_result_3 = sess.analyzedUrls[2];
+      }
+    }
+    
+    // Find last search query
+    const lastSearchAction = recentActions.find(h =>
+      h.action?.tool === 'multi_search' ||
+      h.action?.tool === 'smart_navigate'
+    );
+    
+    if (lastSearchAction?.action?.params?.query) {
+      context.LAST_SEARCH_QUERY = lastSearchAction.action.params.query;
+    }
+  }
+
+  // Multi-search context
+  if (sess?.multiSearchTerms && sess?.multiSearchIndex !== undefined) {
+    const currentIndex = sess.multiSearchIndex || 0;
+    context.CURRENT_SEARCH_TERM = sess.multiSearchTerms[currentIndex] || '';
+    context.NEXT_SEARCH_TERM = sess.multiSearchTerms[currentIndex + 1] || '';
+  }
+
+  // DEBUG: Log final context with non-empty values
+  const nonEmptyContext = Object.entries(context)
+    .filter(([key, value]) => value !== '')
+    .reduce((obj, [key, value]) => ({ ...obj, [key]: value }), {});
+  console.log("[CONTEXT DEBUG] Final context (non-empty values):", nonEmptyContext);
+
+  return context;
+}
+
+// Substitute template variables in a string
+function substituteTemplateVariables(text, context) {
+  if (!text || typeof text !== 'string') {
+    return text;
+  }
+
+  let result = text;
+  
+  // DEBUG: Log substitution attempt
+  const templateMatches = text.match(/\{\{([A-Za-z_]+)\}\}/g);
+  if (templateMatches) {
+    console.log("[SUBSTITUTION DEBUG] Found template variables in text:", templateMatches);
+  }
+  
+  // Replace template variables like {{VARIABLE_NAME}} or {{variable_name}}
+  const templateRegex = /\{\{([A-Za-z_]+)\}\}/g;
+  result = result.replace(templateRegex, (match, variableName) => {
+    console.log(`[SUBSTITUTION DEBUG] Processing variable: ${variableName}`);
+    
+    const value = context[variableName];
+    console.log(`[SUBSTITUTION DEBUG] Context value for ${variableName}:`, value);
+    
+    if (value !== undefined && value !== '') {
+      console.log(`[SUBSTITUTION DEBUG] Using context value for ${variableName}: "${value}"`);
+      return value;
+    }
+    
+    // If template variable can't be resolved, try to provide a sensible fallback
+    const fallbackValue = getFallbackValue(variableName, context);
+    console.log(`[SUBSTITUTION DEBUG] Using fallback value for ${variableName}: "${fallbackValue}"`);
+    return fallbackValue;
+  });
+
+  return result;
+}
+
+// Provide fallback values for unresolved template variables
+function getFallbackValue(variableName, context) {
+  // Handle numbered URL variables
+  if (variableName.startsWith('PREVIOUS_STEP_RESULT_URL_')) {
+    const urlNumber = parseInt(variableName.split('_').pop());
+    if (urlNumber && urlNumber >= 1) {
+      // Fallback to PREVIOUS_RESEARCHED_URL for any numbered URL variable
+      if (context.PREVIOUS_RESEARCHED_URL) {
+        return context.PREVIOUS_RESEARCHED_URL;
+      }
+      // If no previous URL, generate a search URL based on current goal
+      if (context.LAST_SEARCH_QUERY) {
+        return `https://www.google.com/search?q=${encodeURIComponent(context.LAST_SEARCH_QUERY)}`;
+      }
+      if (context.CURRENT_GOAL) {
+        return `https://www.google.com/search?q=${encodeURIComponent(context.CURRENT_GOAL)}`;
+      }
+      return 'https://www.google.com';
+    }
+  }
+  
+  // Handle analyze_urls result variables
+  if (variableName.startsWith('url_from_analyze_urls_result_')) {
+    const urlNumber = parseInt(variableName.split('_').pop());
+    if (urlNumber && urlNumber >= 1) {
+      // Fallback to previous researched URL or generate search URL
+      if (context.PREVIOUS_RESEARCHED_URL) {
+        return context.PREVIOUS_RESEARCHED_URL;
+      }
+      if (context.LAST_SEARCH_QUERY) {
+        return `https://www.google.com/search?q=${encodeURIComponent(context.LAST_SEARCH_QUERY)}`;
+      }
+      if (context.CURRENT_GOAL) {
+        return `https://www.google.com/search?q=${encodeURIComponent(context.CURRENT_GOAL)}`;
+      }
+      return 'https://www.google.com';
+    }
+  }
+  
+  switch (variableName) {
+    case 'PREVIOUS_RESEARCHED_URL':
+      // If no previous URL, use current URL or a search URL
+      if (context.CURRENT_URL && context.CURRENT_URL !== 'about:blank') {
+        return context.CURRENT_URL;
+      }
+      if (context.LAST_SEARCH_QUERY) {
+        return `https://www.google.com/search?q=${encodeURIComponent(context.LAST_SEARCH_QUERY)}`;
+      }
+      return 'https://www.google.com';
+      
+    case 'LAST_SEARCH_QUERY':
+      return context.CURRENT_GOAL || 'information';
+      
+    case 'CURRENT_SEARCH_TERM':
+      return context.LAST_SEARCH_QUERY || context.CURRENT_GOAL || 'search';
+      
+    case 'USER_LOCATION':
+      return 'singapore';
+      
+    default:
+      // Return empty string for unknown variables
+      return '';
+  }
 }
 
 // Input validation
@@ -667,11 +967,14 @@ async function dispatchAgentAction(tabId, action, settings) {
   const sess = agentSessions.get(tabId);
   if (!sess) throw new Error("No agent session");
 
+  // Apply template variable substitution to params
+  const resolvedParams = resolveTemplateVariables(params, sess, tabId);
+
   // URL restriction logic has been disabled by user request.
 
   switch (tool) {
     case "navigate": {
-      const url = String(params.url || "");
+      const url = String(resolvedParams.url || "");
       if (!/^https?:\/\//i.test(url)) {
         return { ok: false, observation: "Invalid URL for navigate" };
       }
@@ -688,7 +991,7 @@ async function dispatchAgentAction(tabId, action, settings) {
         });
         return { ok: false, observation: "Content script unavailable" };
       }
-      const res = await chrome.tabs.sendMessage(tabId, { type: "CLICK_SELECTOR", selector: params.selector || "" });
+      const res = await chrome.tabs.sendMessage(tabId, { type: "CLICK_SELECTOR", selector: resolvedParams.selector || "" });
       return res?.ok ? { ok: true, observation: res.msg || "Clicked" } : { ok: false, observation: res?.error || "Click failed" };
     }
     case "fill": {
@@ -701,7 +1004,7 @@ async function dispatchAgentAction(tabId, action, settings) {
         });
         return { ok: false, observation: "Content script unavailable" };
       }
-      const res = await chrome.tabs.sendMessage(tabId, { type: "FILL_SELECTOR", selector: params.selector || "", value: params.value ?? "" });
+      const res = await chrome.tabs.sendMessage(tabId, { type: "FILL_SELECTOR", selector: resolvedParams.selector || "", value: resolvedParams.value ?? "" });
       return res?.ok ? { ok: true, observation: res.msg || "Filled" } : { ok: false, observation: res?.error || "Fill failed" };
     }
     case "scroll": {
@@ -714,7 +1017,7 @@ async function dispatchAgentAction(tabId, action, settings) {
         });
         return { ok: false, observation: "Content script unavailable" };
       }
-      const res = await chrome.tabs.sendMessage(tabId, { type: "SCROLL_TO_SELECTOR", selector: params.selector || "", direction: params.direction || "" });
+      const res = await chrome.tabs.sendMessage(tabId, { type: "SCROLL_TO_SELECTOR", selector: resolvedParams.selector || "", direction: resolvedParams.direction || "" });
       return res?.ok ? { ok: true, observation: res.msg || "Scrolled" } : { ok: false, observation: res?.error || "Scroll failed" };
     }
     case "waitForSelector": {
@@ -727,7 +1030,7 @@ async function dispatchAgentAction(tabId, action, settings) {
         });
         return { ok: false, observation: "Content script unavailable" };
       }
-      const res = await chrome.tabs.sendMessage(tabId, { type: "WAIT_FOR_SELECTOR", selector: params.selector || "", timeoutMs: params.timeoutMs || 5000 });
+      const res = await chrome.tabs.sendMessage(tabId, { type: "WAIT_FOR_SELECTOR", selector: resolvedParams.selector || "", timeoutMs: resolvedParams.timeoutMs || 5000 });
       return res?.ok ? { ok: true, observation: res.msg || "Selector found" } : { ok: false, observation: res?.error || "Wait failed" };
     }
     case "screenshot": {
@@ -739,8 +1042,8 @@ async function dispatchAgentAction(tabId, action, settings) {
       }
     }
     case "tabs.query": {
-      const titleContains = params.titleContains || "";
-      const urlContains = params.urlContains || "";
+      const titleContains = resolvedParams.titleContains || "";
+      const urlContains = resolvedParams.urlContains || "";
       const tabs = await chrome.tabs.query({});
       const matches = tabs.filter(t => (titleContains ? (t.title || "").toLowerCase().includes(titleContains.toLowerCase()) : true) &&
                                        (urlContains ? (t.url || "").toLowerCase().includes(urlContains.toLowerCase()) : true))
@@ -748,13 +1051,13 @@ async function dispatchAgentAction(tabId, action, settings) {
       return { ok: true, observation: `Found ${matches.length} tabs`, tabs: matches };
     }
     case "tabs.activate": {
-      const tgt = Number(params.tabId);
+      const tgt = Number(resolvedParams.tabId);
       if (!Number.isFinite(tgt)) return { ok: false, observation: "Invalid tabId" };
       await chrome.tabs.update(tgt, { active: true });
       return { ok: true, observation: `Activated tab ${tgt}` };
     }
     case "tabs.close": {
-      const tgt = Number(params.tabId);
+      const tgt = Number(resolvedParams.tabId);
       if (!Number.isFinite(tgt)) return { ok: false, observation: "Invalid tabId" };
       await chrome.tabs.remove(tgt);
       return { ok: true, observation: `Closed tab ${tgt}` };
@@ -763,7 +1066,7 @@ async function dispatchAgentAction(tabId, action, settings) {
       return { ok: true, observation: "Goal marked done" };
     }
     case "generate_report": {
-      const { format = 'markdown', content = '' } = params;
+      const { format = 'markdown', content = '' } = resolvedParams;
       const reportPrompt = buildReportGenerationPrompt(sess.goal, content, format);
       
       const reportRes = await callModelWithRotation(reportPrompt, { model: sess.selectedModel, tabId: tabId });
@@ -791,14 +1094,37 @@ async function dispatchAgentAction(tabId, action, settings) {
         return { ok: false, observation: "Content script unavailable" };
       }
       const res = await chrome.tabs.sendMessage(tabId, { type: "ANALYZE_PAGE_URLS" });
-      return res?.ok ? { ok: true, observation: "URL analysis completed", analysis: res.analysis } : { ok: false, observation: res?.error || "URL analysis failed" };
+      
+      if (res?.ok && res.analysis) {
+        // Store the analysis results in session for template variable access
+        const sess = agentSessions.get(tabId);
+        if (sess) {
+          sess.lastUrlAnalysis = res.analysis;
+          
+          // Extract URLs from analysis and store them for template variables
+          if (res.analysis.relevantUrls && Array.isArray(res.analysis.relevantUrls)) {
+            sess.analyzedUrls = res.analysis.relevantUrls.map(urlInfo =>
+              typeof urlInfo === 'string' ? urlInfo : urlInfo.url || urlInfo.href || ''
+            ).filter(url => url && url.startsWith('http'));
+          }
+        }
+        
+        return {
+          ok: true,
+          observation: `URL analysis completed. Found ${res.analysis.relevantUrls?.length || 0} relevant URLs.`,
+          analysis: res.analysis,
+          urls: sess?.analyzedUrls || []
+        };
+      }
+      
+      return { ok: false, observation: res?.error || "URL analysis failed" };
     }
     case "get_page_links": {
       if (!(await ensureContentScript(tabId))) {
         return { ok: false, observation: "Content script unavailable" };
       }
-      const includeExternal = params.includeExternal !== false;
-      const maxLinks = params.maxLinks || 20;
+      const includeExternal = resolvedParams.includeExternal !== false;
+      const maxLinks = resolvedParams.maxLinks || 20;
       const res = await chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_LINKS", includeExternal, maxLinks });
       return res?.ok ? { ok: true, observation: `Found ${res.links?.length || 0} relevant links`, links: res.links } : { ok: false, observation: res?.error || "Link extraction failed" };
     }
@@ -811,23 +1137,41 @@ async function dispatchAgentAction(tabId, action, settings) {
     }
     case "smart_navigate": {
       // Enhanced navigation that analyzes URLs and suggests the best approach
-      const query = String(params.query || "");
+      const query = String(resolvedParams.query || "");
+      const url = String(resolvedParams.url || "");
       const currentUrl = (await chrome.tabs.get(tabId)).url;
       
-      if (!query) {
-        return { ok: false, observation: "No search query provided for smart navigation" };
+      // Handle direct URL navigation
+      if (url && /^https?:\/\//i.test(url)) {
+        await chrome.tabs.update(tabId, { url });
+        return { ok: true, observation: `Smart navigation to: ${url}` };
       }
       
-      // Determine the best search strategy
-      const searchUrl = determineSearchUrl(query, currentUrl);
-      await chrome.tabs.update(tabId, { url: searchUrl });
-      return { ok: true, observation: `Smart navigation to: ${searchUrl}` };
+      // Handle search query navigation
+      if (query) {
+        const searchUrl = determineSearchUrl(query, currentUrl);
+        await chrome.tabs.update(tabId, { url: searchUrl });
+        return { ok: true, observation: `Smart navigation to: ${searchUrl}` };
+      }
+      
+      return { ok: false, observation: "No search query or URL provided for smart navigation" };
     }
     case "research_url": {
       // Automatically research a specific URL by navigating and extracting content
-      const url = String(params.url || "");
-      const depth = Number(params.depth || 1);
-      const maxDepth = Number(params.maxDepth || 2);
+      const url = String(resolvedParams.url || "");
+      const depth = Number(resolvedParams.depth || 1);
+      const maxDepth = Number(resolvedParams.maxDepth || 2);
+      
+      // Log template resolution for debugging
+      if (params.url !== resolvedParams.url) {
+        emitAgentLog(tabId, {
+          level: LOG_LEVELS.INFO,
+          msg: "Template variable resolved",
+          original: params.url,
+          resolved: resolvedParams.url,
+          tool: "research_url"
+        });
+      }
       
       if (!url || !/^https?:\/\//i.test(url)) {
         return { ok: false, observation: "Invalid URL for research" };
@@ -867,9 +1211,9 @@ async function dispatchAgentAction(tabId, action, settings) {
     }
     case "multi_search": {
       // Perform multiple location-aware searches for comprehensive results
-      const query = String(params.query || "");
-      const userLocation = params.location || getUserLocationFromTimezone();
-      const maxSearches = Number(params.maxSearches || 3);
+      const query = String(resolvedParams.query || "");
+      const userLocation = resolvedParams.location || getUserLocationFromTimezone();
+      const maxSearches = Number(resolvedParams.maxSearches || 3);
       
       if (!query) {
         return { ok: false, observation: "No search query provided for multi-search" };
@@ -943,9 +1287,9 @@ async function dispatchAgentAction(tabId, action, settings) {
         return { ok: false, observation: "Content script unavailable" };
       }
       
-      const currentDepth = Number(params.currentDepth || 1);
-      const maxDepth = Number(params.maxDepth || 3);
-      const researchGoal = String(params.researchGoal || "");
+      const currentDepth = Number(resolvedParams.currentDepth || 1);
+      const maxDepth = Number(resolvedParams.maxDepth || 3);
+      const researchGoal = String(resolvedParams.researchGoal || "");
       
       // Get URL analysis
       const urlAnalysis = await chrome.tabs.sendMessage(tabId, { type: "ANALYZE_PAGE_URLS" });
@@ -1047,6 +1391,39 @@ async function runAgentLoop(tabId, goal, settings) {
 
   await saveSessionToStorage(tabId, sess);
 }
+
+// Initialize enhanced features on startup
+chrome.runtime.onStartup.addListener(async () => {
+  console.log("[BG] Startup");
+  // Initialize API key manager
+  await apiKeyManager.initialize();
+  // Clean up old sessions on startup
+  await cleanupOldSessions();
+  // Initialize enhanced features
+  initializeEnhancedFeatures();
+  
+  // Attempt to restore any active sessions
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      if (tab.id) {
+        await restoreSessionFromStorage(tab.id);
+      }
+    }
+  } catch (e) {
+    console.warn("[BG] Failed to restore sessions on startup:", e);
+  }
+});
+
+chrome.runtime.onInstalled.addListener(async () => {
+  console.log("[BG] Installed");
+  // Initialize API key manager
+  await apiKeyManager.initialize();
+  // Clean up old sessions on install
+  await cleanupOldSessions();
+  // Initialize enhanced features
+  initializeEnhancedFeatures();
+});
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
@@ -1308,6 +1685,62 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             return sendResponse({ ok: false, error: "Failed to parse classification result" });
           } catch (error) {
             return sendResponse({ ok: false, error: error.message || "Classification error" });
+          }
+          break;
+        }
+
+        case MSG.CLASSIFY_INTENT_ENHANCED: {
+          const { userMessage, currentContext = {} } = message;
+          
+          if (!enhancedIntentClassifier) {
+            initializeEnhancedFeatures();
+          }
+          
+          if (!enhancedIntentClassifier) {
+            return sendResponse({ ok: false, error: "Enhanced intent classifier not available" });
+          }
+          
+          try {
+            const result = await enhancedIntentClassifier.classifyWithAmbiguityDetection(userMessage, currentContext);
+            return sendResponse({ ok: true, result });
+          } catch (error) {
+            return sendResponse({ ok: false, error: error.message || "Enhanced classification error" });
+          }
+          break;
+        }
+
+        case MSG.REQUEST_CLARIFICATION: {
+          const { sessionId, userMessage, classificationResult, context = {} } = message;
+          
+          if (!clarificationManager) {
+            initializeEnhancedFeatures();
+          }
+          
+          if (!clarificationManager) {
+            return sendResponse({ ok: false, error: "Clarification manager not available" });
+          }
+          
+          try {
+            const result = clarificationManager.createClarificationRequest(sessionId, userMessage, classificationResult, context);
+            return sendResponse({ ok: true, result });
+          } catch (error) {
+            return sendResponse({ ok: false, error: error.message || "Clarification request failed" });
+          }
+          break;
+        }
+
+        case MSG.RESPOND_CLARIFICATION: {
+          const { clarificationId, response } = message;
+          
+          if (!clarificationManager) {
+            return sendResponse({ ok: false, error: "Clarification manager not available" });
+          }
+          
+          try {
+            const result = clarificationManager.processClarificationResponse(clarificationId, response);
+            return sendResponse({ ok: true, result });
+          } catch (error) {
+            return sendResponse({ ok: false, error: error.message || "Clarification response processing failed" });
           }
           break;
         }
@@ -1944,3 +2377,53 @@ function shouldReadDeeper(urlAnalysis, contentQuality, currentDepth, maxDepth, r
   decision.reasoning = "Current content quality sufficient, no compelling reason to go deeper";
   return decision;
 }
+// DEBUG: Manual test function for template substitution
+function testTemplateSubstitution() {
+  console.log("[TEMPLATE TEST] Starting manual template substitution test...");
+  
+  // Create a mock session with some history
+  const mockSession = {
+    goal: "find ipad price",
+    history: [
+      {
+        action: { tool: "navigate", params: { url: "https://www.google.com" } },
+        observation: "Navigated to Google"
+      },
+      {
+        action: { tool: "research_url", params: { url: "https://www.apple.com/sg/ipad/" } },
+        observation: "Researched Apple iPad page"
+      },
+      {
+        action: { tool: "smart_navigate", params: { query: "ipad price singapore" } },
+        observation: "Smart navigation completed"
+      }
+    ],
+    analyzedUrls: [
+      "https://www.apple.com/sg/ipad/",
+      "https://www.courts.com.sg/ipad",
+      "https://www.challenger.sg/apple-ipad"
+    ]
+  };
+  
+  // Test parameters with template variables
+  const testParams = {
+    url: "{{PREVIOUS_STEP_RESULT_URL_1}}",
+    fallbackUrl: "{{PREVIOUS_RESEARCHED_URL}}",
+    analyzeUrl: "{{url_from_analyze_urls_result_1}}",
+    query: "price comparison for {{CURRENT_GOAL}}"
+  };
+  
+  console.log("[TEMPLATE TEST] Mock session:", mockSession);
+  console.log("[TEMPLATE TEST] Test params:", testParams);
+  
+  // Test the resolution
+  const resolvedParams = resolveTemplateVariables(testParams, mockSession, 123);
+  
+  console.log("[TEMPLATE TEST] Resolved params:", resolvedParams);
+  console.log("[TEMPLATE TEST] Test completed.");
+  
+  return resolvedParams;
+}
+
+// Expose test function globally for manual testing
+globalThis.testTemplateSubstitution = testTemplateSubstitution;

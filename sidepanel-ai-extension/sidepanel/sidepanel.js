@@ -402,42 +402,258 @@ async function sendMessage() {
 }
 
 async function processUserMessage(message) {
-  // Use AI-powered intent classification instead of hardcoded rules
+  // Use enhanced AI-powered intent classification with ambiguity detection
   try {
-    const intent = await classifyUserIntent(message);
+    const enhancedResult = await classifyUserIntentEnhanced(message);
     
-    if (!intent) {
-      // Fallback to general chat if classification fails
-      return await handleGeneralChat(message);
+    if (!enhancedResult) {
+      // Fallback to basic classification
+      const basicIntent = await classifyUserIntent(message);
+      return await routeBasedOnIntent(message, basicIntent);
     }
 
-    // Route to appropriate handler based on AI classification
-    switch (intent.intent) {
-      case 'YOUTUBE':
-        return await handleYouTubeIntent(message, intent);
-      case 'NAVIGATION':
-        return await handleNavigationIntent(message, intent);
-      case 'RESEARCH':
-        return await handleResearchIntent(message, intent);
-      case 'AUTOMATION':
-      case 'NAVIGATION':
-        return await handleAgentIntent(message, intent);
-      case 'CONVERSATION':
-        // Check for specific conversation types
-        if (message.toLowerCase().includes('summarize') || message.toLowerCase().includes('summary')) {
-          return await handleSummarizeChat();
-        }
-        if (message.toLowerCase().includes('task') || message.toLowerCase().includes('todo')) {
-          return "I can help you manage tasks. Would you like me to create a new task or show your existing ones?";
-        }
-        return await handleGeneralChat(message);
-      default:
-        return await handleAgentIntent(message);
+    // Handle clarification requests
+    if (enhancedResult.needsClarification) {
+      return await handleClarificationRequest(message, enhancedResult);
     }
+
+    // Route to appropriate handler based on enhanced classification
+    return await routeBasedOnIntent(message, enhancedResult.classification);
+    
   } catch (error) {
-    console.error('Intent classification error:', error);
-    // Fallback to general chat on error
+    console.error('Enhanced intent classification error:', error);
+    // Fallback to basic classification
+    try {
+      const basicIntent = await classifyUserIntent(message);
+      return await routeBasedOnIntent(message, basicIntent);
+    } catch (fallbackError) {
+      console.error('Fallback classification also failed:', fallbackError);
+      return await handleGeneralChat(message);
+    }
+  }
+}
+
+/**
+ * Enhanced AI-powered intent classification with ambiguity detection
+ */
+async function classifyUserIntentEnhanced(message) {
+  try {
+    // Get current page context
+    const tabRes = await bgSend({ type: MSG.GET_ACTIVE_TAB });
+    const currentContext = {
+      url: tabRes?.tab?.url || 'Unknown',
+      title: tabRes?.tab?.title || 'Unknown',
+      previousActions: [] // Could be populated from chat history
+    };
+
+    // Use the enhanced classification message type
+    const result = await bgSend({
+      type: MSG.CLASSIFY_INTENT_ENHANCED,
+      userMessage: message,
+      currentContext: currentContext
+    });
+
+    if (!result?.ok) {
+      console.warn('Enhanced intent classification failed:', result?.error);
+      return null;
+    }
+
+    if (result.result && result.result.success) {
+      console.log('Enhanced AI Intent Classification:', result.result);
+      return result.result;
+    }
+
+    return null;
+  } catch (error) {
+    console.error('Enhanced intent classification error:', error);
+    return null;
+  }
+}
+
+/**
+ * Handle clarification requests for ambiguous queries
+ */
+async function handleClarificationRequest(originalMessage, enhancedResult) {
+  const sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  
+  try {
+    // Create clarification request
+    const clarificationRes = await bgSend({
+      type: MSG.REQUEST_CLARIFICATION,
+      sessionId: sessionId,
+      userMessage: originalMessage,
+      classificationResult: enhancedResult,
+      context: {
+        timestamp: Date.now(),
+        chatHistory: await loadChatHistory()
+      }
+    });
+
+    if (!clarificationRes?.ok) {
+      return "I need more information to help you, but I'm having trouble processing your request. Could you please be more specific about what you'd like me to do?";
+    }
+
+    const clarificationRequest = clarificationRes.result.request;
+    
+    // Generate clarification message for the user
+    return await generateClarificationMessage(clarificationRequest, sessionId);
+    
+  } catch (error) {
+    console.error('Clarification request failed:', error);
+    return "I need more information to help you effectively. Could you please provide more details about what you'd like me to do?";
+  }
+}
+
+/**
+ * Generate user-friendly clarification message
+ */
+async function generateClarificationMessage(clarificationRequest, sessionId) {
+  const prompts = clarificationRequest.prompts;
+  
+  if (!prompts || prompts.length === 0) {
+    return "Could you please provide more details about what you'd like me to help you with?";
+  }
+
+  const mainPrompt = prompts[0];
+  let clarificationMessage = mainPrompt.message;
+
+  // Add interactive elements based on prompt type
+  switch (mainPrompt.type) {
+    case 'multiple_choice':
+      clarificationMessage += "\n\nPlease choose one of the following options:";
+      mainPrompt.options.forEach((option, index) => {
+        clarificationMessage += `\n${index + 1}. ${option.description}`;
+      });
+      if (mainPrompt.allowCustom) {
+        clarificationMessage += `\n${mainPrompt.options.length + 1}. ${mainPrompt.customPrompt}`;
+      }
+      break;
+
+    case 'context_gathering':
+      clarificationMessage += "\n\nPlease provide the following information:";
+      mainPrompt.questions.forEach((question, index) => {
+        clarificationMessage += `\n${index + 1}. ${question.question}`;
+      });
+      break;
+
+    case 'confidence_check':
+      clarificationMessage += "\n\nPlease respond with:";
+      mainPrompt.options.forEach((option, index) => {
+        clarificationMessage += `\n${index + 1}. ${option.text}`;
+      });
+      break;
+
+    case 'open_clarification':
+      if (mainPrompt.suggestions && mainPrompt.suggestions.length > 0) {
+        clarificationMessage += "\n\nFor example, you might want to:";
+        mainPrompt.suggestions.forEach((suggestion, index) => {
+          clarificationMessage += `\n• ${suggestion}`;
+        });
+      }
+      if (mainPrompt.followUp) {
+        clarificationMessage += `\n\n${mainPrompt.followUp}`;
+      }
+      break;
+
+    case 'page_context':
+      if (mainPrompt.suggestions && mainPrompt.suggestions.length > 0) {
+        mainPrompt.suggestions.forEach((suggestion, index) => {
+          clarificationMessage += `\n${index + 1}. ${suggestion}`;
+        });
+      }
+      break;
+  }
+
+  // Store the clarification context for follow-up processing
+  // This would be handled by the clarification manager in a real implementation
+  
+  return clarificationMessage;
+}
+
+/**
+ * Route message based on intent classification
+ */
+async function routeBasedOnIntent(message, intent) {
+  if (!intent) {
     return await handleGeneralChat(message);
+  }
+
+  // Route to appropriate handler based on AI classification
+  switch (intent.intent) {
+    case 'YOUTUBE':
+      return await handleYouTubeIntent(message, intent);
+    case 'NAVIGATION':
+      return await handleNavigationIntent(message, intent);
+    case 'RESEARCH':
+      return await handleResearchIntent(message, intent);
+    case 'SHOPPING':
+      return await handleShoppingIntent(message, intent);
+    case 'AUTOMATION':
+      return await handleAgentIntent(message, intent);
+    case 'CONVERSATION':
+      // Check for specific conversation types
+      if (message.toLowerCase().includes('summarize') || message.toLowerCase().includes('summary')) {
+        return await handleSummarizeChat();
+      }
+      if (message.toLowerCase().includes('task') || message.toLowerCase().includes('todo')) {
+        return "I can help you manage tasks. Would you like me to create a new task or show your existing ones?";
+      }
+      return await handleGeneralChat(message);
+    default:
+      return await handleAgentIntent(message);
+  }
+}
+
+/**
+ * Handle shopping-related intents with enhanced pricing research
+ */
+async function handleShoppingIntent(message, intent = null) {
+  // Check if API key is available
+  const hasKey = await checkApiKeyWarn();
+  if (!hasKey) {
+    return 'Please set your Gemini API key in settings (gear icon) before I can help with shopping research.';
+  }
+  
+  // Use enhanced research approach for shopping queries
+  const shoppingGoal = `Find comprehensive pricing and product information: ${message}`;
+  
+  const intentMessage = intent ?
+    `I understand you want to ${intent.suggestedAction}. Let me research pricing and product information for you.` :
+    `I'll help you find pricing and product information. Let me search multiple sources for you.`;
+  
+  addMessage('assistant', intentMessage);
+  
+  // Use enhanced research settings with pricing focus
+  const settings = {
+    allowCrossDomain: true,
+    allowTabMgmt: true,
+    autoScreenshots: true,
+    maxSteps: 25 // More steps for comprehensive shopping research
+  };
+  
+  try {
+    const res = await bgSend({ type: MSG.AGENT_RUN, goal: shoppingGoal, settings });
+    if (!res?.ok) {
+      return getErrorMessage(res?.error, res?.errorType);
+    }
+    
+    // Start monitoring agent status
+    startStatusMonitoring();
+    
+    return "I'm now researching pricing and product information for you. I'll search multiple sources, compare prices, and provide you with comprehensive shopping insights. You can use the STOP button if needed.";
+  } catch (error) {
+    return `Error starting shopping research: ${error.message || 'Something went wrong'}`;
+  }
+  
+  function getErrorMessage(error, errorType) {
+    switch (errorType) {
+      case ERROR_TYPES.AGENT_ALREADY_RUNNING:
+        return "I'm already working on another task. Please wait for it to finish or use the STOP button first.";
+      case ERROR_TYPES.RESTRICTED_URL:
+        return "I can't research from this page due to browser restrictions. Try navigating to a regular website first.";
+      default:
+        return `I couldn't start the shopping research: ${error || "unknown error"}`;
+    }
   }
 }
 
