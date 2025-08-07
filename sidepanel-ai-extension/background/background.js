@@ -674,8 +674,7 @@ function validateAction(action) {
     for (const [param, value] of Object.entries(action.params)) {
       const paramSchema = schema.properties.params.properties[param];
       if (!paramSchema) {
-        // Allow extra params but log a warning
-        console.warn(`[VALIDATION] Unknown parameter '${param}' for tool '${action.tool}'.`);
+        errors.push(`Unknown parameter '${param}' for tool '${action.tool}'.`);
         continue;
       }
       const expectedTypes = Array.isArray(paramSchema.type) ? paramSchema.type : [paramSchema.type];
@@ -1298,25 +1297,14 @@ async function dispatchAgentAction(tabId, action, settings) {
         return { ok: false, observation: res?.error || "Content extraction failed" };
     }
     case "record_finding": {
-        const { finding, name, value, key, information } = resolvedParams;
-        let findingToRecord = finding;
+        const { finding } = resolvedParams;
 
-        // Handle flexible parameter structures
-        if (information) {
-            findingToRecord = information;
-        } else if (key && value) {
-            findingToRecord = { [key]: value };
-        } else if (name && value) {
-            findingToRecord = { [name]: value };
+        if (typeof finding !== 'object' || finding === null) {
+            return { ok: false, observation: "Invalid finding object provided. The 'finding' parameter must be a valid JSON object." };
         }
-
-        if (typeof findingToRecord !== 'object' || findingToRecord === null) {
-            return { ok: false, observation: "Invalid finding object provided. A 'finding' object, 'information' object, or 'name'/'key' and 'value' parameters are required." };
-        }
+        const findingToRecord = finding;
         // Deep merge the new finding with existing findings
         sess.findings = deepMerge(sess.findings, findingToRecord);
-        
-        const findingMessage = `✅ Finding Recorded: ${JSON.stringify(findingToRecord, null, 2)}`;
         
         emitAgentLog(tabId, {
             level: LOG_LEVELS.SUCCESS,
@@ -1326,10 +1314,9 @@ async function dispatchAgentAction(tabId, action, settings) {
         
         // Send a dedicated message to the chat to make the finding visible
         chrome.runtime.sendMessage({
-          type: MSG.AGENT_PROGRESS,
+          type: MSG.AGENT_FINDING,
           tabId: tabId,
-          message: findingMessage,
-          step: sess.step,
+          finding: findingToRecord,
           timestamp: Date.now()
         });
 
@@ -1646,10 +1633,19 @@ async function agenticLoop(tabId, goal, settings) {
     const correctedAction = await handleActionFailure(tabId, sess, goal, currentSubTask, contextData, action, execRes);
     
     if (correctedAction) {
-      // If a correction is suggested, execute it immediately in the next loop iteration
-      // by replacing the failed action with the corrected one for the next step.
-      // This is a conceptual note; the loop will naturally use the new state.
-      emitAgentLog(tabId, { level: LOG_LEVELS.INFO, msg: "Proceeding with corrected action in next step." });
+      emitAgentLog(tabId, { level: LOG_LEVELS.INFO, msg: "Re-executing with corrected action." });
+      // Immediately execute the corrected action and update context
+      const correctedExecRes = await executeActionWithContext(tabId, sess, correctedAction, settings);
+      updateSessionContext(tabId, sess, correctedAction, correctedExecRes);
+      
+      // If the corrected action also fails, stop the agent
+      if (!correctedExecRes.ok) {
+        emitAgentLog(tabId, { level: LOG_LEVELS.ERROR, msg: "Corrected action also failed. Stopping agent." });
+        stopAgent(tabId, "Stopping after failed self-correction.");
+        return;
+      }
+      // Replace the original failed action with the successful corrected one for the rest of the loop logic
+      action = correctedAction;
     } else {
       // If no correction, stop the agent
       stopAgent(tabId, "Stopping after failed self-correction.");

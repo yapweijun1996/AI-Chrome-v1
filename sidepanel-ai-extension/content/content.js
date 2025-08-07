@@ -41,42 +41,39 @@ function getPageText(maxChars = 20000) {
 }
 
 function extractStructuredContent() {
-  // 1. Prioritize JSON-LD for structured data
-  const jsonLdScripts = document.querySelectorAll('script[type="application/ld+json"]');
-  if (jsonLdScripts.length > 0) {
-    try {
-      const jsonLdData = Array.from(jsonLdScripts).map(script => JSON.parse(script.textContent));
-      // If we found JSON-LD, we can return it as the primary structured content
-      // We can add more processing here later to normalize it
-      return {
-        source: 'json-ld',
-        data: jsonLdData,
-        title: document.title,
-        mainContent: getCleanTextContent(document.body) // Still provide main text as fallback
-      };
-    } catch (e) {
-      console.warn("Failed to parse JSON-LD script:", e);
-    }
-  }
-
-  // 2. Fallback to existing HTML structure analysis if no JSON-LD
+  // Always build a complete content object to ensure consistent shape
   const content = {
-    source: 'html',
+    source: 'html', // Default source
     title: document.title || '',
     description: '',
     mainContent: '',
     links: [],
     metadata: [],
-    urls: []
+    urls: [],
+    sections: [],
+    jsonLd: null // To store parsed JSON-LD data
   };
 
-  // Extract meta description
+  // 1. Try to get JSON-LD for structured data
+  const jsonLdScripts = document.querySelectorAll('script[type="application/ld+json"]');
+  if (jsonLdScripts.length > 0) {
+    try {
+      const jsonLdData = Array.from(jsonLdScripts).map(script => JSON.parse(script.textContent));
+      content.source = 'json-ld';
+      content.jsonLd = jsonLdData;
+      // Also assign it to 'data' for compatibility with background script
+      content.data = jsonLdData;
+    } catch (e) {
+      console.warn("Failed to parse JSON-LD script:", e);
+    }
+  }
+
+  // 2. Always perform HTML structure analysis to populate all fields
   const metaDesc = document.querySelector('meta[name="description"]');
   if (metaDesc) {
     content.description = metaDesc.getAttribute('content') || '';
   }
 
-  // Extract main content with better text processing
   const mainContentSelectors = [
     'main', 'article', '[role="main"]', '.content', '.main-content',
     '.post-content', '.entry-content', '.article-content'
@@ -92,10 +89,8 @@ function extractStructuredContent() {
     mainElement = document.body;
   }
 
-  // Get clean text content
   content.mainContent = getCleanTextContent(mainElement);
 
-  // Extract relevant links
   const links = Array.from(document.querySelectorAll('a[href]'))
     .filter(link => {
       const href = link.href;
@@ -115,10 +110,8 @@ function extractStructuredContent() {
 
   content.links = links;
 
-  // Extract URLs from text content
   content.urls = extractUrlsFromText(content.mainContent);
 
-  // Extract metadata
   const metaTags = Array.from(document.querySelectorAll('meta[name], meta[property]'));
   content.metadata = metaTags
     .filter(meta => {

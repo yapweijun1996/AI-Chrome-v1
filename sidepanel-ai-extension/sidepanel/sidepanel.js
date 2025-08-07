@@ -16,6 +16,7 @@ const MSG = window.MessageTypes?.MSG || {
   AGENT_STATUS: "AGENT_STATUS",
   AGENT_LOG: "AGENT_LOG",
   AGENT_PROGRESS: "AGENT_PROGRESS",
+  AGENT_FINDING: "AGENT_FINDING",
   SHOW_REPORT: "SHOW_REPORT"
 };
 
@@ -1356,6 +1357,8 @@ chrome.runtime.onMessage.addListener((message) => {
   } else if (message?.type === MSG.AGENT_PROGRESS && message.message) {
     // Phase 3: Update status bubble instead of adding new messages
     updateStatusBubble(message.message, message.step, message.timestamp);
+  } else if (message?.type === MSG.AGENT_FINDING && message.finding) {
+    addFindingMessage(message.finding, message.timestamp);
   } else if (message?.type === MSG.SHOW_REPORT && message.report) {
     // Clear status bubble when showing final report
     clearStatusBubble();
@@ -1488,54 +1491,26 @@ function renderPlan(container, subTasks) {
 
 // Phase 3: Status Bubble functions
 function updateStatusBubble(message, step, timestamp) {
-  const isFinding = message.startsWith('✅ Finding Recorded:');
-
-  if (isFinding) {
-    // If it's a finding, create a new, permanent message bubble
-    const findingContainer = addMessage('assistant', '');
-    findingContainer.classList.add('finding-bubble-container');
-    const contentDiv = findingContainer.querySelector('.content');
-    
-    // Extract the JSON part of the message
-    const jsonString = message.substring(message.indexOf('{'));
-    let formattedFinding = '';
-    try {
-      const findingJson = JSON.parse(jsonString);
-      formattedFinding = `<pre><code>${JSON.stringify(findingJson, null, 2)}</code></pre>`;
-    } catch (e) {
-      formattedFinding = `<p>${message}</p>`; // Fallback for non-JSON findings
-    }
-
+  // Handle regular status updates
+  if (!currentStatusBubble) {
+    const bubbleContainer = addMessage('assistant', '');
+    bubbleContainer.classList.add('status-bubble-container');
+    const contentDiv = bubbleContainer.querySelector('.content');
     contentDiv.innerHTML = `
-      <div class="finding-bubble">
-        <div class="finding-title">✅ Finding Recorded</div>
-        <div class="finding-content">${formattedFinding}</div>
-        <div class="finding-timestamp">${new Date(timestamp).toLocaleTimeString()}</div>
+      <div class="status-bubble">
+        <div class="spinner"></div>
+        <div class="status-text"></div>
+        <div class="status-timestamp"></div>
       </div>
     `;
-    // Do not set currentStatusBubble for findings, as they are permanent
-  } else {
-    // Handle regular status updates
-    if (!currentStatusBubble) {
-      const bubbleContainer = addMessage('assistant', '');
-      bubbleContainer.classList.add('status-bubble-container');
-      const contentDiv = bubbleContainer.querySelector('.content');
-      contentDiv.innerHTML = `
-        <div class="status-bubble">
-          <div class="spinner"></div>
-          <div class="status-text"></div>
-          <div class="status-timestamp"></div>
-        </div>
-      `;
-      currentStatusBubble = bubbleContainer;
-    }
-    
-    const textEl = currentStatusBubble.querySelector('.status-text');
-    const tsEl = currentStatusBubble.querySelector('.status-timestamp');
-    
-    if (textEl) textEl.textContent = message;
-    if (tsEl) tsEl.textContent = `Step ${step || ''} - ${new Date(timestamp).toLocaleTimeString()}`;
+    currentStatusBubble = bubbleContainer;
   }
+  
+  const textEl = currentStatusBubble.querySelector('.status-text');
+  const tsEl = currentStatusBubble.querySelector('.status-timestamp');
+  
+  if (textEl) textEl.textContent = message;
+  if (tsEl) tsEl.textContent = `Step ${step || ''} - ${new Date(timestamp).toLocaleTimeString()}`;
   
   els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
 }
@@ -1564,6 +1539,22 @@ function updatePlan(currentTaskIndex) {
 }
 
 /* ---------- Success Criteria Visualization helpers ---------- */
+function addFindingMessage(finding, timestamp) {
+   const findingContainer = addMessage('assistant', '');
+   findingContainer.classList.add('finding-bubble-container');
+   const contentDiv = findingContainer.querySelector('.content');
+   
+   const formattedFinding = `<pre><code>${JSON.stringify(finding, null, 2)}</code></pre>`;
+ 
+   contentDiv.innerHTML = `
+     <div class="finding-bubble">
+       <div class="finding-title">✅ Finding Recorded</div>
+       <div class="finding-content">${formattedFinding}</div>
+       <div class="finding-timestamp">${new Date(timestamp).toLocaleTimeString()}</div>
+     </div>
+   `;
+   els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
+ }
 function renderSuccessCriteria(schema, findings) {
   const container = els.successCriteria;
   if (!container) return;

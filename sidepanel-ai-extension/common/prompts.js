@@ -676,7 +676,7 @@ AVAILABLE RESEARCH TOOLS:
 - screenshot: Take a screenshot for visual analysis
 - extract_structured_content: Get enhanced content extraction with metadata
 - extract_with_regex: Extract specific information from text using a regex pattern.
-- record_finding: Saves a piece of structured data to your findings. Use this after extracting information to build up your final answer. The data MUST be in a 'finding' object. Example: { "tool": "record_finding", "params": { "finding": { "price": "$1299", "model": "iPad Pro" } } }
+- record_finding: Saves a structured data object to your findings. CRITICAL: All data MUST be passed in a single 'finding' object. DO NOT invent other parameters. Example: { "tool": "record_finding", "params": { "finding": { "exchange_rate": "3.45", "currency_pair": "SGD_to_MYR" } } }
 - generate_report: Create a comprehensive research report. You can only use this when the success criteria are met.
 - done: Mark research complete. You can only use this when the success criteria are met.
 
