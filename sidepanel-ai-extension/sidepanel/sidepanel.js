@@ -91,6 +91,7 @@ let isTyping = false;
 let currentAgentSession = null;
 let statusCheckInterval = null;
 let isAgentRunning = false;
+let currentPlanMessage = null;
 
 function uid() {
   return Math.random().toString(36).slice(2, 10);
@@ -184,13 +185,26 @@ async function checkAgentStatus() {
   try {
     const res = await bgSend({ type: MSG.AGENT_STATUS });
     if (res?.ok && res.session) {
-      currentAgentSession = res.session;
+      const session = res.session;
+      currentAgentSession = session;
       const wasRunning = isAgentRunning;
-      isAgentRunning = res.session.running;
+      isAgentRunning = session.running;
       
       // Update UI based on status changes
-      updateAgentStatusUI(res.session, wasRunning);
-      return res.session;
+      updateAgentStatusUI(session, wasRunning);
+
+      // If the session has a plan, render or update it
+      if (session.subTasks && session.subTasks.length > 0) {
+        if (!currentPlanMessage) {
+          // If no plan is currently displayed, render it.
+          const planContainer = addMessage('assistant', '');
+          renderPlan(planContainer.querySelector('.content'), session.subTasks);
+          currentPlanMessage = planContainer;
+        }
+        updatePlan(session.currentTaskIndex || 0);
+      }
+      
+      return session;
     } else {
       if (isAgentRunning) {
         isAgentRunning = false;
@@ -1210,14 +1224,37 @@ function wireBasics() {
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === MSG.AGENT_LOG && message.entry) {
     addAgentLogToChat(message.entry);
+    // Also check for step updates in the log to update the plan
+    if (message.entry.step !== undefined && currentPlanMessage) {
+      updatePlan(message.entry.step);
+    }
   } else if (message?.type === MSG.AGENT_PROGRESS && message.message) {
     // Add progress updates to chat
     addMessage('assistant', message.message, message.timestamp || Date.now());
   } else if (message?.type === MSG.SHOW_REPORT && message.report) {
     addMessage('assistant', message.report, Date.now(), message.format === 'markdown');
-  } else if (message?.type === MSG.AGENT_STATUS && message.session?.running) {
-    // Ensure drawer visible while running
-    ensureActivityOpen();
+  } else if (message?.type === MSG.AGENT_STATUS) {
+    if (message.session?.running) {
+      // Ensure drawer visible while running
+      ensureActivityOpen();
+    }
+    // Handle plan updates from status messages
+    if (message.session?.subTasks?.length > 0) {
+      if (!currentPlanMessage) {
+        const planContainer = addMessage('assistant', '');
+        renderPlan(planContainer.querySelector('.content'), message.session.subTasks);
+        currentPlanMessage = planContainer;
+      }
+      updatePlan(message.session.currentTaskIndex || 0);
+    }
+  } else if (message?.type === MSG.AGENT_PLAN_GENERATED) {
+      const planContainer = addMessage('assistant', '');
+      renderPlan(planContainer.querySelector('.content'), message.plan);
+      currentPlanMessage = planContainer;
+  } else if (message?.type === MSG.AGENT_STEP_UPDATE) {
+      if (currentPlanMessage) {
+        updatePlan(message.currentTaskIndex);
+      }
   }
 });
 
