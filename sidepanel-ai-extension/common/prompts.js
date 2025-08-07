@@ -3,22 +3,22 @@
 
 function buildSummarizePrompt(pageText, userPrompt = "") {
   let prompt = `You are an intelligent assistant. Your task is to analyze the provided text from a webpage and respond to the user's request.
-
-First, provide a concise, neutral summary of the text.
-
-Second, analyze the user's follow-up request: "${userPrompt}"
-
-Follow these rules:
-1.  If the user's request can be answered using the provided text, answer it directly.
-2.  If the user's request is unrelated to the provided text, clearly state that the text does not contain the requested information and suggest how the user can find it (e.g., by searching online, visiting a specific website).
-3.  If no user request is provided, just return the summary.
-
-Here is the text to analyze:
----
-${pageText}
----
-
-Present your response in two parts: a "Concise Summary of the Text" and then your "Response to User Request".`;
+  
+  First, provide a concise, neutral summary of the text.
+  
+  Second, analyze the user's follow-up request: "${userPrompt}"
+  
+  Follow these rules:
+  1.  If the user's request can be answered using the provided text, answer it directly.
+  2.  If the user's request is unrelated to the provided text, clearly state that the text does not contain the requested information and suggest how the user can find it (e.g., by searching online, visiting a specific website).
+  3.  If no user request is provided, just return the summary.
+  
+  Here is the text to analyze:
+  ---
+  ${pageText}
+  ---
+  
+  Present your response in two parts: a "Concise Summary of the Text" and then your "Response to User Request".`;
 
   return prompt;
 }
@@ -138,7 +138,7 @@ Return ONLY a JSON object with your next action:
   "params": { /* tool-specific parameters */ },
   "rationale": "Clear reasoning for this action based on context and progress",
   "confidence": 0.85, // 0.0-1.0 confidence in this action
-  "done": false // true only when current sub-task is definitively complete
+  "done": false // true only when the CURRENT SUB-TASK is definitively complete. This will advance the agent to the next sub-task in the plan.
 }
 
 Choose the most contextually appropriate action to advance the current sub-task efficiently.`
@@ -206,11 +206,12 @@ Current Page Context:
 - Title: ${pageInfo.title || 'unknown'}
 
 PLANNING PRINCIPLES:
-1. Each sub-task should be atomic and verifiable
-2. Tasks should follow logical dependencies (e.g., navigate before interact)
-3. If the current page is not relevant to the goal, the first step MUST be to navigate to an appropriate page (e.g., google.com for a search task).
-4. Include validation steps to ensure success before proceeding
-5. Consider error scenarios and recovery paths
+1. **STRICT Step Limit:** The plan must have a STRICT MAXIMUM of 5 steps. Be extremely concise.
+2. **Simplicity First:** Prioritize the simplest, most direct path. Avoid redundant steps.
+3. **Logical Dependencies:** Tasks must follow a logical order (e.g., navigate before interacting).
+4. **Mandatory Navigation:** If the current page is not relevant, the first step MUST be navigation (e.g., to google.com).
+5. **Atomic & Verifiable:** Each sub-task should be a single, clear action.
+6. **Final Synthesis:** The final step should typically be to synthesize information or generate a report.
 
 TASK CATEGORIES TO CONSIDER:
 - Navigation: Moving between pages/sites
@@ -231,14 +232,14 @@ Example for "Research the best restaurants in Paris" when on "chrome://newtab":
   "subTasks": [
     "Navigate to https://www.google.com",
     "Search for 'best restaurants in Paris'",
-    "Identify and click on a reputable review site from the search results",
-    "Extract restaurant names and ratings from the page",
-    "Synthesize the findings into a list"
+    "Analyze search results and navigate to the most promising link",
+    "Extract key information (names, ratings) from the page",
+    "Synthesize the findings into a final report"
   ],
   "context": {
     "taskType": "research",
-    "expectedDuration": "medium",
-    "complexity": "moderate",
+    "expectedDuration": "short",
+    "complexity": "low",
     "dependencies": ["web_search", "data_extraction"]
   }
 }
@@ -638,9 +639,9 @@ DISCOVERED URLS & LINKS:
 ${context.interactiveElements ? analyzePageUrls(context.interactiveElements) : 'No URL analysis available'}
 
 AVAILABLE RESEARCH TOOLS:
+- read_page_content: Read and process the full content of the current page. This should be used after navigating to a new page.
 - smart_navigate: Intelligently navigate to the best source for your query (location-aware)
 - multi_search: Perform multiple location-aware searches for comprehensive results
-- continue_multi_search: Continue to next search in multi-search sequence
 - research_url: Automatically research a specific URL with depth control (supports recursive reading)
 - analyze_url_depth: Analyze if current page URLs are worth reading deeper
 - analyze_urls: Analyze all URLs on current page for research relevance
@@ -655,16 +656,12 @@ AVAILABLE RESEARCH TOOLS:
 - generate_report: Create a comprehensive research report
 - done: Mark research complete
 
-INTELLIGENT RESEARCH STRATEGY:
-1. **Location-Aware Search**: Use multi_search to perform multiple location-aware searches based on user's timezone
-2. **URL Discovery**: Automatically identify and analyze relevant URLs on each page
-3. **Smart Navigation**: Use smart_navigate to find the best sources for your research topic (location-aware)
-4. **Deep URL Analysis**: Use analyze_url_depth to decide if URLs are worth reading deeper
-5. **Recursive Reading**: Use research_url with depth control for comprehensive content extraction
-6. **Content Extraction**: Use extract_structured_content to get rich, structured information
-7. **Link Analysis**: Use get_page_links to find the most relevant related sources
-8. **Multi-Source Research**: Visit multiple authoritative sources automatically with intelligent depth control
-9. **Synthesis**: Combine findings from all sources into comprehensive insights
+// CORE RESEARCH STRATEGY:
+// 1. **Search**: Use \`multi_search\` or \`smart_navigate\` to find a relevant page.
+// 2. **Read**: Use \`read_page_content\` to understand the page's content. This is a mandatory step after navigation.
+// 3. **Analyze & Extract**: Based on the content you just read, use \`extract_structured_content\`, \`get_page_links\`, or \`analyze_urls\` to gather specific information.
+// 4. **Synthesize**: Once enough information is gathered from 2-3 sources, use \`generate_report\`.
+// 5. **Repeat**: If more information is needed, repeat from step 1 or 2 with a new source.
 
 LOCATION-AWARE FEATURES:
 - Automatically detects user location from timezone (e.g., Singapore from Asia/Singapore)
@@ -688,6 +685,9 @@ Consider these factors for your next action:
 4. **Research Depth**: Do you need more specific or general information?
 5. **Synthesis Readiness**: Do you have enough information to provide comprehensive insights?
 
+// **CRITICAL RULE 1: DO NOT use the \`generate_report\` tool until you have gathered sufficient information from at least 2-3 different sources.** If you have not gathered enough information, you MUST use tools like \`smart_navigate\`, \`research_url\`, or \`multi_search\` first.
+// **CRITICAL RULE 2: DO NOT be repetitive. If you have already performed a search, analyze the results and navigate to a link. Do not perform the same search again.**
+
 HUMAN-LIKE RESEARCH BEHAVIOR:
 - Automatically read and follow relevant URLs found in content
 - Prioritize authoritative sources (academic, government, established organizations)
@@ -698,7 +698,7 @@ HUMAN-LIKE RESEARCH BEHAVIOR:
 
 Return your next intelligent research action:
 {
-  "tool": "smart_navigate|multi_search|continue_multi_search|research_url|analyze_url_depth|analyze_urls|get_page_links|navigate|click|fill|scroll|waitForSelector|screenshot|extract_structured_content|generate_report|done",
+  "tool": "read_page_content|smart_navigate|multi_search|research_url|analyze_url_depth|analyze_urls|get_page_links|navigate|click|fill|scroll|waitForSelector|screenshot|extract_structured_content|generate_report|done",
   "params": {
     "query": "search query for smart_navigate/multi_search",
     "location": "user location (auto-detected from timezone if not specified)",
@@ -718,7 +718,7 @@ Return your next intelligent research action:
   "rationale": "Detailed reasoning for this research action based on current context and goals",
   "confidence": 0.85,
   "research_strategy": "location_aware_search|multi_source_discovery|deep_analysis|recursive_reading|synthesis|verification",
-  "done": false
+  "done": false // true ONLY when the current sub-task is complete. This moves to the next sub-task.
 }
 
 Focus on taking intelligent, autonomous actions that mimic how a human researcher would naturally explore and analyze information.`;

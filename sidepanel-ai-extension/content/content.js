@@ -226,6 +226,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         handleScrapeSelector(message, sendResponse);
         break;
       }
+      case "READ_PAGE_CONTENT": {
+        const text = getPageText(message.maxChars);
+        sendResponse({ ok: true, text });
+        break;
+      }
       default:
         sendResponse({ ok: false, error: "Unknown message type in content script: " + message.type });
     }

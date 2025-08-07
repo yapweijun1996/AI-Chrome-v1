@@ -1140,6 +1140,18 @@ async function dispatchAgentAction(tabId, action, settings) {
       const res = await chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_LINKS", includeExternal, maxLinks });
       return res?.ok ? { ok: true, observation: `Found ${res.links?.length || 0} relevant links`, links: res.links } : { ok: false, observation: res?.error || "Link extraction failed" };
     }
+    case "read_page_content": {
+      if (!(await ensureContentScript(tabId))) {
+        return { ok: false, observation: "Content script unavailable" };
+      }
+      const res = await chrome.tabs.sendMessage(tabId, { type: "READ_PAGE_CONTENT", maxChars: 15000 });
+      if (res?.ok) {
+        const observationText = `Successfully read page content. Length: ${res.text?.length}.`;
+        return { ok: true, observation: observationText, pageContent: res.text };
+      } else {
+        return { ok: false, observation: res?.error || "Failed to read page content" };
+      }
+    }
     case "extract_structured_content": {
       if (!(await ensureContentScript(tabId))) {
         return { ok: false, observation: "Content script unavailable" };
@@ -1357,40 +1369,110 @@ async function agenticLoop(tabId, goal, settings) {
     return;
   }
 
-  // Perceive
-  const context = await gatherContextForReasoning(tabId, sess);
-
-  // Reason
-  const reasoningPrompt = buildReasoningPrompt(goal, context, sess.history);
-  const modelResponse = await callModelWithRotation(reasoningPrompt, { model: sess.selectedModel, tabId });
-
-  if (!modelResponse.ok) {
-    emitAgentLog(tabId, { level: LOG_LEVELS.ERROR, msg: "Reasoning failed", error: modelResponse.error });
-    stopAgent(tabId, "Reasoning failed");
+  // Check if all sub-tasks are completed
+  if (sess.currentTaskIndex >= sess.subTasks.length) {
+    emitAgentLog(tabId, { level: LOG_LEVELS.INFO, msg: "All sub-tasks completed. Generating final report." });
+    await generateFinalReport(tabId, sess);
+    stopAgent(tabId, "Goal achieved");
     return;
   }
 
-  const { action, rationale } = parseModelResponse(modelResponse.text);
+  const currentSubTask = sess.subTasks[sess.currentTaskIndex];
 
-  if (!action || !action.tool) {
-    emitAgentLog(tabId, { level: LOG_LEVELS.ERROR, msg: "Failed to parse action from model response", response: modelResponse.text });
+  // 1. Perceive: Gather enhanced context
+  const contextData = await gatherEnhancedContext(tabId, sess, currentSubTask);
+  if (!contextData) {
+    stopAgent(tabId, "Failed to gather context");
+    return;
+  }
+
+  // 2. Reason: Select appropriate prompt based on task type
+  const { taskType } = sess.taskContext || { taskType: 'AUTOMATION' };
+  let reasoningPrompt;
+  switch (taskType) {
+    case 'RESEARCH':
+      reasoningPrompt = buildResearchAgentPrompt(goal, currentSubTask, contextData);
+      break;
+    case 'YOUTUBE':
+      reasoningPrompt = buildYouTubeActionPrompt(goal, contextData);
+      break;
+    case 'NAVIGATION':
+      reasoningPrompt = buildNavigationActionPrompt(goal, contextData);
+      break;
+    default:
+      reasoningPrompt = buildAgentPlanPrompt(goal, currentSubTask, contextData);
+  }
+  
+  const modelResponse = await callModelWithRotation(reasoningPrompt, { model: sess.selectedModel, tabId });
+
+  // 3. Parse and Validate Action
+  let action;
+  if (modelResponse.ok) {
+    const validationResult = parseAndValidateAction(tabId, sess, modelResponse.text);
+    if (validationResult.success) {
+      action = validationResult.action;
+    } else {
+      emitAgentLog(tabId, { level: LOG_LEVELS.ERROR, msg: "Failed to parse valid action", error: validationResult.error, rawText: validationResult.rawText });
+      // Attempt recovery planning
+      const recoveryResponse = await attemptRecoveryPlanning(tabId, sess, goal, currentSubTask, contextData);
+      if (recoveryResponse?.ok) {
+        const recoveryValidation = parseAndValidateAction(tabId, sess, recoveryResponse.text);
+        if (recoveryValidation.success) {
+          action = recoveryValidation.action;
+        }
+      }
+    }
+  }
+
+  if (!action) {
+    emitAgentLog(tabId, { level: LOG_LEVELS.ERROR, msg: "Stopping agent due to parsing failure after recovery attempt." });
     stopAgent(tabId, "Failed to parse action");
     return;
   }
 
-  // Act
+  // 4. Act: Execute the action
   const execRes = await executeActionWithContext(tabId, sess, action, settings);
 
-  // Observe
+  // 5. Observe and Update Context
   updateSessionContext(tabId, sess, action, execRes);
 
-  if (action.tool === 'done' || sess.step >= settings.maxSteps) {
+  // 6. Handle Failures and Self-Correction
+  if (!execRes.ok) {
+    sess.failureCount = (sess.failureCount || 0) + 1;
+    sess.consecutiveFailures = (sess.consecutiveFailures || 0) + 1;
+    
+    const correctedAction = await handleActionFailure(tabId, sess, goal, currentSubTask, contextData, action, execRes);
+    
+    if (correctedAction) {
+      // If a correction is suggested, execute it immediately in the next loop iteration
+      // by replacing the failed action with the corrected one for the next step.
+      // This is a conceptual note; the loop will naturally use the new state.
+      emitAgentLog(tabId, { level: LOG_LEVELS.INFO, msg: "Proceeding with corrected action in next step." });
+    } else {
+      // If no correction, stop the agent
+      stopAgent(tabId, "Stopping after failed self-correction.");
+      return;
+    }
+  } else {
+    // Reset consecutive failures on success
+    sess.consecutiveFailures = 0;
+  }
+
+  // 7. Advance to the next sub-task if 'done' is signaled for the current one
+  if (action.tool === 'done' || action.done === true) {
+    emitAgentLog(tabId, { level: LOG_LEVELS.INFO, msg: `Sub-task "${currentSubTask}" completed.` });
+    sess.currentTaskIndex++;
+  }
+
+  // 8. Check for overall completion or max steps
+  if (sess.step >= settings.maxSteps) {
+    emitAgentLog(tabId, { level: LOG_LEVELS.WARN, msg: "Max steps reached. Generating final report." });
     await generateFinalReport(tabId, sess);
-    stopAgent(tabId, "Goal achieved or max steps reached.");
+    stopAgent(tabId, "Max steps reached");
     return;
   }
 
-  // Continue the loop
+  // 9. Continue the loop
   sess.step++;
   const delay = calculateAdaptiveDelay(action, execRes.ok);
   await new Promise(r => setTimeout(r, delay));
@@ -2069,39 +2151,19 @@ Choose the next action to progress toward your goal. Return ONLY valid JSON:
   
   return null;
 }
-// [CONTEXT ENGINEERING] Enhanced context gathering with caching
+// [CONTEXT ENGINEERING] Enhanced context gathering from session state
 async function gatherEnhancedContext(tabId, sess, currentSubTask) {
-  const now = Date.now();
-  const cache = sess.contextCache || {};
-  const CACHE_TTL = 30000; // 30 seconds
-
-  // Use cached data if not stale
-  if (cache.timestamp && (now - cache.timestamp < CACHE_TTL)) {
-    emitAgentLog(tabId, { level: LOG_LEVELS.DEBUG, msg: "Using cached context" });
-    return cache.data;
-  }
-
-  emitAgentLog(tabId, { level: LOG_LEVELS.DEBUG, msg: "Gathering fresh context" });
+  emitAgentLog(tabId, { level: LOG_LEVELS.DEBUG, msg: "Gathering context from session state" });
 
   try {
     const pageInfo = await getPageInfoForPlanning(tabId);
-    let pageContent = "";
-    let interactiveElements = [];
 
-    if (!isRestrictedUrl(pageInfo.url)) {
-      if (await ensureContentScript(tabId)) {
-        const textExtract = await chrome.tabs.sendMessage(tabId, { type: MSG.EXTRACT_PAGE_TEXT, maxChars: 8000 });
-        if (textExtract?.ok) pageContent = textExtract.text;
-
-        const elementsExtract = await chrome.tabs.sendMessage(tabId, { type: MSG.GET_INTERACTIVE_ELEMENTS });
-        if (elementsExtract?.ok) interactiveElements = elementsExtract.elements;
-      }
-    }
-
+    // Context is now primarily built from session history, not active polling.
+    // The agent must explicitly use tools like `read_page_content` or `get_interactive_elements`.
     const contextData = {
       pageInfo,
-      pageContent,
-      interactiveElements,
+      pageContent: sess.currentPageContent || "", // Get content from session
+      interactiveElements: sess.currentInteractiveElements || [], // Get elements from session
       history: sess.history || [],
       lastAction: sess.lastAction,
       lastObservation: sess.lastObservation,
@@ -2114,12 +2176,6 @@ async function gatherEnhancedContext(tabId, sess, currentSubTask) {
         failureCount: sess.failureCount,
         consecutiveFailures: sess.consecutiveFailures
       }
-    };
-
-    // Update cache
-    sess.contextCache = {
-      timestamp: now,
-      data: contextData
     };
 
     return contextData;
@@ -2171,14 +2227,21 @@ function updateSessionContext(tabId, sess, action, execRes) {
 
   // Add to history and keep it trimmed
   sess.history.push({ action, observation: execRes?.observation || "" });
-  if (sess.history.length > 20) { // Increased history size for better context
+  if (sess.history.length > 20) {
     sess.history.shift();
   }
 
-  // Invalidate cache after successful navigation
-  if (action.tool === 'navigate' && execRes.ok) {
-    sess.contextCache = {};
-    emitAgentLog(tabId, { level: LOG_LEVELS.DEBUG, msg: "Context cache invalidated after navigation." });
+  // If the page content was read, store it in the session
+  if (action.tool === 'read_page_content' && execRes.ok && execRes.pageContent) {
+    sess.currentPageContent = execRes.pageContent;
+    emitAgentLog(tabId, { level: LOG_LEVELS.DEBUG, msg: `Stored page content in session (length: ${execRes.pageContent.length})` });
+  }
+
+  // If we navigate away, the content is now stale and must be cleared
+  if (action.tool === 'navigate' || action.tool === 'smart_navigate') {
+    sess.currentPageContent = "";
+    sess.currentInteractiveElements = [];
+    emitAgentLog(tabId, { level: LOG_LEVELS.DEBUG, msg: "Cleared stale page content from session after navigation." });
   }
 
   // Persist session state after each action
