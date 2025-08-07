@@ -30,7 +30,7 @@ function openDB() {
     });
 }
 
-export async function saveSession(session) {
+async function saveSession(session) {
     const db = await openDB();
     return new Promise((resolve, reject) => {
         const transaction = db.transaction([STORE_NAME], 'readwrite');
@@ -45,7 +45,7 @@ export async function saveSession(session) {
     });
 }
 
-export async function loadSession(sessionId) {
+async function loadSession(sessionId) {
     const db = await openDB();
     return new Promise((resolve, reject) => {
         const transaction = db.transaction([STORE_NAME], 'readonly');
@@ -62,7 +62,7 @@ export async function loadSession(sessionId) {
     });
 }
 
-export async function clearSession(sessionId) {
+async function clearSession(sessionId) {
     const db = await openDB();
     return new Promise((resolve, reject) => {
         const transaction = db.transaction([STORE_NAME], 'readwrite');

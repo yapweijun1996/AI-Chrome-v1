@@ -1385,6 +1385,7 @@ async function agenticLoop(tabId, goal, settings) {
   updateSessionContext(tabId, sess, action, execRes);
 
   if (action.tool === 'done' || sess.step >= settings.maxSteps) {
+    await generateFinalReport(tabId, sess);
     stopAgent(tabId, "Goal achieved or max steps reached.");
     return;
   }
@@ -1432,6 +1433,43 @@ async function gatherContextForReasoning(tabId, sess) {
     pageContent,
     interactiveElements,
   };
+}
+
+async function generateFinalReport(tabId, sess) {
+  emitAgentLog(tabId, { level: LOG_LEVELS.INFO, msg: "Generating final report for user." });
+
+  const historySummary = sess.history.map((h, i) =>
+    `Step ${i + 1}: Action: ${h.action.tool}, Observation: ${(h.observation || "").substring(0, 150)}...`
+  ).join('\n');
+
+  const reportPrompt = `You are an AI assistant. You have just completed a task for a user. Your goal was: "${sess.goal}".
+Review your action history and provide a concise, user-friendly summary of what you accomplished.
+
+Your Action History:
+---
+${historySummary}
+---
+
+Based on this history, write a final response to the user that summarizes the outcome of the task.`;
+
+  const reportRes = await callModelWithRotation(reportPrompt, { model: sess.selectedModel, tabId });
+
+  if (reportRes.ok) {
+    chrome.runtime.sendMessage({
+      type: MSG.SHOW_REPORT,
+      tabId: tabId,
+      report: reportRes.text,
+      format: 'markdown'
+    });
+  } else {
+    // Fallback message if report generation fails
+    chrome.runtime.sendMessage({
+      type: MSG.SHOW_REPORT,
+      tabId: tabId,
+      report: `I have completed the task, but encountered an issue generating the final summary. The goal was: "${sess.goal}".`,
+      format: 'markdown'
+    });
+  }
 }
 
 // Initialize enhanced features on startup
