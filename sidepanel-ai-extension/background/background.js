@@ -54,6 +54,40 @@ const { MSG, PARAM_LIMITS, TIMEOUTS, ERROR_TYPES, LOG_LEVELS, API_KEY_ROTATION }
 // Simple in-memory agent sessions keyed by tabId
 const agentSessions = new Map(); // tabId -> { running, stopped, step, goal, subTasks: [], currentTaskIndex: 0, settings, logs: [], history: [], lastAction, lastObservation }
 
+function initializeNewSession(tabId, goal, subTasks, settings, selectedModel, taskContext) {
+  return {
+    running: false,
+    stopped: false,
+    step: 0,
+    goal,
+    subTasks,
+    currentTaskIndex: 0,
+    settings,
+    selectedModel,
+    logs: [],
+    lastAction: "",
+    lastObservation: "",
+    history: [],
+    scratchpad: [],
+    requestId: `agent_${tabId}_${Date.now()}`,
+    taskContext: taskContext || {},
+    contextCache: {},
+    failureCount: 0,
+    consecutiveFailures: 0,
+    findings: {},
+    successCriteria: {},
+    subTaskStep: 0,
+    maxSubTaskSteps: 15,
+    domainVisitCount: {},
+    maxDomainVisits: 5,
+    noProgressCounter: 0,
+    maxNoProgressSteps: 4,
+    lastProgressObservation: "",
+    chatTranscript: [],
+    sessionId: tabId,
+  };
+}
+
 // Enhanced functionality instances
 let enhancedIntentClassifier = null;
 let enhancedPlanner = null;
@@ -643,8 +677,12 @@ function validateAction(action) {
         console.warn(`[VALIDATION] Unknown parameter '${param}' for tool '${action.tool}'.`);
         continue;
       }
-      if (typeof value !== paramSchema.type && paramSchema.type !== 'integer') { // Allow number for integer
-        errors.push(`Invalid type for param '${param}'. Expected ${paramSchema.type}, got ${typeof value}.`);
+      const expectedTypes = Array.isArray(paramSchema.type) ? paramSchema.type : [paramSchema.type];
+      if (!expectedTypes.includes(typeof value)) {
+          // Allow number for integer type
+        if (!(expectedTypes.includes('integer') && typeof value === 'number')) {
+          errors.push(`Invalid type for param '${param}'. Expected ${expectedTypes.join(' or ')}, got ${typeof value}.`);
+        }
       }
       if (paramSchema.maxLength && value.length > paramSchema.maxLength) {
         errors.push(`Parameter '${param}' is too long.`);
@@ -1259,20 +1297,44 @@ async function dispatchAgentAction(tabId, action, settings) {
         return { ok: false, observation: res?.error || "Content extraction failed" };
     }
     case "record_finding": {
-        const { finding } = resolvedParams;
-        if (typeof finding !== 'object' || finding === null) {
-            return { ok: false, observation: "Invalid finding object provided." };
+        const { finding, name, value, key, information } = resolvedParams;
+        let findingToRecord = finding;
+
+        // Handle flexible parameter structures
+        if (information) {
+            findingToRecord = information;
+        } else if (key && value) {
+            findingToRecord = { [key]: value };
+        } else if (name && value) {
+            findingToRecord = { [name]: value };
+        }
+
+        if (typeof findingToRecord !== 'object' || findingToRecord === null) {
+            return { ok: false, observation: "Invalid finding object provided. A 'finding' object, 'information' object, or 'name'/'key' and 'value' parameters are required." };
         }
         // Deep merge the new finding with existing findings
-        sess.findings = deepMerge(sess.findings, finding);
+        sess.findings = deepMerge(sess.findings, findingToRecord);
+        
+        const findingMessage = `✅ Finding Recorded: ${JSON.stringify(findingToRecord, null, 2)}`;
+        
         emitAgentLog(tabId, {
             level: LOG_LEVELS.SUCCESS,
             msg: "Recorded finding to session",
-            finding: finding
+            finding: findingToRecord
           });
-          // Persist session after recording a finding
-          saveSessionToStorage(tabId, sess);
-          return { ok: true, observation: "Finding recorded successfully." };
+        
+        // Send a dedicated message to the chat to make the finding visible
+        chrome.runtime.sendMessage({
+          type: MSG.AGENT_PROGRESS,
+          tabId: tabId,
+          message: findingMessage,
+          step: sess.step,
+          timestamp: Date.now()
+        });
+
+        // Persist session after recording a finding
+        saveSessionToStorage(tabId, sess);
+        return { ok: true, observation: "Finding recorded successfully." };
         }
     case "smart_navigate": {
       // Enhanced navigation that analyzes URLs and suggests the best approach
@@ -1555,7 +1617,21 @@ async function agenticLoop(tabId, goal, settings) {
     return;
   }
 
-  // 4. Act: Execute the action
+  // 4. Act: Execute the action, with a guard against premature 'done'
+  if (action.tool === 'done' && Object.keys(sess.findings).length === 0) {
+    emitAgentLog(tabId, {
+      level: LOG_LEVELS.WARN,
+      msg: "Premature 'done' action detected. Overriding with 'think' to force re-evaluation.",
+      originalAction: action
+    });
+    action = {
+      tool: 'think',
+      params: { thought: "I was about to mark the task as done, but I haven't recorded any findings yet. I need to re-evaluate my plan and gather information first." },
+      rationale: "Overriding premature 'done' action to ensure findings are gathered before completion.",
+      confidence: 0.99,
+      done: false
+    };
+  }
   const execRes = await executeActionWithContext(tabId, sess, action, settings);
 
   // 5. Observe and Update Context
@@ -1738,7 +1814,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case MSG.AGENT_RUN: {
           const { goal = "", settings: userSettings = {} } = message || {};
           const settings = {
-            maxSteps: 120, // Increased default max steps
+            maxSteps: 150, // Increased default max steps
             ...userSettings
           };
           const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -1799,38 +1875,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
 
           // 2. Initialize session with enhanced context
-          const newSession = {
-            running: false,
-            stopped: false,
-            step: 0,
-            goal,
-            subTasks,
-            currentTaskIndex: 0,
-            settings,
-            selectedModel: GEMINI_MODEL || "gemini-1.5-flash",
-            logs: [],
-            lastAction: "",
-            lastObservation: "",
-            history: [],
-            scratchpad: [], // Working memory for the agent
-            requestId: `agent_${tab.id}_${Date.now()}`, // For correlation
-            taskContext: taskContext, // Enhanced task context
-            contextCache: {}, // Context caching
-            failureCount: 0,
-            consecutiveFailures: 0,
-            findings: {}, // For storing structured data
-            successCriteria: {}, // Schema for required findings
-            // Watchdog timers and counters
-            subTaskStep: 0, // For per-subtask step budget
-            maxSubTaskSteps: 15, // Default per-subtask step limit
-            domainVisitCount: {}, // For per-domain cap
-            maxDomainVisits: 5, // Default per-domain visit limit
-            noProgressCounter: 0, // For no-progress detector
-            maxNoProgressSteps: 4, // Default no-progress step limit
-            lastProgressObservation: "", // Store last meaningful observation
-            chatTranscript: [], // For persisting chat history
-            sessionId: tab.id,
-          };
+          const newSession = initializeNewSession(tab.id, goal, subTasks, settings, GEMINI_MODEL || "gemini-1.5-flash", taskContext);
           agentSessions.set(tab.id, newSession);
           
           // Persist new session
@@ -2152,6 +2197,66 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           break;
         }
 
+        case MSG.COORDINATE_AND_EXECUTE: {
+          const { userMessage } = message;
+          const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+          if (!tab?.id) return sendResponse({ ok: false, error: "No active tab" });
+
+          // 1. Get API Key
+          await apiKeyManager.initialize();
+          const currentKey = apiKeyManager.getCurrentKey();
+          if (!currentKey) {
+            return sendResponse({ ok: false, error: "No available API keys." });
+          }
+          const { GEMINI_MODEL } = await chrome.storage.sync.get("GEMINI_MODEL");
+          const selectedModel = GEMINI_MODEL || "gemini-1.5-flash";
+
+          // 2. Build Coordinator Prompt
+          const pageInfo = await getPageInfoForPlanning(tab.id);
+          const coordinatorPrompt = buildCoordinatorPrompt(userMessage, pageInfo);
+
+          // 3. Call Model to get the tool and parameters
+          const modelRes = await callModelWithRotation(coordinatorPrompt, { model: selectedModel, tabId: tab.id });
+          if (!modelRes.ok) {
+            return sendResponse({ ok: false, error: "Coordinator model call failed.", details: modelRes.error });
+          }
+
+          const extracted = extractJSONWithRetry(modelRes.text, 'coordinator response');
+          if (!extracted.success) {
+            // If JSON parsing fails, fall back to a general chat response.
+            const fallbackPrompt = buildSummarizePrompt("", `I couldn't determine a specific action for your request: "${userMessage}". Please try rephrasing. Here's a general response:`);
+            const fallbackRes = await callModelWithRotation(fallbackPrompt, { model: selectedModel, tabId: tab.id });
+            return sendResponse({ ok: true, summary: fallbackRes.text });
+          }
+
+          const { tool, params } = extracted.data;
+
+          // 4. Execute the chosen tool
+          switch (tool) {
+            case 'quick_answer':
+              const chatPrompt = buildSummarizePrompt("", params.question);
+              const chatRes = await callModelWithRotation(chatPrompt, { model: selectedModel, tabId: tab.id });
+              sendResponse({ ok: true, summary: chatRes.text });
+              break;
+            case 'web_automation':
+              // This re-uses the existing AGENT_RUN logic.
+              const agentGoal = params.goal;
+              const agentSettings = { maxSteps: 50, allowCrossDomain: true, allowTabMgmt: true };
+              
+              // De-duplicate agent run logic by calling the existing handler function internally
+              // This requires refactoring the AGENT_RUN case slightly. For now, we duplicate a bit.
+              const newSession = initializeNewSession(tab.id, agentGoal, [agentGoal], agentSettings, selectedModel, { taskType: 'AUTOMATION' });
+              agentSessions.set(tab.id, newSession);
+              await saveSessionToStorage(tab.id, newSession);
+              runAgentLoop(tab.id, agentGoal, agentSettings).catch(e => console.error("[BG] Agent loop error:", e));
+              
+              sendResponse({ ok: true, agentStarted: true, goal: agentGoal });
+              break;
+            default:
+              sendResponse({ ok: false, error: `Unknown tool from coordinator: ${tool}` });
+          }
+          break;
+        }
         default:
           sendResponse({ ok: false, error: "Unknown message type" });
       }
@@ -2889,7 +2994,12 @@ async function summarizeChatTranscript(transcript, model, tabId) {
     return "";
   }
 
-  // Keep the last 10 messages for context
+  // If the transcript is short, just concatenate messages to avoid a slow LLM call.
+  if (transcript.length <= 4) {
+    return transcript.map(m => `${m.role}: ${m.content}`).join('\n');
+  }
+
+  // For longer transcripts, summarize the last 10 messages for context
   const recentMessages = transcript.slice(-10);
   const summaryPrompt = buildChatSummaryPrompt(recentMessages);
 

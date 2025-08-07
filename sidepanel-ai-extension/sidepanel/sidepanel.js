@@ -418,13 +418,22 @@ async function sendMessage() {
     // Process the message
     const response = await processUserMessage(input);
     hideTypingIndicator();
-    addMessage('assistant', response);
+    // The new coordinator returns a summary for quick answers, or an agentStarted flag.
+    if (response.summary) {
+      addMessage('assistant', response.summary);
+    } else if (response.agentStarted) {
+      addMessage('assistant', `I'm starting the web automation to handle your request: "${response.goal}". I'll keep you updated!`);
+      startStatusMonitoring();
+    } else {
+      addMessage('assistant', "I'm not sure how to handle that request. Please try rephrasing.");
+    }
     
     // Save to history
     const history = await loadChatHistory();
+    const assistantResponse = response.summary || `Agent started for: ${response.goal}`;
     history.push(
       { role: 'user', content: input, timestamp: Date.now() },
-      { role: 'assistant', content: response, timestamp: Date.now() }
+      { role: 'assistant', content: assistantResponse, timestamp: Date.now() }
     );
     // Keep only last 50 messages
     if (history.length > 50) {
@@ -441,50 +450,17 @@ async function sendMessage() {
 }
 
 async function processUserMessage(message) {
-  // If we are waiting for a clarification response, handle that first.
-  if (clarificationContext) {
-    return await handleClarificationResponse(message);
+  // All user messages now go through the coordinator in the background script.
+  const response = await bgSend({
+    type: MSG.COORDINATE_AND_EXECUTE,
+    userMessage: message,
+  });
+
+  if (!response?.ok) {
+    return formatChatError(response?.error || 'Coordinator failed to respond.');
   }
 
-  // Phase 1 (Refined): Heuristic-first routing
-  const messageLower = message.toLowerCase().trim();
-  
-  // Define verbs that strongly suggest agent/automation mode
-  const automationVerbs = [
-    'run', 'automate', 'click', 'fill', 'submit', 'navigate', 'open',
-    'go to', 'search for', 'register', 'login', 'checkout', 'buy',
-    'scrape', 'extract', 'book', 'purchase', 'download'
-  ];
-
-  const hasAutomationIntent = automationVerbs.some(verb => messageLower.startsWith(verb));
-  const isUrl = messageLower.match(/^(https?:\/\/|www\.)/);
-
-  // If intent is clearly automation, use the agent.
-  if (hasAutomationIntent || isUrl) {
-    return await handleAgentIntent(message);
-  }
-
-  // For queries that don't start with a clear chat verb, they might be ambiguous.
-  // e.g., "sgd myr" vs "what is sgd to myr"
-  const chatVerbs = [
-    'what', 'why', 'how', 'explain', 'summarize', 'summary', 'list',
-    'compare', 'outline', 'describe', 'tell me', 'help', 'can you',
-    'should i', 'is it', 'are there', 'do you', 'when', 'where', 'who'
-  ];
-  const hasClearChatIntent = chatVerbs.some(verb => messageLower.startsWith(verb));
-
-  // Special case for summarize
-  if (messageLower.includes('summarize') && (messageLower.includes('page') || messageLower.includes('this'))) {
-      return await handleSummarizeChat();
-  }
-
-  if (!hasClearChatIntent && message.length < 20 && message.split(' ').length < 4) {
-    // Short, non-verb queries are often ambiguous. Let's clarify.
-    return await handleAmbiguousClarification(message);
-  }
-
-  // Default to general chat for everything else.
-  return await handleGeneralChat(message);
+  return response;
 }
 
 // New function to handle ambiguous messages with clarification
@@ -1508,6 +1484,67 @@ function renderPlan(container, subTasks) {
   });
 
   container.appendChild(planList);
+}
+
+// Phase 3: Status Bubble functions
+function updateStatusBubble(message, step, timestamp) {
+  const isFinding = message.startsWith('✅ Finding Recorded:');
+
+  if (isFinding) {
+    // If it's a finding, create a new, permanent message bubble
+    const findingContainer = addMessage('assistant', '');
+    findingContainer.classList.add('finding-bubble-container');
+    const contentDiv = findingContainer.querySelector('.content');
+    
+    // Extract the JSON part of the message
+    const jsonString = message.substring(message.indexOf('{'));
+    let formattedFinding = '';
+    try {
+      const findingJson = JSON.parse(jsonString);
+      formattedFinding = `<pre><code>${JSON.stringify(findingJson, null, 2)}</code></pre>`;
+    } catch (e) {
+      formattedFinding = `<p>${message}</p>`; // Fallback for non-JSON findings
+    }
+
+    contentDiv.innerHTML = `
+      <div class="finding-bubble">
+        <div class="finding-title">✅ Finding Recorded</div>
+        <div class="finding-content">${formattedFinding}</div>
+        <div class="finding-timestamp">${new Date(timestamp).toLocaleTimeString()}</div>
+      </div>
+    `;
+    // Do not set currentStatusBubble for findings, as they are permanent
+  } else {
+    // Handle regular status updates
+    if (!currentStatusBubble) {
+      const bubbleContainer = addMessage('assistant', '');
+      bubbleContainer.classList.add('status-bubble-container');
+      const contentDiv = bubbleContainer.querySelector('.content');
+      contentDiv.innerHTML = `
+        <div class="status-bubble">
+          <div class="spinner"></div>
+          <div class="status-text"></div>
+          <div class="status-timestamp"></div>
+        </div>
+      `;
+      currentStatusBubble = bubbleContainer;
+    }
+    
+    const textEl = currentStatusBubble.querySelector('.status-text');
+    const tsEl = currentStatusBubble.querySelector('.status-timestamp');
+    
+    if (textEl) textEl.textContent = message;
+    if (tsEl) tsEl.textContent = `Step ${step || ''} - ${new Date(timestamp).toLocaleTimeString()}`;
+  }
+  
+  els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
+}
+
+function clearStatusBubble() {
+  if (currentStatusBubble) {
+    currentStatusBubble.remove();
+    currentStatusBubble = null;
+  }
 }
 
 function updatePlan(currentTaskIndex) {

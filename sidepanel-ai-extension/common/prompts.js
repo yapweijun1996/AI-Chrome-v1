@@ -676,7 +676,7 @@ AVAILABLE RESEARCH TOOLS:
 - screenshot: Take a screenshot for visual analysis
 - extract_structured_content: Get enhanced content extraction with metadata
 - extract_with_regex: Extract specific information from text using a regex pattern.
-- record_finding: Saves a piece of structured data to your findings. Use this after extracting information to build up your final answer.
+- record_finding: Saves a piece of structured data to your findings. Use this after extracting information to build up your final answer. The data MUST be in a 'finding' object. Example: { "tool": "record_finding", "params": { "finding": { "price": "$1299", "model": "iPad Pro" } } }
 - generate_report: Create a comprehensive research report. You can only use this when the success criteria are met.
 - done: Mark research complete. You can only use this when the success criteria are met.
 
@@ -825,6 +825,7 @@ Report Generation Guidelines:
 4. If the requested format is "markdown", use appropriate Markdown syntax for formatting (e.g., # for headings, * for lists, ** for bold).
 5. If the requested format is "story", weave the information into a narrative.
 6. The report should directly address the user's original goal.
+7. If the findings are empty, state that you were unable to find the information and suggest alternative ways the user can find it.
 
 Please generate the report in ${format} format.`
   );
@@ -944,4 +945,64 @@ ${formattedTranscript}
 ---
 
 Summary:`;
+}
+
+function buildCoordinatorPrompt(userMessage, pageInfo = {}) {
+  return `You are an intelligent AI coordinator. Your job is to analyze a user's request and decide which tool is best suited to handle it.
+
+User Request: "${userMessage}"
+
+Current Page Context:
+- URL: ${pageInfo.url || 'unknown'}
+- Title: ${pageInfo.title || 'unknown'}
+
+Available Tools:
+1.  **quick_answer**: Use for simple questions, definitions, or requests that do not require accessing a web page.
+    - Example: "What is a Chrome extension?", "Explain JavaScript promises"
+2.  **web_automation**: Use for tasks that require navigating websites, clicking elements, filling forms, or extracting information from the current or other web pages.
+    - Example: "Find the price of an iPad on apple.com", "Log in to my GitHub account"
+
+Decision Framework:
+- If the user is asking a general knowledge question, use "quick_answer".
+- If the user is asking about the content of the *current* page, or wants to perform an action on *any* web page, use "web_automation".
+- For ambiguous requests like "sgd myr", which could be a simple conversion or a request to find the best exchange rate, prefer "web_automation" to provide a more comprehensive answer.
+
+Return ONLY a JSON object with your decision.
+
+Schema:
+{
+  "tool": "quick_answer" | "web_automation",
+  "params": {
+    "question": "The user's question for a quick answer", // for quick_answer
+    "goal": "The user's goal for web automation" // for web_automation
+  }
+}
+
+Example 1:
+User Request: "What is the capital of France?"
+{
+  "tool": "quick_answer",
+  "params": {
+    "question": "What is the capital of France?"
+  }
+}
+
+Example 2:
+User Request: "Find me a good recipe for chocolate cake"
+{
+  "tool": "web_automation",
+  "params": {
+    "goal": "Find a good recipe for chocolate cake"
+  }
+}
+
+Example 3:
+User Request: "sgd myr"
+{
+    "tool": "web_automation",
+    "params": {
+        "goal": "Find the current exchange rate for SGD to MYR"
+    }
+}
+`;
 }
