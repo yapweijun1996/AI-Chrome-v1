@@ -231,6 +231,7 @@ async function callModelWithRotation(prompt, options, timeoutMs = TIMEOUTS.MODEL
       if (result.ok) {
         // Success - mark key as good
         apiKeyManager.markKeySuccess();
+        apiKeyManager.rotateOnSuccess();
         return result;
       } else {
         // Prefer structured errorType from API wrapper; fallback to heuristics

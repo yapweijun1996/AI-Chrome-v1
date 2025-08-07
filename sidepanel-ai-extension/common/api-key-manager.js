@@ -214,6 +214,19 @@
     }
   }
 
+  rotateOnSuccess() {
+    if (this.keys.length === 0) return;
+    const activeKeys = this.keys.filter(k => this.isKeyAvailable(k));
+    if (activeKeys.length <= 1) return; // No need to rotate if only one key is available
+
+    this.currentIndex = (this.currentIndex + 1) % this.keys.length;
+    // Skip to the next available key
+    while (!this.isKeyAvailable(this.keys[this.currentIndex])) {
+      this.currentIndex = (this.currentIndex + 1) % this.keys.length;
+    }
+    this.saveKeys();
+  }
+
   getKeyStats() {
     return {
       total: this.keys.length,
