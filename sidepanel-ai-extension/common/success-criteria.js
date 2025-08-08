@@ -92,6 +92,96 @@ globalThis.SUCCESS_CRITERIA_SCHEMAS = {
 };
 
 /**
+ * Internal helper to validate any value against a (subset of) JSON schema.
+ * Supports: type (object, array, string, number, integer), required, properties, items,
+ * and minimal format checks for "uri" and "date-time".
+ * @param {*} value
+ * @param {object} schema
+ * @param {string} path - dotted path for error messages
+ * @param {string[]} errors - accumulator
+ */
+function validateValueAgainstSchema(value, schema, path, errors) {
+  if (!schema || typeof schema !== 'object') return;
+
+  const type = schema.type;
+
+  // Arrays
+  if (type === 'array') {
+    if (!Array.isArray(value)) {
+      errors.push(`${path || 'value'} has incorrect type. Expected array, got ${Array.isArray(value) ? 'array' : typeof value}.`);
+      return;
+    }
+    if (typeof schema.minItems === 'number' && value.length < schema.minItems) {
+      errors.push(`Property '${path || 'array'}' must have at least ${schema.minItems} items.`);
+    }
+    if (schema.items) {
+      for (let i = 0; i < value.length; i++) {
+        validateValueAgainstSchema(value[i], schema.items, `${path}[${i}]`, errors);
+      }
+    }
+    return;
+  }
+
+  // Objects
+  if (type === 'object') {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      errors.push(`${path || 'value'} has incorrect type. Expected object, got ${value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value}.`);
+      return;
+    }
+    if (Array.isArray(schema.required)) {
+      for (const prop of schema.required) {
+        if (!(prop in value)) {
+          errors.push(`Missing required property: '${path ? path + '.' : ''}${prop}'.`);
+        }
+      }
+    }
+    if (schema.properties && typeof schema.properties === 'object') {
+      for (const [prop, propSchema] of Object.entries(schema.properties)) {
+        if (prop in value) {
+          validateValueAgainstSchema(value[prop], propSchema, path ? `${path}.${prop}` : prop, errors);
+        }
+      }
+    }
+    return;
+  }
+
+  // Strings
+  if (type === 'string') {
+    if (typeof value !== 'string') {
+      errors.push(`${path || 'value'} has incorrect type. Expected string, got ${typeof value}.`);
+      return;
+    }
+    if (schema.format === 'uri') {
+      try { new URL(value); } catch { errors.push(`${path || 'value'} is not a valid uri.`); }
+    } else if (schema.format === 'date-time') {
+      const t = Date.parse(value);
+      if (Number.isNaN(t)) {
+        errors.push(`${path || 'value'} is not a valid date-time.`);
+      }
+    }
+    return;
+  }
+
+  // Numbers
+  if (type === 'number') {
+    if (typeof value !== 'number' || Number.isNaN(value)) {
+      errors.push(`${path || 'value'} has incorrect type. Expected number, got ${typeof value}.`);
+    }
+    return;
+  }
+
+  // Integers (not used in current schemas but supported)
+  if (type === 'integer') {
+    if (typeof value !== 'number' || !Number.isInteger(value)) {
+      errors.push(`${path || 'value'} has incorrect type. Expected integer, got ${typeof value}.`);
+    }
+    return;
+  }
+
+  // If schema.type is not provided or unrecognized, skip strict type checks.
+}
+
+/**
  * @description Validates a set of findings against a given JSON schema.
  * @param {object} findings - The collected data to validate.
  * @param {object} schema - The JSON schema to validate against.
@@ -99,53 +189,17 @@ globalThis.SUCCESS_CRITERIA_SCHEMAS = {
  */
 globalThis.validateFindings = (findings, schema) => {
   const errors = [];
-  
-  if (typeof findings !== 'object' || findings === null) {
+
+  // Root must be an object for our findings structure
+  if (typeof findings !== 'object' || findings === null || Array.isArray(findings)) {
     return { isValid: false, errors: ["Findings must be a non-null object."] };
   }
 
-  // Check required properties
-  if (schema.required) {
-    for (const prop of schema.required) {
-      if (!(prop in findings)) {
-        errors.push(`Missing required property: '${prop}'.`);
-      }
-    }
-  }
-
-  // Check property types and constraints
-  if (schema.properties) {
-    for (const [prop, rule] of Object.entries(schema.properties)) {
-      if (prop in findings) {
-        const value = findings[prop];
-        
-        // Type checking
-        if (typeof value !== rule.type && !(rule.type === 'number' && typeof value === 'number')) {
-            errors.push(`Property '${prop}' has incorrect type. Expected ${rule.type}, got ${typeof value}.`);
-            continue;
-        }
-
-        // Array checks
-        if (rule.type === 'array') {
-          if (rule.minItems && value.length < rule.minItems) {
-            errors.push(`Property '${prop}' must have at least ${rule.minItems} items.`);
-          }
-          // Recursively validate items in array if item schema is provided
-          if (rule.items) {
-            for (let i = 0; i < value.length; i++) {
-              const itemErrors = validateFindings(value[i], rule.items).errors;
-              if (itemErrors.length > 0) {
-                errors.push(`Item ${i} in '${prop}' is invalid: ${itemErrors.join(', ')}`);
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+  // Validate the full object against the schema
+  validateValueAgainstSchema(findings, { type: 'object', ...schema }, '', errors);
 
   return {
     isValid: errors.length === 0,
-    errors: errors
+    errors
   };
 };

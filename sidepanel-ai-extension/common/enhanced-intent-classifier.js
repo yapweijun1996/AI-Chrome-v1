@@ -67,7 +67,7 @@
       const prompt = this.buildEnhancedClassificationPrompt(userMessage, currentContext);
       
       // This would call the model - for now we'll simulate the structure
-      const result = await callModelWithRotation(prompt, { model: "gemini-1.5-flash" });
+      const result = await callModelWithRotation(prompt, { model: "gemini-2.5-flash" });
       
       if (!result?.ok) {
         throw new Error(result?.error || "Classification failed");

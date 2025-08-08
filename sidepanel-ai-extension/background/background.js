@@ -29,12 +29,30 @@
   safeImport("../common/storage.js");           // IndexedDB session storage
   safeImport("../common/success-criteria.js");  // Success criteria schemas and validator
   safeImport("../common/action-schema.js");     // Action validation schema
+  safeImport("../common/tools-registry.js");    // Tool Registry (contracts, runTool)
+  // Observer for structured timeline events
+  safeImport("./observer.js");                  // AgentObserver (run/tool events to UI + storage)
+  // Namespaced console logger (globalThis.Log)
+  safeImport("../common/logger.js");           // Logger: globalThis.Log with levels/namespaces
   // api-key-manager.js is optional; guard its absence
   try {
     safeImport("../common/api-key-manager.js");  // API key rotation/manager (if present)
   } catch (e) {
     console.warn("[BG] api-key-manager optional import failed; continuing without rotation:", e && e.message);
   }
+
+  // Provide safe fallback if apiKeyManager was not loaded
+  if (!globalThis.apiKeyManager) {
+    globalThis.apiKeyManager = {
+      keys: [],
+      async initialize() { /* no-op fallback */ },
+      getCurrentKey() { return null; },
+      markKeySuccess() {},
+      rotateOnSuccess() {},
+      async rotateToNextKey() { return null; }
+    };
+  }
+  const apiKeyManager = globalThis.apiKeyManager;
 
   // Early top-level sanity checks
   try {
@@ -47,9 +65,148 @@
     throw e;
   }
 })();
+ 
+// Initialize namespaced logger for background (optional if Log not loaded)
+try { globalThis.Log?.init?.(); } catch (_) {}
+const BG_LOG = (globalThis.Log && globalThis.Log.createLogger) ? globalThis.Log.createLogger('agent') : null;
 
 // Extract centralized message types and constants
 const { MSG, PARAM_LIMITS, TIMEOUTS, ERROR_TYPES, LOG_LEVELS, API_KEY_ROTATION } = MessageTypes;
+// Capability Registry to define risky actions
+const CapabilityRegistry = {
+  'click_element': { risky: true },
+  'type_text': { risky: true },
+  'select_option': { risky: true },
+  // Canonical navigation tool
+  'navigate': { risky: true, crossOrigin: true },
+  // Back-compat alias (to be removed after schema/tooling migration)
+  'goto_url': { risky: true, crossOrigin: true },
+  'close_tab': { risky: true },
+  'download_link': { risky: true },
+  'set_cookie': { risky: true },
+  // Non-risky actions
+  'wait_for_selector': { risky: false },
+  'scroll_to': { risky: false },
+  'take_screenshot': { risky: false },
+  'create_tab': { risky: false },
+  'switch_tab': { risky: false },
+  'read_page_content': { risky: false },
+  'scrape': { risky: false },
+  'think': { risky: false },
+  'tabs.query': { risky: false },
+  'record_finding': { risky: false },
+};
+
+class PermissionManager {
+  constructor(storage) {
+    this.storage = storage;
+    this.pendingRequests = new Map(); // correlationId -> { resolve, reject }
+  }
+
+  async hasPermission(tabId, action) {
+    const { tool, params } = action;
+    const capability = CapabilityRegistry[tool];
+
+    // Non-risky actions: always allowed
+    if (!capability || !capability.risky) {
+      return { granted: true };
+    }
+
+    // Determine origin safely (may be chrome:// or restricted)
+    let origin = 'unknown';
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      try {
+        origin = new URL(tab.url).origin;
+      } catch (_) {
+        origin = 'unknown';
+      }
+    } catch (_) {
+      // ignore inability to read tab
+    }
+
+    // Full-auto mode: auto-grant all risky actions, no user prompt
+    try {
+      emitAgentLog(tabId, {
+        level: LOG_LEVELS.INFO,
+        msg: "Permission auto-granted",
+        tool,
+        origin,
+        autoGrant: true
+      });
+    } catch (_) {}
+
+    // Mirror legacy "remember for 24h" behavior to keep downstream logic simple
+    try {
+      const permissionKey = `permission_${origin}_${tool}`;
+      const expiry = Date.now() + (24 * 60 * 60 * 1000);
+      await this.storage.set(permissionKey, { granted: true, expires: expiry, autoGrant: true });
+    } catch (_) {
+      // non-fatal
+    }
+
+    return { granted: true };
+  }
+
+  async requestPermission(tabId, origin, tool, action) {
+    const correlationId = `perm_${tabId}_${Date.now()}`;
+    
+    return new Promise((resolve, reject) => {
+      this.pendingRequests.set(correlationId, { resolve, reject });
+
+      chrome.runtime.sendMessage({
+        type: MSG.AGENT_PERMISSION_REQUEST,
+        tabId,
+        payload: {
+          correlationId,
+          origin,
+          tool,
+          params: action.params,
+          rationale: action.rationale,
+        }
+      }).catch(err => {
+        this.pendingRequests.delete(correlationId);
+        reject(new Error(`Failed to send permission request: ${err.message}`));
+      });
+
+      // Timeout for the permission request
+      setTimeout(() => {
+        if (this.pendingRequests.has(correlationId)) {
+          this.pendingRequests.delete(correlationId);
+          reject(new Error('Permission request timed out.'));
+        }
+      }, 60000); // 60 second timeout
+    });
+  }
+
+  async handlePermissionDecision(decision) {
+    const { correlationId, granted, remember, origin, tool } = decision;
+    const request = this.pendingRequests.get(correlationId);
+
+    if (!request) {
+      console.warn(`No pending permission request found for correlationId: ${correlationId}`);
+      return;
+    }
+
+    this.pendingRequests.delete(correlationId);
+
+    if (granted) {
+      if (remember) {
+        const permissionKey = `permission_${origin}_${tool}`;
+        const expiry = Date.now() + (24 * 60 * 60 * 1000); // 24 hours
+        await this.storage.set(permissionKey, { granted: true, expires: expiry });
+      }
+      request.resolve({ granted: true });
+    } else {
+      request.reject(new Error('Permission denied by user.'));
+    }
+  }
+}
+
+const permissionManager = new PermissionManager({
+  get: async (key) => (await chrome.storage.local.get(key))[key],
+  set: async (key, value) => await chrome.storage.local.set({ [key]: value }),
+});
 
 // Simple in-memory agent sessions keyed by tabId
 const agentSessions = new Map(); // tabId -> { running, stopped, step, goal, subTasks: [], currentTaskIndex: 0, settings, logs: [], history: [], lastAction, lastObservation }
@@ -104,7 +261,7 @@ function initializeEnhancedFeatures() {
     });
     
     enhancedPlanner = new EnhancedPlanner({
-      model: "gemini-1.5-flash",
+      model: "gemini-2.5-flash",
       maxRetries: 3,
       searchAPIs: ['google', 'bing', 'duckduckgo'],
       pricingAPIs: ['google_shopping', 'amazon', 'local_stores']
@@ -212,6 +369,15 @@ async function callModelWithRotation(prompt, options, timeoutMs = TIMEOUTS.MODEL
   const totalKeys = apiKeyManager.keys?.length || 1;
   const maxAttempts = Math.min(totalKeys, API_KEY_ROTATION.MAX_KEYS); // Try all available keys up to configured cap
 
+  const currentKey = apiKeyManager.getCurrentKey();
+  if (currentKey) {
+    const result = await callModelWithTimeout(currentKey.key, prompt, options, timeoutMs);
+    if (result.ok) {
+      apiKeyManager.markKeySuccess();
+      return result;
+    }
+  }
+
   while (attempts < maxAttempts) {
     const currentKey = apiKeyManager.getCurrentKey();
 
@@ -313,15 +479,52 @@ async function callModelWithRotation(prompt, options, timeoutMs = TIMEOUTS.MODEL
 }
 
 async function dispatchActionWithTimeout(tabId, action, settings, timeoutMs = TIMEOUTS.DOM_ACTION_MS) {
+  const startedAt = Date.now();
   try {
-    return await withTimeout(
+    // Emit tool_started to timeline
+    try {
+      if (globalThis.AgentObserver && typeof globalThis.AgentObserver.emitToolStarted === 'function') {
+        await globalThis.AgentObserver.emitToolStarted(tabId, action?.tool || 'unknown', action?.params || {});
+      }
+    } catch (_) {}
+
+    const res = await withTimeout(
       dispatchAgentAction(tabId, action, settings),
       timeoutMs,
       'DOM action'
     );
+
+    // Emit tool_result to timeline
+    try {
+      if (globalThis.AgentObserver && typeof globalThis.AgentObserver.emitToolResult === 'function') {
+        await globalThis.AgentObserver.emitToolResult(tabId, action?.tool || 'unknown', {
+          ok: res?.ok !== false,
+          observation: res?.observation || '',
+          durationMs: Math.max(0, Date.now() - startedAt),
+          data: res?.data,
+          links: res?.links,
+          tabs: res?.tabs,
+          report: res?.report
+        });
+      }
+    } catch (_) {}
+
+    return res;
   } catch (error) {
-    return { 
-      ok: false, 
+    // Emit failure result as well
+    try {
+      if (globalThis.AgentObserver && typeof globalThis.AgentObserver.emitToolResult === 'function') {
+        await globalThis.AgentObserver.emitToolResult(tabId, action?.tool || 'unknown', {
+          ok: false,
+          observation: `Action failed: ${error.message}`,
+          durationMs: Math.max(0, Date.now() - startedAt),
+          error: String(error?.message || error)
+        });
+      }
+    } catch (_) {}
+
+    return {
+      ok: false,
       observation: `Action failed: ${error.message}`,
       errorType: error.message.includes('timeout') ? ERROR_TYPES.TIMEOUT : ERROR_TYPES.DOM_ERROR
     };
@@ -398,8 +601,12 @@ function resolveTemplateVariables(params, sess, tabId) {
   const context = buildTemplateContext(sess, tabId);
 
   // DEBUG: Log template resolution process
-  console.log("[TEMPLATE DEBUG] Original params:", params);
-  console.log("[TEMPLATE DEBUG] Substitution context:", context);
+  // DEBUG logging can be noisy; gate behind a flag
+  const DEBUG = false;
+  if (DEBUG) {
+    console.log("[TEMPLATE DEBUG] Original params:", params);
+    console.log("[TEMPLATE DEBUG] Substitution context:", context);
+  }
 
   // Recursively resolve template variables in all string parameters
   for (const [key, value] of Object.entries(resolvedParams)) {
@@ -408,15 +615,17 @@ function resolveTemplateVariables(params, sess, tabId) {
       resolvedParams[key] = substituteTemplateVariables(value, context);
       
       // DEBUG: Log each substitution
-      if (originalValue !== resolvedParams[key]) {
-        console.log(`[TEMPLATE DEBUG] Substituted ${key}: "${originalValue}" -> "${resolvedParams[key]}"`);
-      } else if (originalValue.includes('{{')) {
-        console.log(`[TEMPLATE DEBUG] No substitution for ${key}: "${originalValue}" (contains template variables)`);
+      if (DEBUG) {
+        if (originalValue !== resolvedParams[key]) {
+          console.log(`[TEMPLATE DEBUG] Substituted ${key}: "${originalValue}" -> "${resolvedParams[key]}"`);
+        } else if (originalValue.includes('{{')) {
+          console.log(`[TEMPLATE DEBUG] No substitution for ${key}: "${originalValue}" (contains template variables)`);
+        }
       }
     }
   }
 
-  console.log("[TEMPLATE DEBUG] Resolved params:", resolvedParams);
+  if (DEBUG) console.log("[TEMPLATE DEBUG] Resolved params:", resolvedParams);
   return resolvedParams;
 }
 
@@ -452,8 +661,9 @@ function buildTemplateContext(sess, tabId) {
   };
 
   // DEBUG: Log session state for context building
-  console.log("[CONTEXT DEBUG] Building context for tabId:", tabId);
-  console.log("[CONTEXT DEBUG] Session state:", {
+  const DEBUG = false;
+  if (DEBUG) console.log("[CONTEXT DEBUG] Building context for tabId:", tabId);
+  if (DEBUG) console.log("[CONTEXT DEBUG] Session state:", {
     hasHistory: !!(sess?.history && sess.history.length > 0),
     historyLength: sess?.history?.length || 0,
     hasAnalyzedUrls: !!(sess?.analyzedUrls && Array.isArray(sess.analyzedUrls)),
@@ -467,7 +677,7 @@ function buildTemplateContext(sess, tabId) {
     const recentActions = sess.history.slice(-5);
     
     // DEBUG: Log recent actions
-    console.log("[CONTEXT DEBUG] Recent actions:", recentActions.map(h => ({
+    if (DEBUG) console.log("[CONTEXT DEBUG] Recent actions:", recentActions.map(h => ({
       tool: h.action?.tool,
       url: h.action?.params?.url,
       observation: h.observation?.substring(0, 100)
@@ -481,7 +691,7 @@ function buildTemplateContext(sess, tabId) {
     ).reverse(); // Most recent first
     
     // DEBUG: Log research actions found
-    console.log("[CONTEXT DEBUG] Research actions found:", researchActions.map(h => ({
+    if (DEBUG) console.log("[CONTEXT DEBUG] Research actions found:", researchActions.map(h => ({
       tool: h.action?.tool,
       url: h.action?.params?.url
     })));
@@ -490,20 +700,20 @@ function buildTemplateContext(sess, tabId) {
     if (researchActions.length > 0) {
       context.PREVIOUS_RESEARCHED_URL = researchActions[0].action?.params?.url || '';
       context.PREVIOUS_STEP_RESULT_URL_1 = researchActions[0].action?.params?.url || '';
-      console.log("[CONTEXT DEBUG] Set PREVIOUS_STEP_RESULT_URL_1:", context.PREVIOUS_STEP_RESULT_URL_1);
+      if (DEBUG) console.log("[CONTEXT DEBUG] Set PREVIOUS_STEP_RESULT_URL_1:", context.PREVIOUS_STEP_RESULT_URL_1);
     }
     if (researchActions.length > 1) {
       context.PREVIOUS_STEP_RESULT_URL_2 = researchActions[1].action?.params?.url || '';
-      console.log("[CONTEXT DEBUG] Set PREVIOUS_STEP_RESULT_URL_2:", context.PREVIOUS_STEP_RESULT_URL_2);
+      if (DEBUG) console.log("[CONTEXT DEBUG] Set PREVIOUS_STEP_RESULT_URL_2:", context.PREVIOUS_STEP_RESULT_URL_2);
     }
     if (researchActions.length > 2) {
       context.PREVIOUS_STEP_RESULT_URL_3 = researchActions[2].action?.params?.url || '';
-      console.log("[CONTEXT DEBUG] Set PREVIOUS_STEP_RESULT_URL_3:", context.PREVIOUS_STEP_RESULT_URL_3);
+      if (DEBUG) console.log("[CONTEXT DEBUG] Set PREVIOUS_STEP_RESULT_URL_3:", context.PREVIOUS_STEP_RESULT_URL_3);
     }
     
     // Find URLs from analyze_urls results stored in session
     if (sess.analyzedUrls && Array.isArray(sess.analyzedUrls)) {
-      console.log("[CONTEXT DEBUG] Found analyzedUrls:", sess.analyzedUrls);
+      if (DEBUG) console.log("[CONTEXT DEBUG] Found analyzedUrls:", sess.analyzedUrls);
       // Populate the url_from_analyze_urls_result_* variables
       if (sess.analyzedUrls.length > 0) {
         context.url_from_analyze_urls_result_1 = sess.analyzedUrls[0];
@@ -538,7 +748,7 @@ function buildTemplateContext(sess, tabId) {
   const nonEmptyContext = Object.entries(context)
     .filter(([key, value]) => value !== '')
     .reduce((obj, [key, value]) => ({ ...obj, [key]: value }), {});
-  console.log("[CONTEXT DEBUG] Final context (non-empty values):", nonEmptyContext);
+  if (DEBUG) console.log("[CONTEXT DEBUG] Final context (non-empty values):", nonEmptyContext);
 
   return context;
 }
@@ -552,27 +762,29 @@ function substituteTemplateVariables(text, context) {
   let result = text;
   
   // DEBUG: Log substitution attempt
+  const DEBUG = false;
   const templateMatches = text.match(/\{\{([A-Za-z_]+)\}\}/g);
-  if (templateMatches) {
+  if (DEBUG && templateMatches) {
     console.log("[SUBSTITUTION DEBUG] Found template variables in text:", templateMatches);
   }
   
   // Replace template variables like {{VARIABLE_NAME}} or {{variable_name}}
   const templateRegex = /\{\{([A-Za-z_]+)\}\}/g;
   result = result.replace(templateRegex, (match, variableName) => {
-    console.log(`[SUBSTITUTION DEBUG] Processing variable: ${variableName}`);
+    const DEBUG = false;
+    if (DEBUG) console.log(`[SUBSTITUTION DEBUG] Processing variable: ${variableName}`);
     
     const value = context[variableName];
-    console.log(`[SUBSTITUTION DEBUG] Context value for ${variableName}:`, value);
+    if (DEBUG) console.log(`[SUBSTITUTION DEBUG] Context value for ${variableName}:`, value);
     
     if (value !== undefined && value !== '') {
-      console.log(`[SUBSTITUTION DEBUG] Using context value for ${variableName}: "${value}"`);
+      if (DEBUG) console.log(`[SUBSTITUTION DEBUG] Using context value for ${variableName}: "${value}"`);
       return value;
     }
     
     // If template variable can't be resolved, try to provide a sensible fallback
     const fallbackValue = getFallbackValue(variableName, context);
-    console.log(`[SUBSTITUTION DEBUG] Using fallback value for ${variableName}: "${fallbackValue}"`);
+    if (DEBUG) console.log(`[SUBSTITUTION DEBUG] Using fallback value for ${variableName}: "${fallbackValue}"`);
     return fallbackValue;
   });
 
@@ -735,33 +947,6 @@ async function openSidePanel(tabId) {
   }
 }
 
-chrome.runtime.onInstalled.addListener(async () => {
-  console.log("[BG] Installed");
-  // Initialize API key manager
-  await apiKeyManager.initialize();
-  // Clean up old sessions on install
-  await cleanupOldSessions();
-});
-
-chrome.runtime.onStartup.addListener(async () => {
-  console.log("[BG] Startup");
-  // Initialize API key manager
-  await apiKeyManager.initialize();
-  // Clean up old sessions on startup
-  await cleanupOldSessions();
-  
-  // Attempt to restore any active sessions
-  try {
-    const tabs = await chrome.tabs.query({});
-    for (const tab of tabs) {
-      if (tab.id) {
-        await restoreSessionFromStorage(tab.id);
-      }
-    }
-  } catch (e) {
-    console.warn("[BG] Failed to restore sessions on startup:", e);
-  }
-});
 
 chrome.action.onClicked.addListener(async (tab) => {
   await openSidePanel(tab.id);
@@ -1013,6 +1198,13 @@ function stopAgent(tabId, reason = "STOP requested") {
   sess.stopped = true;
   sess.running = false;
   emitAgentLog(tabId, { level: "warn", msg: "Agent stopped", reason });
+
+  // Emit run_state: stopped
+  try {
+    if (globalThis.AgentObserver && typeof globalThis.AgentObserver.emitRunState === 'function') {
+      globalThis.AgentObserver.emitRunState(tabId, 'stopped', { reason });
+    }
+  } catch (_) {}
   
   // Persist final session state
   saveSessionToStorage(tabId, sess);
@@ -1055,82 +1247,270 @@ async function ensureContentScript(tabId) {
   }
 }
 
+/**
+ * Core Tools Registration via ToolsRegistry
+ * - navigateToUrl: open a URL in the current tab
+ * - extractLinks: extract relevant links via content script
+ */
+(function registerCoreTools() {
+  try {
+    if (!globalThis.ToolsRegistry) {
+      console.warn("[BG] ToolsRegistry not available; skipping core tool registration");
+      return;
+    }
+
+    // navigateToUrl
+    globalThis.ToolsRegistry.registerTool({
+      id: "navigateToUrl",
+      title: "Navigate to URL",
+      description: "Open the specified URL in the current tab.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          url: { type: "string", maxLength: 2048 }
+        },
+        required: ["url"]
+      },
+      retryPolicy: { maxAttempts: 1 },
+      preconditions: async (_ctx, input) => {
+        const url = String(input?.url || "");
+        if (!/^https?:\/\//i.test(url)) {
+          return { ok: false, observation: "Invalid or unsupported URL (must start with http/https)" };
+        }
+        return { ok: true };
+      },
+      run: async (ctx, input) => {
+        const tabId = ctx?.tabId;
+        const url = String(input.url);
+        await chrome.tabs.update(tabId, { url });
+        return { ok: true, observation: `Navigated to ${url}` };
+      }
+    });
+
+    // extractLinks
+    globalThis.ToolsRegistry.registerTool({
+      id: "extractLinks",
+      title: "Extract Page Links",
+      description: "Extract relevant links from the current page.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          includeExternal: { type: "boolean" },
+          maxLinks: { type: ["integer", "number"] }
+        }
+      },
+      retryPolicy: { maxAttempts: 2, backoffMs: 300 },
+      run: async (ctx, input) => {
+        const tabId = ctx?.tabId;
+        const includeExternal = input?.includeExternal !== false;
+        const maxLinks = Number(input?.maxLinks || 20);
+
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+        const res = await chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_LINKS", includeExternal, maxLinks });
+        if (res?.ok) {
+          return {
+            ok: true,
+            observation: `Found ${res.links?.length || 0} relevant links`,
+            links: res.links
+          };
+        }
+        return { ok: false, observation: res?.error || "Link extraction failed" };
+      }
+    });
+
+    console.log("[BG] Core tools registered: navigateToUrl, extractLinks");
+  } catch (e) {
+    console.warn("[BG] Core tool registration failed:", e);
+  }
+})();
+
+/**
+ * Wrapper to run a registered tool with standardized timeline events.
+ */
+async function runRegisteredTool(tabId, toolId, input) {
+  const startedAt = Date.now();
+  // Best-effort namespaced logger
+  const log = BG_LOG?.withContext?.({ tabId, toolId }) || BG_LOG;
+
+  // Console summary for start
+  try { log?.info?.("tool_started", { input: sanitizeForLog(input) }); } catch (_) {}
+
+  // Emit tool_started
+  try {
+    if (globalThis.AgentObserver && typeof globalThis.AgentObserver.emitToolStarted === "function") {
+      await globalThis.AgentObserver.emitToolStarted(tabId, toolId, input || {});
+    }
+  } catch (_) {}
+
+  try {
+    const ctx = {
+      tabId,
+      ensureContentScript,
+      chrome
+    };
+    const result = await globalThis.ToolsRegistry.runTool(toolId, ctx, input || {});
+
+    // Emit tool_result
+    try {
+      if (globalThis.AgentObserver && typeof globalThis.AgentObserver.emitToolResult === "function") {
+        await globalThis.AgentObserver.emitToolResult(tabId, toolId, {
+          ...result,
+          durationMs: result?.durationMs ?? Math.max(0, Date.now() - startedAt)
+        });
+      }
+    } catch (_) {}
+
+    // Console summary for result (avoid huge payloads)
+    try {
+      const summary = {
+        ok: result?.ok !== false,
+        status: result?.status,
+        observation: (result?.observation || "").slice(0, 200),
+        durationMs: result?.durationMs ?? Math.max(0, Date.now() - startedAt)
+      };
+      log?.info?.("tool_result", summary);
+    } catch (_) {}
+
+    return result;
+  } catch (e) {
+    // Emit failure result
+    try {
+      if (globalThis.AgentObserver && typeof globalThis.AgentObserver.emitToolResult === "function") {
+        await globalThis.AgentObserver.emitToolResult(tabId, toolId, {
+          ok: false,
+          observation: String(e?.message || e),
+          durationMs: Math.max(0, Date.now() - startedAt),
+          errors: [String(e?.message || e)]
+        });
+      }
+    } catch (_) {}
+
+    // Console error
+    try { log?.error?.("tool_error", { error: String(e?.message || e) }); } catch (_) {}
+
+    throw e;
+  }
+
+  // Helper to cap verbose inputs in logs
+  function sanitizeForLog(obj) {
+    try {
+      const json = JSON.stringify(obj);
+      if (json.length <= 500) return obj;
+      // Truncate safely
+      return JSON.parse(json.slice(0, 500));
+    } catch {
+      return obj;
+    }
+  }
+}
+
 async function dispatchAgentAction(tabId, action, settings) {
   const { tool, params = {}, rationale = "" } = action || {};
   const sess = agentSessions.get(tabId);
   if (!sess) throw new Error("No agent session");
 
+  // Normalize legacy tool names from prompts into schema/dispatcher names
+  const legacyToolMap = {
+    navigate: "goto_url",
+    click: "click_element",
+    fill: "type_text",
+    scroll: "scroll_to",
+    waitForSelector: "wait_for_selector",
+    screenshot: "take_screenshot",
+    "tabs.activate": "switch_tab",
+    "tabs.close": "close_tab"
+  };
+  const normalizedTool = legacyToolMap[tool] || tool;
+
   // Apply template variable substitution to params
   const resolvedParams = resolveTemplateVariables(params, sess, tabId);
+  const normalizedParams = { ...resolvedParams };
+  if (normalizedTool === 'type_text' && typeof normalizedParams.text === 'undefined' && typeof normalizedParams.value !== 'undefined') {
+    normalizedParams.text = normalizedParams.value;
+  }
+  const actionWithResolvedParams = { ...action, tool: normalizedTool, params: normalizedParams };
+
+  // Check for permission before executing the action
+  try {
+    const permission = await permissionManager.hasPermission(tabId, actionWithResolvedParams);
+    if (!permission.granted) {
+      return { ok: false, observation: "Permission denied by user." };
+    }
+  } catch (error) {
+    return { ok: false, observation: error.message };
+  }
 
   // URL restriction logic has been disabled by user request.
 
-  switch (tool) {
-    case "navigate": {
-      const url = String(resolvedParams.url || "");
+  switch (normalizedTool) {
+    case "navigate":
+    case "goto_url": {
+      const url = String(normalizedParams.url || "");
       if (!/^https?:\/\//i.test(url)) {
         return { ok: false, observation: "Invalid URL for navigate" };
       }
       await chrome.tabs.update(tabId, { url });
       return { ok: true, observation: `Navigated to ${url}` };
     }
-    case "click": {
+    case "click_element": {
       if (!(await ensureContentScript(tabId))) {
-        emitAgentLog(tabId, { 
-          level: LOG_LEVELS.ERROR, 
-          msg: "Content script unavailable: cannot execute DOM tool", 
-          tool: "click",
+        emitAgentLog(tabId, {
+          level: LOG_LEVELS.ERROR,
+          msg: "Content script unavailable: cannot execute DOM tool",
+          tool: "click_element",
           errorType: ERROR_TYPES.CONTENT_SCRIPT_UNAVAILABLE
         });
         return { ok: false, observation: "Content script unavailable" };
       }
-      const res = await chrome.tabs.sendMessage(tabId, { type: "CLICK_SELECTOR", selector: resolvedParams.selector || "" });
+      const res = await chrome.tabs.sendMessage(tabId, { type: "CLICK_SELECTOR", selector: normalizedParams.selector || "" });
       return res?.ok ? { ok: true, observation: res.msg || "Clicked" } : { ok: false, observation: res?.error || "Click failed" };
     }
-    case "fill": {
+    case "type_text": {
       if (!(await ensureContentScript(tabId))) {
-        emitAgentLog(tabId, { 
-          level: LOG_LEVELS.ERROR, 
-          msg: "Content script unavailable: cannot execute DOM tool", 
-          tool: "fill",
+        emitAgentLog(tabId, {
+          level: LOG_LEVELS.ERROR,
+          msg: "Content script unavailable: cannot execute DOM tool",
+          tool: "type_text",
           errorType: ERROR_TYPES.CONTENT_SCRIPT_UNAVAILABLE
         });
         return { ok: false, observation: "Content script unavailable" };
       }
-      const res = await chrome.tabs.sendMessage(tabId, { type: "FILL_SELECTOR", selector: resolvedParams.selector || "", value: resolvedParams.value ?? "" });
-      return res?.ok ? { ok: true, observation: res.msg || "Filled" } : { ok: false, observation: res?.error || "Fill failed" };
+      const res = await chrome.tabs.sendMessage(tabId, { type: "FILL_SELECTOR", selector: normalizedParams.selector || "", value: normalizedParams.text ?? "" });
+      return res?.ok ? { ok: true, observation: res.msg || "Text entered" } : { ok: false, observation: res?.error || "Typing failed" };
     }
-    case "scroll": {
+    case "scroll_to": {
       if (!(await ensureContentScript(tabId))) {
-        emitAgentLog(tabId, { 
-          level: LOG_LEVELS.ERROR, 
-          msg: "Content script unavailable: cannot execute DOM tool", 
-          tool: "scroll",
+        emitAgentLog(tabId, {
+          level: LOG_LEVELS.ERROR,
+          msg: "Content script unavailable: cannot execute DOM tool",
+          tool: "scroll_to",
           errorType: ERROR_TYPES.CONTENT_SCRIPT_UNAVAILABLE
         });
         return { ok: false, observation: "Content script unavailable" };
       }
-      const res = await chrome.tabs.sendMessage(tabId, { type: "SCROLL_TO_SELECTOR", selector: resolvedParams.selector || "", direction: resolvedParams.direction || "" });
+      const res = await chrome.tabs.sendMessage(tabId, { type: "SCROLL_TO_SELECTOR", selector: normalizedParams.selector || "", direction: normalizedParams.direction || "" });
       return res?.ok ? { ok: true, observation: res.msg || "Scrolled" } : { ok: false, observation: res?.error || "Scroll failed" };
     }
-    case "waitForSelector": {
+    case "wait_for_selector": {
       if (!(await ensureContentScript(tabId))) {
-        emitAgentLog(tabId, { 
-          level: LOG_LEVELS.ERROR, 
-          msg: "Content script unavailable: cannot execute DOM tool", 
-          tool: "waitForSelector",
+        emitAgentLog(tabId, {
+          level: LOG_LEVELS.ERROR,
+          msg: "Content script unavailable: cannot execute DOM tool",
+          tool: "wait_for_selector",
           errorType: ERROR_TYPES.CONTENT_SCRIPT_UNAVAILABLE
         });
         return { ok: false, observation: "Content script unavailable" };
       }
-      const res = await chrome.tabs.sendMessage(tabId, { type: "WAIT_FOR_SELECTOR", selector: resolvedParams.selector || "", timeoutMs: resolvedParams.timeoutMs || 5000 });
+      const res = await chrome.tabs.sendMessage(tabId, { type: "WAIT_FOR_SELECTOR", selector: normalizedParams.selector || "", timeoutMs: normalizedParams.timeoutMs || 5000 });
       return res?.ok ? { ok: true, observation: res.msg || "Selector found" } : { ok: false, observation: res?.error || "Wait failed" };
     }
     case "scrape": {
         if (!(await ensureContentScript(tabId))) {
             return { ok: false, observation: "Content script unavailable" };
         }
-        const res = await chrome.tabs.sendMessage(tabId, { type: MSG.SCRAPE_SELECTOR, selector: resolvedParams.selector || "" });
+        const res = await chrome.tabs.sendMessage(tabId, { type: MSG.SCRAPE_SELECTOR, selector: normalizedParams.selector || "" });
         
         if (res?.ok) {
             // Truncate potentially large scraped data for the observation log
@@ -1141,10 +1521,10 @@ async function dispatchAgentAction(tabId, action, settings) {
         }
     }
     case "think": {
-        const thought = String(resolvedParams.thought || "...");
+        const thought = String(normalizedParams.thought || "...");
         return { ok: true, observation: `Thought recorded: ${thought}` };
     }
-    case "screenshot": {
+    case "take_screenshot": {
       try {
         const dataUrl = await chrome.tabs.captureVisibleTab(undefined, { format: "png" });
         return { ok: true, observation: "Screenshot captured", dataUrl };
@@ -1153,22 +1533,27 @@ async function dispatchAgentAction(tabId, action, settings) {
       }
     }
     case "tabs.query": {
-      const titleContains = resolvedParams.titleContains || "";
-      const urlContains = resolvedParams.urlContains || "";
+      const titleContains = normalizedParams.titleContains || "";
+      const urlContains = normalizedParams.urlContains || "";
       const tabs = await chrome.tabs.query({});
       const matches = tabs.filter(t => (titleContains ? (t.title || "").toLowerCase().includes(titleContains.toLowerCase()) : true) &&
                                        (urlContains ? (t.url || "").toLowerCase().includes(urlContains.toLowerCase()) : true))
                           .map(t => ({ id: t.id, title: t.title, url: t.url, active: t.active, windowId: t.windowId }));
       return { ok: true, observation: `Found ${matches.length} tabs`, tabs: matches };
     }
-    case "tabs.activate": {
-      const tgt = Number(resolvedParams.tabId);
+    case "create_tab": {
+      const { url, active = true } = normalizedParams;
+      const newTab = await chrome.tabs.create({ url, active });
+      return { ok: true, observation: `Created new tab with ID ${newTab.id}`, tabId: newTab.id };
+    }
+    case "switch_tab": {
+      const tgt = Number(normalizedParams.tabId);
       if (!Number.isFinite(tgt)) return { ok: false, observation: "Invalid tabId" };
       await chrome.tabs.update(tgt, { active: true });
       return { ok: true, observation: `Activated tab ${tgt}` };
     }
-    case "tabs.close": {
-      const tgt = Number(resolvedParams.tabId);
+    case "close_tab": {
+      const tgt = Number(normalizedParams.tabId);
       if (!Number.isFinite(tgt)) return { ok: false, observation: "Invalid tabId" };
       await chrome.tabs.remove(tgt);
       return { ok: true, observation: `Closed tab ${tgt}` };
@@ -1521,6 +1906,76 @@ async function dispatchAgentAction(tabId, action, settings) {
   }
 }
 
+async function sendActionResultToChat(tabId, sess, action, execRes) {
+  if (!execRes.ok) return;
+
+  let payload;
+  const { tool, params } = action;
+
+  switch (tool) {
+    case 'record_finding':
+      payload = {
+        tool,
+        data: params.finding,
+      };
+      break;
+    case 'read_page_content':
+      if (execRes.pageContent) {
+        const pageInfo = await getPageInfoForPlanning(tabId);
+        payload = {
+          tool,
+          data: {
+            summary: execRes.pageContent.substring(0, 500) + (execRes.pageContent.length > 500 ? '...' : ''),
+            url: pageInfo.url,
+            title: pageInfo.title,
+          }
+        };
+      }
+      break;
+    case 'navigate':
+    case 'goto_url':
+      // Wait a bit for the page to load before getting title
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      const pageInfo = await getPageInfoForPlanning(tabId);
+      payload = {
+        tool,
+        data: {
+          url: params.url,
+          title: pageInfo.title,
+        }
+      };
+      break;
+  }
+
+  if (payload) {
+    chrome.runtime.sendMessage({
+      type: MSG.AGENT_ACTION_RESULT,
+      tabId: tabId,
+      payload: sanitizePayload(payload),
+      timestamp: Date.now()
+    });
+  }
+}
+
+function sanitizePayload(payload) {
+  const redactedPayload = JSON.parse(JSON.stringify(payload));
+
+  // Redact PII
+  if (redactedPayload.data && redactedPayload.data.summary) {
+    redactedPayload.data.summary = redactedPayload.data.summary.replace(/\b\d{10,}\b/g, '[REDACTED]');
+  }
+
+  // Truncate oversized payloads
+  if (JSON.stringify(redactedPayload).length > 5000) {
+    if (redactedPayload.data && redactedPayload.data.summary) {
+      redactedPayload.data.summary = redactedPayload.data.summary.substring(0, 500) + '...';
+    }
+  }
+
+  return redactedPayload;
+}
+
+
 async function runAgentLoop(tabId, goal, settings) {
   const sess = agentSessions.get(tabId);
   if (!sess) return;
@@ -1536,6 +1991,18 @@ async function runAgentLoop(tabId, goal, settings) {
     model: sess.selectedModel,
     settings
   });
+
+  // Emit run_state: started
+  try {
+    if (globalThis.AgentObserver && typeof globalThis.AgentObserver.emitRunState === 'function') {
+      await globalThis.AgentObserver.emitRunState(tabId, 'started', {
+        goal,
+        model: sess.selectedModel,
+        settings,
+        requestId: sess.requestId
+      });
+    }
+  } catch (_) {}
 
   // Start the agentic loop
   agenticLoop(tabId, goal, settings);
@@ -1872,7 +2339,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
 
           // 2. Initialize session with enhanced context
-          const newSession = initializeNewSession(tab.id, goal, subTasks, settings, GEMINI_MODEL || "gemini-1.5-flash", taskContext);
+          const newSession = initializeNewSession(tab.id, goal, subTasks, settings, GEMINI_MODEL || "gemini-2.5-flash", taskContext);
           agentSessions.set(tab.id, newSession);
           
           // Persist new session
@@ -1985,8 +2452,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
 
         case MSG.READ_API_KEY: {
-          const { GEMINI_API_KEY } = await chrome.storage.sync.get("GEMINI_API_KEY");
-          sendResponse({ ok: true, apiKey: GEMINI_API_KEY || "" });
+          // Use key manager presence to determine availability (supports single and multi-key)
+          await apiKeyManager.initialize();
+          const currentKey = apiKeyManager.getCurrentKey();
+          sendResponse({ ok: true, apiKey: currentKey?.key || "" });
+          break;
+        }
+
+        // Execute a registered tool via ToolsRegistry and emit timeline events
+        case MSG.AGENT_EXECUTE_TOOL: {
+          try {
+            const { toolId, input = {}, tabId: providedTabId } = message;
+
+            // Determine target tab
+            let targetTabId = providedTabId;
+            if (!Number.isFinite(targetTabId)) {
+              const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+              targetTabId = activeTab?.id;
+            }
+            if (!Number.isFinite(targetTabId)) {
+              return sendResponse({ ok: false, error: "No active tab to run tool against" });
+            }
+
+            // Run the tool (emits tool_started/tool_result via AgentObserver)
+            const result = await runRegisteredTool(targetTabId, toolId, input);
+
+            // Notify UI of tool result (optional; timeline already receives events)
+            try {
+              chrome.runtime.sendMessage({
+                type: MSG.AGENT_TOOL_RESULT,
+                tabId: targetTabId,
+                toolId,
+                result
+              });
+            } catch (_) {}
+
+            sendResponse({ ok: true, result });
+          } catch (e) {
+            sendResponse({ ok: false, error: String(e?.message || e) });
+          }
           break;
         }
 
@@ -2003,7 +2507,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             }
             
             const { GEMINI_MODEL } = await chrome.storage.sync.get("GEMINI_MODEL");
-            const selectedModel = (GEMINI_MODEL || "gemini-1.5-flash");
+            const selectedModel = (GEMINI_MODEL || "gemini-2.5-flash");
             
             // Build a direct prompt without page context
             const prompt = userPrompt || "Please provide a helpful response.";
@@ -2047,7 +2551,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }
           
           const { GEMINI_MODEL } = await chrome.storage.sync.get("GEMINI_MODEL");
-          const selectedModel = (GEMINI_MODEL || "gemini-1.5-flash");
+          const selectedModel = (GEMINI_MODEL || "gemini-2.5-flash");
  
           // 3) Build prompt and call Gemini with rotation
           const prompt = buildSummarizePrompt(extract.text || "", userPrompt);
@@ -2072,7 +2576,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             const classificationPrompt = buildIntentClassificationPrompt(userMessage, currentContext);
             
             // Call model for intent classification (use fast model for quick classification)
-            const result = await callModelWithRotation(classificationPrompt, { model: "gemini-1.5-flash" });
+            const result = await callModelWithRotation(classificationPrompt, { model: "gemini-2.5-flash" });
             
             if (!result?.ok) {
               return sendResponse({ ok: false, error: result?.error || "Classification failed" });
@@ -2114,7 +2618,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }
           
           const { GEMINI_MODEL } = await chrome.storage.sync.get("GEMINI_MODEL");
-          const selectedModel = (GEMINI_MODEL || "gemini-1.5-flash");
+          const selectedModel = (GEMINI_MODEL || "gemini-2.5-flash");
           
           // Build a direct prompt without page context
           const prompt = userPrompt || "Please provide a helpful response.";
@@ -2206,7 +2710,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             return sendResponse({ ok: false, error: "No available API keys." });
           }
           const { GEMINI_MODEL } = await chrome.storage.sync.get("GEMINI_MODEL");
-          const selectedModel = GEMINI_MODEL || "gemini-1.5-flash";
+          const selectedModel = GEMINI_MODEL || "gemini-2.5-flash";
 
           // 2. Build Coordinator Prompt
           const pageInfo = await getPageInfoForPlanning(tab.id);
@@ -2254,6 +2758,49 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }
           break;
         }
+        case MSG.AGENT_EXECUTE_TOOL: {
+          try {
+            // Determine target tabId: prefer explicit, fallback to active tab
+            let targetTabId = Number.isFinite(message.tabId) ? message.tabId : null;
+            if (!Number.isFinite(targetTabId)) {
+              const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+              if (!tab?.id) {
+                return sendResponse({ ok: false, error: "No active tab" });
+              }
+              targetTabId = tab.id;
+            }
+
+            const toolId = message.toolId;
+            const input = message.input || {};
+            if (!toolId || typeof toolId !== "string") {
+              return sendResponse({ ok: false, error: "Missing toolId" });
+            }
+
+            // Execute the registered tool (emits timeline events internally)
+            const result = await runRegisteredTool(targetTabId, toolId, input);
+
+            // Notify UI (optional convenience channel in addition to direct response)
+            try {
+              chrome.runtime.sendMessage({
+                type: MSG.AGENT_TOOL_RESULT,
+                tabId: targetTabId,
+                toolId,
+                result,
+                timestamp: Date.now()
+              });
+            } catch (_) {}
+
+            sendResponse({ ok: true, result });
+          } catch (e) {
+            sendResponse({ ok: false, error: String(e?.message || e) });
+          }
+          break;
+        }
+        case MSG.AGENT_PERMISSION_DECISION: {
+          await permissionManager.handlePermissionDecision(message.payload);
+          sendResponse({ ok: true });
+          break;
+        }
         default:
           sendResponse({ ok: false, error: "Unknown message type" });
       }
@@ -2283,7 +2830,7 @@ async function classifyAndDecomposeTask(tabId, goal, pageInfo) {
     });
     
     const classificationRes = await callModelWithRotation(classificationPrompt, {
-      model: "gemini-1.5-flash",
+      model: "gemini-2.5-flash",
       tabId: tabId
     });
     
@@ -2322,7 +2869,7 @@ async function classifyAndDecomposeTask(tabId, goal, pageInfo) {
     
     // Decompose the task with enhanced context
     const decompRes = await callModelWithRotation(decompPrompt, {
-      model: "gemini-1.5-flash",
+      model: "gemini-2.5-flash",
       tabId: tabId
     });
     
@@ -2490,6 +3037,18 @@ function generateFallbackAction(sess, contextData) {
   };
 }
 
+function debounce(func, wait) {
+  let timeout;
+  return function executedFunction(...args) {
+    const later = () => {
+      clearTimeout(timeout);
+      func(...args);
+    };
+    clearTimeout(timeout);
+    timeout = setTimeout(later, wait);
+  };
+}
+
 // Recovery planning for when main planning fails
 async function attemptRecoveryPlanning(tabId, sess, goal, currentSubTask, contextData) {
   emitAgentLog(tabId, {
@@ -2580,8 +3139,10 @@ async function executeActionWithContext(tabId, sess, action, settings) {
     requestId: sess.requestId
   });
 
+  sendActionResultToChat(tabId, sess, action, execRes);
+
   // Auto-sense: if navigation was successful, immediately read the new page content
-  if (execRes.ok && ['navigate', 'smart_navigate', 'research_url'].includes(action.tool)) {
+  if (execRes.ok && ['navigate', 'goto_url', 'smart_navigate', 'research_url'].includes(action.tool)) {
     emitAgentLog(tabId, {
       level: LOG_LEVELS.INFO,
       msg: "Auto-sensing new page content after navigation",
@@ -2631,7 +3192,7 @@ function updateSessionContext(tabId, sess, action, execRes) {
   }
 
   // If we navigate away, the content is now stale and must be cleared
-  if (action.tool === 'navigate' || action.tool === 'smart_navigate') {
+  if (action.tool === 'navigate' || action.tool === 'goto_url' || action.tool === 'smart_navigate') {
     sess.currentPageContent = "";
     sess.currentInteractiveElements = [];
     emitAgentLog(tabId, { level: LOG_LEVELS.DEBUG, msg: "Cleared stale page content from session after navigation." });
@@ -2641,7 +3202,7 @@ function updateSessionContext(tabId, sess, action, execRes) {
   saveSessionToStorage(tabId, sess);
 
   // Update domain visit count for the watchdog
-  if (execRes.ok && ['navigate', 'smart_navigate', 'research_url'].includes(action.tool)) {
+  if (execRes.ok && ['navigate', 'goto_url', 'smart_navigate', 'research_url'].includes(action.tool)) {
     try {
       const url = new URL(action.params.url);
       const domain = url.hostname;
@@ -2953,7 +3514,7 @@ function runWatchdogs(tabId, sess, lastAction, lastExecRes) {
   }
 
   // 2. Per-domain visit cap
-  if (['navigate', 'smart_navigate', 'research_url'].includes(lastAction.tool) && lastExecRes.ok) {
+  if (['navigate', 'goto_url', 'smart_navigate', 'research_url'].includes(lastAction.tool) && lastExecRes.ok) {
     try {
       const url = new URL(lastAction.params.url);
       const domain = url.hostname;
@@ -2979,6 +3540,18 @@ function runWatchdogs(tabId, sess, lastAction, lastExecRes) {
     sess.lastAction = { tool: 'think', params: { thought: `I seem to be stuck. My last few actions resulted in similar observations. I need to re-evaluate my plan.` } };
     sess.lastObservation = `Forced to rethink strategy due to lack of progress.`;
     sess.noProgressCounter = 0; // Reset after intervention
+    return true;
+  }
+
+  // 4. Invalid action watchdog
+  if (sess.consecutiveFailures >= 3) {
+    emitAgentLog(tabId, {
+      level: LOG_LEVELS.WARN,
+      msg: `Watchdog: ${sess.consecutiveFailures} consecutive invalid actions. Forcing a 'record_finding' action.`
+    });
+    sess.lastAction = { tool: 'record_finding', params: { finding: { error: 'Forced recovery due to repeated invalid actions.' } } };
+    sess.lastObservation = `Forced to record a finding to recover from repeated invalid actions.`;
+    sess.consecutiveFailures = 0; // Reset after intervention
     return true;
   }
 

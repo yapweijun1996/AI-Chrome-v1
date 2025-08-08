@@ -46,11 +46,10 @@
       "resources": [
         "sidepanel/sidepanel.html",
         "sidepanel/sidepanel.css",
-        "sidepanel/sidepanel.js",
-        "common/*.js"
+        "sidepanel/sidepanel.js"
       ],
       "matches": [
-        "<all_urls>"
+        "chrome-extension://*/*"
       ]
     }
   ]

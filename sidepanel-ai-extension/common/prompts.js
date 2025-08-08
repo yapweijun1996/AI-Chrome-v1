@@ -27,7 +27,7 @@ function buildSummarizePrompt(pageText, userPrompt = "") {
  * Build a planning prompt for autonomous Agent Mode.
  * The assistant must reply ONLY with a single JSON object using this schema:
  * {
- *   "tool": string, // one of: "navigate","click","fill","scroll","waitForSelector","screenshot","tabs.query","tabs.activate","tabs.close","done"
+ *   "tool": string, // one of: "goto_url","click_element","type_text","scroll_to","wait_for_selector","take_screenshot","tabs.query","switch_tab","close_tab","done"
  *   "params": object, // as required by the tool (see constraints)
  *   "rationale": string, // brief reason for the chosen action
  *   "done": boolean // true when the overall goal is met
@@ -315,12 +315,12 @@ Current Context:
 - Page Content: ${context.pageContent ? context.pageContent.substring(0, 500) + '...' : 'Not available'}
 
 Available Tools (ONLY use these exact tool names):
-- navigate: Go to a specific URL
-- click: Click on elements using CSS selectors
-- fill: Fill input fields with text
-- scroll: Scroll to find more content. direction must be "up" or "down" (lowercase). amountPx optional number.
-- waitForSelector: Wait for elements to appear
-- screenshot: Take a screenshot
+- goto_url: Go to a specific URL
+- click_element: Click on elements using CSS selectors
+- type_text: Fill input fields with text
+- scroll_to: Scroll to find more content. direction must be "up", "down", "top" or "bottom".
+- wait_for_selector: Wait for elements to appear
+- take_screenshot: Take a screenshot
 - done: Mark task as complete
 
 For YouTube tasks, follow this approach:
@@ -337,13 +337,13 @@ Important YouTube selectors:
 
 Return your next action as JSON (use ONLY the exact tool names listed above):
 {
-  "tool": "navigate|click|fill|scroll|waitForSelector|screenshot|done",
+  "tool": "goto_url|click_element|type_text|scroll_to|wait_for_selector|take_screenshot|done",
   "params": {
-    "url": "https://youtube.com" (for navigate only),
-    "selector": "CSS selector" (for click/fill/scroll/waitForSelector),
-    "value": "text to type" (for fill only),
-    "direction": "up|down" (for scroll only),
-    "timeoutMs": 5000 (for waitForSelector only)
+    "url": "https://youtube.com" (for goto_url only),
+    "selector": "CSS selector" (for click_element/type_text/scroll_to/wait_for_selector),
+    "value": "text to type" (for type_text only),
+    "direction": "up|down|top|bottom" (for scroll_to only),
+    "timeoutMs": 5000 (for wait_for_selector only)
   },
   "rationale": "Why this action will help achieve the goal",
   "done": false
@@ -368,12 +368,12 @@ Current Context:
 - Last Observation: ${context.lastObservation || 'None'}
 
 Available Tools (ONLY use these exact tool names):
-- navigate: Go to a specific URL
-- click: Click on elements using CSS selectors
-- fill: Fill input fields with text
-- scroll: Scroll to find more content
-- waitForSelector: Wait for elements to appear
-- screenshot: Take a screenshot to see current state
+- goto_url: Go to a specific URL
+- click_element: Click on elements using CSS selectors
+- type_text: Fill input fields with text
+- scroll_to: Scroll to find more content
+- wait_for_selector: Wait for elements to appear
+- take_screenshot: Take a screenshot to see current state
 - done: Mark task as complete
 
 Action Guidelines:
@@ -386,13 +386,13 @@ Action Guidelines:
 
 Return your next action as JSON (use ONLY the exact tool names listed above):
 {
-  "tool": "navigate|click|fill|scroll|waitForSelector|screenshot|done",
+  "tool": "goto_url|click_element|type_text|scroll_to|wait_for_selector|take_screenshot|done",
   "params": {
-    "url": "full URL" (for navigate only),
-    "selector": "CSS selector" (for click/fill/scroll/waitForSelector),
-    "value": "text to type" (for fill only),
-    "direction": "up|down" (for scroll only),
-    "timeoutMs": 5000 (for waitForSelector only)
+    "url": "full URL" (for goto_url only),
+    "selector": "CSS selector" (for click_element/type_text/scroll_to/wait_for_selector),
+    "value": "text to type" (for type_text only),
+    "direction": "up|down|top|bottom" (for scroll_to only),
+    "timeoutMs": 5000 (for wait_for_selector only)
   },
   "rationale": "Brief explanation of why this action helps achieve the goal",
   "done": false

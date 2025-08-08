@@ -183,14 +183,25 @@ async function handleInject(tabId: number, scriptConfig: ScriptConfig) {
     });
     await chrome.scripting.executeScript({
       target: { tabId },
-      func: (code) => new Function(code)(),
+      func: (code) => {
+        // Safer execution gate: only allow string source; wrap in IIFE
+        if (typeof code !== 'string') return false;
+        const fn = Function; // avoid direct eval usage
+        fn('(function(){\n' + code + '\n})();')();
+        return true;
+      },
       args: [jsScript],
       world: ExecutionWorld.MAIN,
     });
   } else {
     await chrome.scripting.executeScript({
       target: { tabId },
-      func: (code) => new Function(code)(),
+      func: (code) => {
+        if (typeof code !== 'string') return false;
+        const fn = Function;
+        fn('(function(){\n' + code + '\n})();')();
+        return true;
+      },
       args: [jsScript],
       world: ExecutionWorld.ISOLATED,
     });

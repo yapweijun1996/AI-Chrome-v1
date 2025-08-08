@@ -545,7 +545,7 @@ function generateSelector(element) {
       const combinedSelector = element.tagName.toLowerCase() + classSelector;
       try {
         const matches = document.querySelectorAll(combinedSelector);
-        if (matches.length === 1 && matches === element) {
+        if (matches.length === 1 && matches[0] === element) {
           return combinedSelector;
         }
       } catch (e) { /* ignore invalid selector */ }

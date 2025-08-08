@@ -88,11 +88,11 @@
         // Try to parse JSON error
         let errorType = mapGeminiError(response.status, text);
         // Friendly message for NOT_FOUND models
-        if (response.status === 404 || /NOT_FOUND|models\/.*is not found|404/i.test(text)) {
+    if (response.status === 404 || /NOT_FOUND|models\/.*is not found|404/i.test(text)) {
           return {
             ok: false,
             error:
-              "Gemini model not found or unsupported. Use model 'gemini-1.5-flash' (default) or verify access in Google AI Studio. Ensure the URL format is /v1/models/{model}:generateContent.",
+              "Gemini model not found or unsupported. Use a supported Gemini model (e.g., 'gemini-2.5-flash' default) or verify access in Google AI Studio. Ensure the URL format is /v1/models/{model}:generateContent.",
             raw: null,
             errorType
           };
@@ -123,7 +123,7 @@
         return {
           ok: false,
           error:
-            "Gemini model not found or unsupported. Use model 'gemini-1.5-flash' (default) or verify access in Google AI Studio. Ensure the URL format is /v1/models/{model}:generateContent.",
+            "Gemini model not found or unsupported. Use a supported Gemini model (e.g., 'gemini-2.5-flash' default) or verify access in Google AI Studio. Ensure the URL format is /v1/models/{model}:generateContent.",
           raw: null,
           errorType: ERROR_TYPES.MODEL_ERROR
         };

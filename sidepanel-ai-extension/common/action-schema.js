@@ -6,14 +6,19 @@ globalThis.ACTION_SCHEMA = {
     "tool": {
       "type": "string",
       "enum": [
-        "navigate",
-        "click",
-        "fill",
-        "scroll",
-        "waitForSelector",
+        "navigate",          // canonical name
+        "goto_url",          // legacy alias (kept for back-compat)
+        "click_element",
+        "type_text",
+        "scroll_to",
+        "wait_for_selector",
+        "take_screenshot",
+        "create_tab",
+        "close_tab",
+        "switch_tab",
+        "select_option",
         "scrape",
         "think",
-        "screenshot",
         "tabs.query",
         "tabs.activate",
         "tabs.close",
@@ -40,7 +45,7 @@ globalThis.ACTION_SCHEMA = {
         "name": { "type": "string", "maxLength": 500 },
         "key": { "type": "string", "maxLength": 500 },
         "information": { "type": "object" },
-        "direction": { "type": "string", "enum": ["up", "down", "left", "right"] },
+        "direction": { "type": "string", "enum": ["up", "down", "top", "bottom"] },
         "timeoutMs": { "type": "integer", "minimum": 100, "maximum": 30000 },
         "timeout": { "type": "integer", "minimum": 100, "maximum": 30000 },
         "thought": { "type": "string", "maxLength": 4000 },
@@ -58,7 +63,11 @@ globalThis.ACTION_SCHEMA = {
         "location": { "type": "string", "maxLength": 100 },
         "maxSearches": { "type": "integer", "minimum": 1, "maximum": 10 },
         "currentDepth": { "type": "integer", "minimum": 0, "maximum": 5 },
-        "researchGoal": { "type": "string", "maxLength": 500 }
+        "researchGoal": { "type": "string", "maxLength": 500 },
+        "text": { "type": "string", "maxLength": 5000 },
+        "optionValue": { "type": "string", "maxLength": 500 },
+        "active": { "type": "boolean" },
+        "targetTabId": { "type": "integer" }
       }
     },
     "rationale": { "type": "string", "maxLength": 2000 },

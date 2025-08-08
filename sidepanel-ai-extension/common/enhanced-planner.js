@@ -8,7 +8,7 @@
 
   class EnhancedPlanner {
     constructor(options = {}) {
-      this.model = options.model || "gemini-1.5-flash";
+      this.model = options.model || "gemini-2.5-flash";
       this.maxRetries = options.maxRetries || 3;
       this.searchAPIs = options.searchAPIs || ['google', 'bing', 'duckduckgo'];
       this.pricingAPIs = options.pricingAPIs || ['google_shopping', 'amazon', 'local_stores'];
