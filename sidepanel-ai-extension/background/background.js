@@ -34,6 +34,8 @@
   safeImport("./observer.js");                  // AgentObserver (run/tool events to UI + storage)
   // Namespaced console logger (globalThis.Log)
   safeImport("../common/logger.js");           // Logger: globalThis.Log with levels/namespaces
+  // Task Graph Engine (experimental)
+  safeImport("../common/task-graph.js");
   // api-key-manager.js is optional; guard its absence
   try {
     safeImport("../common/api-key-manager.js");  // API key rotation/manager (if present)
@@ -438,7 +440,21 @@ async function callModelWithRotation(prompt, options, timeoutMs = TIMEOUTS.MODEL
               fromKey: currentKey.name,
               toKey: nextKey.name
             });
-            await new Promise(resolve => setTimeout(resolve, API_KEY_ROTATION.RETRY_DELAY_MS));
+            // Respect RetryInfo if present (e.g., 50s) else use configured delay with jitter
+            let delayMs = API_KEY_ROTATION.RETRY_DELAY_MS;
+            try {
+              // Look for retry delay hints embedded in the error message
+              // Example snippet may include 'retryDelay': '50s'
+              const m = String(result.error || '').match(/retryDelay\"?\s*[:=]\s*\"?(\d+)(s|ms)?/i);
+              if (m) {
+                const val = parseInt(m[1], 10);
+                const unit = (m[2] || 'ms').toLowerCase();
+                delayMs = unit === 's' ? val * 1000 : val;
+              }
+            } catch (_) {}
+            // Add jitter 0.5x-1.5x
+            const jitter = 0.5 + Math.random();
+            await new Promise(resolve => setTimeout(resolve, Math.max(500, Math.floor(delayMs * jitter))));
             continue; // Try again with the newly selected key
           } else {
             console.warn("[BG] No more API keys available for rotation");
@@ -460,7 +476,8 @@ async function callModelWithRotation(prompt, options, timeoutMs = TIMEOUTS.MODEL
       // Try rotating as generic API_KEY_ERROR once, else bail if exhausted
       const nextKey = await apiKeyManager.rotateToNextKey(ERROR_TYPES.API_KEY_ERROR);
       if (attempts < maxAttempts && nextKey) {
-        await new Promise(resolve => setTimeout(resolve, API_KEY_ROTATION.RETRY_DELAY_MS));
+        const jitter = 0.5 + Math.random();
+        await new Promise(resolve => setTimeout(resolve, Math.floor(API_KEY_ROTATION.RETRY_DELAY_MS * jitter)));
         continue;
       }
       return {
@@ -537,7 +554,13 @@ function extractJSONWithRetry(text, context = 'JSON') {
   const fencedMatch = text.match(/```json\s*\n([\s\S]*?)\n\s*```/i);
   if (fencedMatch) {
     try {
-      return { success: true, data: JSON.parse(fencedMatch[1]) };
+      const raw = fencedMatch[1];
+      try {
+        return { success: true, data: JSON.parse(raw) };
+      } catch (e1) {
+        const cleaned = sanitizeModelJson(raw);
+        return { success: true, data: JSON.parse(cleaned) };
+      }
     } catch (e) {
       console.warn('Failed to parse fenced JSON:', e);
     }
@@ -549,7 +572,12 @@ function extractJSONWithRetry(text, context = 'JSON') {
   if (jsonStart >= 0 && jsonEnd > jsonStart) {
     const jsonStr = text.slice(jsonStart, jsonEnd + 1);
     try {
-      return { success: true, data: JSON.parse(jsonStr) };
+      try {
+        return { success: true, data: JSON.parse(jsonStr) };
+      } catch (e1) {
+        const cleaned = sanitizeModelJson(jsonStr);
+        return { success: true, data: JSON.parse(cleaned) };
+      }
     } catch (e) {
       console.warn('Failed to parse brace-extracted JSON:', e);
     }
@@ -560,6 +588,26 @@ function extractJSONWithRetry(text, context = 'JSON') {
     error: `Failed to extract valid JSON from ${context}`,
     rawText: text.substring(0, 500) + (text.length > 500 ? '...' : '')
   };
+}
+
+// Attempt to repair common model JSON issues: comments, trailing commas, single quotes
+function sanitizeModelJson(input) {
+  let s = String(input || '');
+  // Strip surrounding code fences if present (any fence)
+  s = s.replace(/^```[a-zA-Z]*\n([\s\S]*?)\n```\s*$/m, '$1');
+  // Remove block comments /* ... */
+  s = s.replace(/\/\*[\s\S]*?\*\//g, '');
+  // Remove line comments // ... (to end of line)
+  s = s.replace(/^\s*\/\/.*$/gm, '');
+  // Remove trailing commas before } or ]
+  s = s.replace(/,\s*([}\]])/g, '$1');
+  // Convert single-quoted property names to double-quoted
+  s = s.replace(/'([A-Za-z0-9_]+)'\s*:/g, '"$1":');
+  // Convert single-quoted string values to double-quoted (simple case)
+  s = s.replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, ': "$1"');
+  // Normalize whitespace
+  s = s.trim();
+  return s;
 }
 
 // Deep merge utility for findings
@@ -885,7 +933,12 @@ function validateAction(action) {
   if (action.params && typeof action.params === 'object') {
     for (const [param, value] of Object.entries(action.params)) {
       const paramSchema = schema.properties.params.properties[param];
+      // For record_finding, ignore unknown extra params (will be normalized)
       if (!paramSchema) {
+        if (action.tool === 'record_finding') {
+          // Silently ignore unknown params for this tool; the dispatcher will normalize
+          continue;
+        }
         errors.push(`Unknown parameter '${param}' for tool '${action.tool}'.`);
         continue;
       }
@@ -910,6 +963,150 @@ function validateAction(action) {
     errors: errors
   };
 }
+// Action pre-normalizer and repair helpers
+function tryParseJSONMaybe(text) {
+  if (typeof text !== 'string') return null;
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+function normalizeRecordFindingParams(params) {
+  const normalized = { ...(params || {}) };
+
+  // If finding exists as string JSON, parse it
+  if (typeof normalized.finding === 'string') {
+    const parsed = tryParseJSONMaybe(normalized.finding);
+    if (parsed && typeof parsed === 'object') {
+      normalized.finding = parsed;
+    }
+  }
+
+  // If finding missing or invalid, attempt to construct it from common synonyms
+  const findingIsObject = normalized.finding && typeof normalized.finding === 'object' && !Array.isArray(normalized.finding);
+  if (!findingIsObject) {
+    let candidate = null;
+
+    // Prefer explicit 'data' object
+    if (normalized.data && typeof normalized.data === 'object') {
+      candidate = { ...normalized.data };
+    }
+
+    // Pair: finding_name + finding_value
+    if (!candidate && typeof normalized.finding_name === 'string' && normalized.finding_value !== undefined) {
+      candidate = { [normalized.finding_name]: normalized.finding_value };
+    }
+
+    // Single summary/value
+    if (!candidate && typeof normalized.summary === 'string') {
+      candidate = { summary: normalized.summary };
+    }
+
+    if (!candidate && typeof normalized.value === 'string') {
+      candidate = { value: normalized.value };
+    }
+
+    // If still not found, aggregate all non-meta params into a finding object
+    if (!candidate) {
+      const metaKeys = new Set(['timeout', 'timeoutMs', 'thought', 'tabId']);
+      const temp = {};
+      for (const [k, v] of Object.entries(normalized)) {
+        if (k === 'finding') continue;
+        if (metaKeys.has(k)) continue;
+        temp[k] = v;
+      }
+      if (Object.keys(temp).length > 0) {
+        candidate = temp;
+      }
+    }
+
+    if (candidate) {
+      normalized.finding = candidate;
+    }
+  }
+
+  // Attach common metadata fields into the finding.meta bucket
+  if (normalized.finding && typeof normalized.finding === 'object') {
+    const metaFields = ['source', 'date_extracted', 'explanation', 'data_type', 'sub_task_goal'];
+    for (const key of metaFields) {
+      if (normalized[key] !== undefined) {
+        if (!normalized.finding.meta || typeof normalized.finding.meta !== 'object') {
+          normalized.finding.meta = {};
+        }
+        normalized.finding.meta[key] = normalized[key];
+      }
+    }
+  }
+
+  // Drop all extra params; leave only { finding } plus safe meta timing fields if needed
+  const finalParams = {};
+  if (normalized.finding && typeof normalized.finding === 'object') {
+    finalParams.finding = normalized.finding;
+  }
+  // Preserve timeout if present
+  if (typeof normalized.timeoutMs === 'number') finalParams.timeoutMs = normalized.timeoutMs;
+  if (typeof normalized.timeout === 'number') finalParams.timeout = normalized.timeout;
+
+  return finalParams;
+}
+
+function preNormalizeAction(action) {
+  if (!action || typeof action !== 'object') return action;
+  const out = { ...action, params: { ...(action.params || {}) } };
+  if (out.tool === 'record_finding') {
+    out.params = normalizeRecordFindingParams(out.params);
+  }
+  return out;
+}
+
+// Action normalization shim: map aliases and remove unknown params to satisfy schema
+function normalizeActionAliases(action) {
+  if (!action || typeof action !== 'object') return action;
+
+  const schema = globalThis.ACTION_SCHEMA || {};
+  const allowedParamKeys = Object.keys(
+    (schema.properties && schema.properties.params && schema.properties.params.properties) || {}
+  );
+
+  const toolAliasMap = {
+    click: 'click_element',
+    fill: 'type_text',
+    waitForSelector: 'wait_for_selector',
+    screenshot: 'take_screenshot',
+    readPageContent: 'read_page_content',
+    extractStructuredContent: 'extract_structured_content',
+    analyzeUrls: 'analyze_urls',
+    getPageLinks: 'get_page_links',
+  };
+
+  const out = {
+    ...action,
+    tool: toolAliasMap[action.tool] || action.tool,
+    params: { ...(action.params || {}) }
+  };
+
+  // Normalize common parameter aliases and cleanups
+  if (typeof out.params.selector === 'string') {
+    out.params.selector = out.params.selector.trim();
+  }
+
+  // Remove non-canonical/LLM-only fields
+  if ('selector_type' in out.params) delete out.params.selector_type;
+  if ('state' in out.params) delete out.params.state;
+
+  // Normalize typing parameter
+  if (out.tool === 'type_text' && typeof out.params.text === 'undefined' && typeof out.params.value !== 'undefined') {
+    out.params.text = out.params.value;
+  }
+
+  // Drop any params not present in the global schema to pass validation
+  for (const k of Object.keys(out.params)) {
+    if (!allowedParamKeys.includes(k)) {
+      delete out.params[k];
+    }
+  }
+
+  return out;
+}
+
 
 // [SUCCESS CRITERIA] Check if the agent has met the goal's success criteria
 function checkSuccessCriteria(sess, tabId) {
@@ -1320,7 +1517,111 @@ async function ensureContentScript(tabId) {
       }
     });
 
-    console.log("[BG] Core tools registered: navigateToUrl, extractLinks");
+    // readPageContent
+    globalThis.ToolsRegistry.registerTool({
+      id: "readPageContent",
+      title: "Read Page Content",
+      description: "Reads textual content from the current page.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          maxChars: { type: ["integer", "number"] }
+        }
+      },
+      retryPolicy: { maxAttempts: 1 },
+      run: async (ctx, input) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+        const maxChars = Number(input?.maxChars || 15000);
+        const res = await chrome.tabs.sendMessage(tabId, { type: "READ_PAGE_CONTENT", maxChars });
+        if (res?.ok) {
+          return { ok: true, observation: `Read page content (${res.text?.length || 0} chars)`, pageContent: res.text };
+        }
+        return { ok: false, observation: res?.error || "Failed to read page content" };
+      }
+    });
+
+    // analyzeUrls
+    globalThis.ToolsRegistry.registerTool({
+      id: "analyzeUrls",
+      title: "Analyze Page URLs",
+      description: "Analyzes current page for relevant links/URLs.",
+      inputSchema: { type: "object", properties: {} },
+      retryPolicy: { maxAttempts: 1 },
+      run: async (ctx) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+        const res = await chrome.tabs.sendMessage(tabId, { type: MSG.ANALYZE_PAGE_URLS });
+        if (res?.ok) {
+          return {
+            ok: true,
+            observation: `URL analysis completed. Found ${res.analysis?.relevantUrls?.length || 0} relevant URLs.`,
+            analysis: res.analysis
+          };
+        }
+        return { ok: false, observation: res?.error || "URL analysis failed" };
+      }
+    });
+
+    // extractStructuredContent
+    globalThis.ToolsRegistry.registerTool({
+      id: "extractStructuredContent",
+      title: "Extract Structured Content",
+      description: "Extracts structured content (JSON-LD, metadata) from the page.",
+      inputSchema: { type: "object", properties: {} },
+      retryPolicy: { maxAttempts: 1 },
+      run: async (ctx) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+        const res = await chrome.tabs.sendMessage(tabId, { type: MSG.EXTRACT_STRUCTURED_CONTENT });
+        if (res?.ok) {
+          return { ok: true, observation: `Structured content extracted via ${res.content?.source || 'unknown'}`, content: res.content };
+        }
+        return { ok: false, observation: res?.error || "Content extraction failed" };
+      }
+    });
+
+    // recordFinding (session-coupled)
+    globalThis.ToolsRegistry.registerTool({
+      id: "recordFinding",
+      title: "Record Finding",
+      description: "Stores a structured finding into the current session.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          finding: { type: "object" }
+        },
+        required: ["finding"]
+      },
+      retryPolicy: { maxAttempts: 1 },
+      run: async (ctx, input) => {
+        const tabId = ctx?.tabId;
+        const finding = input?.finding;
+        if (!finding || typeof finding !== 'object') {
+          return { ok: false, observation: "Invalid 'finding' parameter" };
+        }
+        const sess = agentSessions.get(tabId);
+        if (!sess) {
+          return { ok: false, observation: "No active session" };
+        }
+        try {
+          sess.findings = deepMerge(sess.findings || {}, finding);
+          emitAgentLog(tabId, { level: LOG_LEVELS.SUCCESS, msg: "Recorded finding to session (via ToolsRegistry)", finding });
+          await saveSessionToStorage(tabId, sess);
+          return { ok: true, observation: "Finding recorded" };
+        } catch (e) {
+          return { ok: false, observation: `Failed to record finding: ${String(e?.message || e)}` };
+        }
+      }
+    });
+
+    console.log("[BG] Core tools registered: navigateToUrl, extractLinks, readPageContent, analyzeUrls, extractStructuredContent, recordFinding");
   } catch (e) {
     console.warn("[BG] Core tool registration failed:", e);
   }
@@ -2361,12 +2662,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             msg: `Success criteria schema set to '${schemaKey}'`,
             schema: newSession.successCriteria
           });
+// 3. Start execution engine (graph mode or legacy loop) but don't block sendResponse
+try {
+  const { EXPERIMENTAL_GRAPH_MODE } = await chrome.storage.local.get("EXPERIMENTAL_GRAPH_MODE");
+  if (globalThis.TaskGraphEngine && EXPERIMENTAL_GRAPH_MODE) {
+    const graph = buildSimpleGraphForSession(tab.id, newSession);
+    runGraphForSession(tab.id, newSession, graph).catch(e => {
+      console.error("[BG] Graph run error:", e);
+      emitAgentLog(tab.id, { level: "error", msg: "Graph run error", error: String(e?.message || e) });
+    });
+  } else {
+    runAgentLoop(tab.id, goal, settings).catch(e => {
+      console.error("[BG] Agent loop error:", e);
+      emitAgentLog(tab.id, { level: "error", msg: "Agent loop error", error: String(e?.message || e) });
+    });
+  }
+} catch (e) {
+  runAgentLoop(tab.id, goal, settings).catch(err => {
+    console.error("[BG] Agent loop error:", err);
+    emitAgentLog(tab.id, { level: "error", msg: "Agent loop error", error: String(err?.message || err) });
+  });
+}
 
-          // 3. Start loop but don't block sendResponse
-          runAgentLoop(tab.id, goal, settings).catch(e => {
-            console.error("[BG] Agent loop error:", e);
-            emitAgentLog(tab.id, { level: "error", msg: "Agent loop error", error: String(e?.message || e) });
-          });
         
           // Send the generated plan to the sidepanel
           chrome.runtime.sendMessage({
@@ -2956,8 +3273,39 @@ function parseAndValidateAction(tabId, sess, responseText) {
     };
   }
 
-  const action = jsonResult.data.action || jsonResult.data; // Handle cases where 'action' is nested
-  const { valid, errors } = validateAction(action);
+  let action = jsonResult.data.action || jsonResult.data; // Handle cases where 'action' is nested
+
+  // Pre-normalize action (especially for record_finding)
+  action = preNormalizeAction(action);
+
+  // Normalize aliases and strip unknown params to satisfy schema
+  const normalized = normalizeActionAliases(action);
+  const changed =
+    (normalized.tool !== action.tool) ||
+    (JSON.stringify(normalized.params || {}) !== JSON.stringify(action.params || {}));
+  if (changed) {
+    try {
+      emitAgentLog(tabId, {
+        level: LOG_LEVELS.INFO,
+        msg: 'Action normalized for schema compatibility',
+        before: { tool: action.tool, params: Object.keys(action.params || {}) },
+        after: { tool: normalized.tool, params: Object.keys(normalized.params || {}) }
+      });
+    } catch (_) {}
+  }
+  action = normalized;
+
+  let { valid, errors } = validateAction(action);
+
+  // One-shot repair attempt for record_finding
+  if (!valid && action.tool === 'record_finding') {
+    const repaired = preNormalizeAction(action);
+    const res2 = validateAction(repaired);
+    if (res2.valid) {
+      action = repaired;
+      valid = true; errors = [];
+    }
+  }
 
   if (valid) {
     // Set default confidence if not provided
@@ -3547,10 +3895,10 @@ function runWatchdogs(tabId, sess, lastAction, lastExecRes) {
   if (sess.consecutiveFailures >= 3) {
     emitAgentLog(tabId, {
       level: LOG_LEVELS.WARN,
-      msg: `Watchdog: ${sess.consecutiveFailures} consecutive invalid actions. Forcing a 'record_finding' action.`
+      msg: `Watchdog: ${sess.consecutiveFailures} consecutive invalid actions. Forcing a 'think' action to repair.`
     });
-    sess.lastAction = { tool: 'record_finding', params: { finding: { error: 'Forced recovery due to repeated invalid actions.' } } };
-    sess.lastObservation = `Forced to record a finding to recover from repeated invalid actions.`;
+    sess.lastAction = { tool: 'think', params: { thought: 'I produced invalid actions repeatedly. I will repair by proposing a simpler, schema-compliant action next.' } };
+    sess.lastObservation = `Forced reflection to repair invalid action sequence.`;
     sess.consecutiveFailures = 0; // Reset after intervention
     return true;
   }
@@ -3632,3 +3980,92 @@ function testTemplateSubstitution() {
 
 // Expose test function globally for manual testing
 globalThis.testTemplateSubstitution = testTemplateSubstitution;
+// ===== Graph helpers (Phase A.1 minimal, appended) =====
+(function attachGraphHelpers(global) {
+  if (!global.TaskGraphEngine) return;
+
+  const LOGGER = (global.Log && global.Log.createLogger) ? global.Log.createLogger('graph') : null;
+
+  // Build a simple read -> analyze -> extract graph for current tab/session
+  global.buildSimpleGraphForSession = function(tabId, sess) {
+    const nodes = [
+      {
+        id: 'read_page',
+        kind: 'tool',
+        toolId: 'readPageContent',
+        input: { maxChars: 15000 },
+        retryPolicy: { maxAttempts: 1 }
+      },
+      {
+        id: 'analyze_urls',
+        kind: 'tool',
+        toolId: 'analyzeUrls',
+        dependsOn: ['read_page'],
+        retryPolicy: { maxAttempts: 1 }
+      },
+      {
+        id: 'extract_structured',
+        kind: 'tool',
+        toolId: 'extractStructuredContent',
+        dependsOn: ['read_page'],
+        retryPolicy: { maxAttempts: 1 }
+      }
+    ];
+    try { LOGGER?.debug?.('graph_build', { nodes: nodes.length, requestId: sess?.requestId }); } catch (_) {}
+    return global.TaskGraphEngine.createGraph(nodes, { requestId: sess?.requestId, goal: sess?.goal || '' });
+  };
+
+  // Run a graph and update session state on key node completions
+  global.runGraphForSession = async function(tabId, sess, graph) {
+    try { LOGGER?.info?.('graph_run_begin', { graphId: graph?.id, requestId: sess?.requestId }); } catch (_) {}
+
+    const res = await global.TaskGraphEngine.run(tabId, graph, {
+      ctx: { tabId, ensureContentScript, chrome },
+      defaultToolTimeoutMs: (global.MessageTypes?.TIMEOUTS?.DOM_ACTION_MS || 10000),
+      concurrency: 2,
+      failFast: false,
+      onNodeFinish: (node, out) => {
+        try {
+          // Persist meaningful artifacts into session
+          if (node.kind === 'tool' && out && out.ok !== false) {
+            if (node.toolId === 'readPageContent' && out.pageContent) {
+              sess.currentPageContent = out.pageContent;
+              emitAgentLog(tabId, { level: MessageTypes.LOG_LEVELS.DEBUG, msg: 'Graph: stored page content in session', length: out.pageContent.length });
+            }
+            if (node.toolId === 'extractStructuredContent' && out.content) {
+              const { content } = out;
+              let findingToRecord = content.source === 'json-ld' ? content.data : { ...content };
+              if (Array.isArray(findingToRecord)) {
+                findingToRecord.forEach(item => { sess.findings = deepMerge(sess.findings || {}, item); });
+              } else {
+                sess.findings = deepMerge(sess.findings || {}, findingToRecord);
+              }
+              emitAgentLog(tabId, { level: MessageTypes.LOG_LEVELS.SUCCESS, msg: 'Graph: recorded structured finding', source: content.source || 'unknown' });
+            }
+            // Persist after each successful node
+            saveSessionToStorage(tabId, sess);
+          }
+        } catch (e) {
+          try { LOGGER?.warn?.('graph_onNodeFinish_error', { nodeId: node?.id, error: String(e?.message || e) }); } catch (_) {}
+        }
+      }
+    });
+
+    try { LOGGER?.info?.('graph_run_end', { graphId: graph?.id, ok: res?.ok !== false, durationMs: res?.durationMs }); } catch (_) {}
+
+    // Emit a concise agent log summary
+    try {
+      emitAgentLog(tabId, {
+        level: (res?.ok !== false ? MessageTypes.LOG_LEVELS.SUCCESS : MessageTypes.LOG_LEVELS.ERROR),
+        msg: 'Graph run completed',
+        graphId: graph?.id,
+        ok: res?.ok !== false,
+        durationMs: res?.durationMs
+      });
+    } catch (_) {}
+
+    return res;
+  };
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : window));
+
+// ===== End Graph helpers =====

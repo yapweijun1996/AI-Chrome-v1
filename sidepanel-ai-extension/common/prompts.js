@@ -33,12 +33,12 @@ function buildSummarizePrompt(pageText, userPrompt = "") {
  *   "done": boolean // true when the overall goal is met
  * }
  * Constraints per tool:
- * - navigate: { "url": "https://..." }
- * - click: { "selector": "CSS selector" }
- * - fill: { "selector": "CSS selector", "value": "text" }
- * - scroll: { "selector": "CSS selector" } OR { "direction": "top"|"bottom" }
- * - waitForSelector: { "selector": "CSS selector", "timeoutMs": number (optional, default 5000) }
- * - screenshot: { "reason": "optional string" }
+ * - navigate|goto_url: { "url": "https://..." }
+ * - click_element: { "selector": "CSS selector" }
+ * - type_text: { "selector": "CSS selector", "text": "text" }
+ * - scroll_to: { "selector": "CSS selector" } OR { "direction": "top"|"bottom" }
+ * - wait_for_selector: { "selector": "CSS selector", "timeoutMs": number (optional, default 5000) }
+ * - take_screenshot: { "reason": "optional string" }
  * - tabs.query: { "titleContains": "optional", "urlContains": "optional" }
  * - tabs.activate: { "tabId": number }
  * - tabs.close: { "tabId": number }
@@ -149,13 +149,13 @@ Page Content Preview (first 2000 chars):
 ${(pageContent || "").substring(0, 2000)}${pageContent && pageContent.length > 2000 ? "..." : ""}
 ---
 
-Return ONLY a JSON object with your next action:
+Return ONLY a JSON object with your next action. Your entire reply must be a single JSON object with no extra commentary or markdown:
 {
-  "tool": "read_page_content|navigate|click|fill|scroll|waitForSelector|screenshot|tabs.query|tabs.activate|tabs.close|generate_report|done|record_finding",
+  "tool": "read_page_content|navigate|goto_url|click_element|type_text|scroll_to|wait_for_selector|take_screenshot|tabs.query|tabs.activate|tabs.close|generate_report|done|record_finding",
   "params": { /* tool-specific parameters */ },
   "rationale": "Clear reasoning for this action based on context and progress",
-  "confidence": 0.85, // 0.0-1.0 confidence in this action
-  "done": false // true only when the CURRENT SUB-TASK is definitively complete. This will advance the agent to the next sub-task in the plan.
+  "confidence": 0.85,
+  "done": false
 }
 
 Choose the most contextually appropriate action to advance the current sub-task efficiently.`
@@ -325,7 +325,7 @@ Available Tools (ONLY use these exact tool names):
 
 For YouTube tasks, follow this approach:
 1. If not on YouTube, navigate to youtube.com first
-2. Use the search box to search for content (use "fill" tool)
+2. Use the search box to search for content (use "type_text" tool)
 3. Click on relevant video results
 4. Handle any popups or overlays that might appear
 
@@ -341,7 +341,7 @@ Return your next action as JSON (use ONLY the exact tool names listed above):
   "params": {
     "url": "https://youtube.com" (for goto_url only),
     "selector": "CSS selector" (for click_element/type_text/scroll_to/wait_for_selector),
-    "value": "text to type" (for type_text only),
+    "text": "text to type" (for type_text only),
     "direction": "up|down|top|bottom" (for scroll_to only),
     "timeoutMs": 5000 (for wait_for_selector only)
   },
@@ -390,7 +390,7 @@ Return your next action as JSON (use ONLY the exact tool names listed above):
   "params": {
     "url": "full URL" (for goto_url only),
     "selector": "CSS selector" (for click_element/type_text/scroll_to/wait_for_selector),
-    "value": "text to type" (for type_text only),
+    "text": "text to type" (for type_text only),
     "direction": "up|down|top|bottom" (for scroll_to only),
     "timeoutMs": 5000 (for wait_for_selector only)
   },
@@ -484,12 +484,12 @@ ${(pageContent || "").substring(0, 1500)}${pageContent && pageContent.length > 1
 
 Based on the failure analysis and available options, return your recovery action:
 {
-  "tool": "navigate|click|fill|scroll|waitForSelector|screenshot|tabs.query|tabs.activate|tabs.close|done",
+  "tool": "navigate|goto_url|click_element|type_text|scroll_to|wait_for_selector|take_screenshot|tabs.query|tabs.activate|tabs.close|done",
   "params": { /* parameters for the recovery action */ },
   "rationale": "Detailed explanation of why this recovery approach will work",
-  "confidence": 0.75, // 0.0-1.0 confidence this will succeed
-  "recoveryType": "retry|alternative|refresh|navigate|skip", // type of recovery strategy
-  "done": false // only true if giving up on current sub-task
+  "confidence": 0.75,
+  "recoveryType": "retry|alternative|refresh|navigate|skip",
+  "done": false
 }
 
 Choose a recovery action that addresses the root cause and maximizes chance of success.`
@@ -668,12 +668,12 @@ AVAILABLE RESEARCH TOOLS:
 - analyze_url_depth: Analyze if current page URLs are worth reading deeper
 - analyze_urls: Analyze all URLs on current page for research relevance
 - get_page_links: Extract and rank relevant links from current page
-- navigate: Go to a specific URL
-- click: Click on elements using CSS selectors
-- fill: Fill input fields with text
-- scroll: Scroll to find more content
-- waitForSelector: Wait for elements to appear
-- screenshot: Take a screenshot for visual analysis
+- navigate|goto_url: Go to a specific URL
+- click_element: Click on elements using CSS selectors
+- type_text: Fill input fields with text
+- scroll_to: Scroll to find more content
+- wait_for_selector: Wait for elements to appear
+- take_screenshot: Take a screenshot for visual analysis
 - extract_structured_content: Get enhanced content extraction with metadata
 - extract_with_regex: Extract specific information from text using a regex pattern.
 - record_finding: Saves a structured data object to your findings. CRITICAL: All data MUST be passed in a single 'finding' object. DO NOT invent other parameters. Example: { "tool": "record_finding", "params": { "finding": { "exchange_rate": "3.45", "currency_pair": "SGD_to_MYR" } } }

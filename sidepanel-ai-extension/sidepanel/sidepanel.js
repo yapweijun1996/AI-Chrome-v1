@@ -2066,6 +2066,18 @@ function addFindingMessage(finding, timestamp) {
 
  function addActionResultMessage(payload, timestamp) {
   const { tool, data } = payload;
+  if (!tool || !data) {
+    return; // Ignore empty payloads
+  }
+
+  // De-duplicate by a simple rolling cache (last 10)
+  if (!window.__lastActionResults) window.__lastActionResults = [];
+  const key = JSON.stringify({ tool, data });
+  if (window.__lastActionResults.includes(key)) {
+    return;
+  }
+  window.__lastActionResults.push(key);
+  if (window.__lastActionResults.length > 10) window.__lastActionResults.shift();
   const resultContainer = addMessage('assistant', '');
   resultContainer.classList.add('action-result-bubble-container');
   const contentDiv = resultContainer.querySelector('.content');
@@ -2105,8 +2117,8 @@ function addFindingMessage(finding, timestamp) {
   contentDiv.innerHTML = contentHtml;
   els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
 
-  // QA log
-  console.log('Rendered action result:', { tool, data });
+  // QA log (reduced noise)
+  // console.log('Rendered action result:', { tool, data });
 }
 
 function renderSuccessCriteria(schema, findings) {
