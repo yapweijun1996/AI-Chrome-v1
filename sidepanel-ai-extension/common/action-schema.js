@@ -33,7 +33,22 @@ globalThis.ACTION_SCHEMA = {
         "research_url",
         "multi_search",
         "continue_multi_search",
-        "analyze_url_depth"
+        "analyze_url_depth",
+
+        // New registry-first camelCase aliases (normalized by dispatcher)
+        "navigateToUrl",
+        "clickElement",
+        "typeText",
+        "scrollTo",
+        "waitForSelector",
+        "readPageContent",
+        "analyzeUrls",
+        "extractStructuredContent",
+        "extractLinks",
+        "scrapeSelector",
+        "getInteractiveElements",
+        "recordFinding",
+        "generateReport"
       ]
     },
     "params": {
@@ -41,6 +56,8 @@ globalThis.ACTION_SCHEMA = {
       "properties": {
         "url": { "type": "string", "format": "uri" },
         "selector": { "type": "string", "maxLength": 500 },
+        "semantic_selector": { "type": "string", "maxLength": 500 },
+        "elementIndex": { "type": "integer", "minimum": 1, "maximum": 500 },
         "value": { "type": ["string", "object"], "maxLength": 5000 },
         "name": { "type": "string", "maxLength": 500 },
         "key": { "type": "string", "maxLength": 500 },
@@ -67,7 +84,8 @@ globalThis.ACTION_SCHEMA = {
         "text": { "type": "string", "maxLength": 5000 },
         "optionValue": { "type": "string", "maxLength": 500 },
         "active": { "type": "boolean" },
-        "targetTabId": { "type": "integer" }
+        "targetTabId": { "type": "integer" },
+        "label": { "type": "string", "maxLength": 500 }
       }
     },
     "rationale": { "type": "string", "maxLength": 2000 },

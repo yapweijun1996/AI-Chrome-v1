@@ -236,6 +236,47 @@ html,body{
   border-color:var(--accent); color:var(--accent);
 }
 
+/* Automation Templates */
+.automation-templates{
+  margin-top:16px; padding:12px; 
+  background:var(--panel); border:1px solid var(--border); border-radius:8px;
+}
+.templates-header h3{
+  margin:0 0 4px 0; font-size:14px; font-weight:600; color:var(--text);
+}
+.templates-header small{
+  color:var(--muted); font-size:11px;
+}
+.templates-grid{
+  display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:12px;
+}
+.template-card{
+  background:var(--chip); border:1px solid var(--chip-border); border-radius:6px;
+  padding:10px; cursor:pointer; transition:all 0.2s; position:relative;
+}
+.template-card:hover{
+  border-color:var(--accent); background:var(--user-msg);
+  transform:translateY(-1px);
+}
+.template-card .template-icon{
+  font-size:18px; margin-bottom:4px; display:block;
+}
+.template-card .template-name{
+  font-size:12px; font-weight:600; color:var(--text); margin-bottom:2px;
+}
+.template-card .template-desc{
+  font-size:10px; color:var(--muted); line-height:1.3; 
+  overflow:hidden; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
+}
+.template-card .template-badge{
+  position:absolute; top:6px; right:6px; 
+  background:var(--accent-2); color:#0a0a0a; font-size:9px; font-weight:600;
+  padding:2px 4px; border-radius:4px; text-transform:uppercase;
+}
+.template-card.premium .template-badge{
+  background:var(--warning);
+}
+
 /* Modals */
 .modal{
   display:none; position:fixed; inset:0;
@@ -888,4 +929,48 @@ html,body{
 @keyframes toast-out{
   from { opacity: 1; transform: translateY(0); }
   to   { opacity: 0; transform: translateY(6px); }
+}
+/* ===== Feature Flags + Planner Status Pill ===== */
+.feature-flags{
+  display:flex;
+  gap:10px;
+  align-items:center;
+  padding:8px 12px;
+  border-bottom:1px solid var(--border);
+  background:var(--panel);
+}
+.feature-flags .toggle{
+  background:var(--chip);
+  border:1px solid var(--chip-border);
+  border-radius:20px;
+  padding:6px 12px;
+  color:var(--text);
+  display:flex;
+  align-items:center;
+  gap:6px;
+  font-size:12px;
+}
+.planner-pill{
+  margin-left:auto;
+  border:1px solid var(--chip-border);
+  border-radius:999px;
+  padding:4px 10px;
+  font-size:12px;
+  user-select:none;
+}
+.planner-pill.linear{
+  background:var(--chip);
+  color:var(--text);
+}
+.planner-pill.react{
+  background:var(--accent);
+  border-color:var(--accent);
+  color:white;
+  font-weight:600;
+}
+.planner-pill.legacy{
+  background:var(--warning);
+  border-color:var(--warning);
+  color:#1A202C;
+  font-weight:600;
 }

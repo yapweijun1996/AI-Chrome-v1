@@ -75,6 +75,57 @@
     if (raw?.error) out.errors = [String(raw.error)];
     if (raw?.warnings) out.warnings = [].concat(raw.warnings);
 
+    // Back-compat: pass through common fields for legacy callers that expect top-level properties
+    if (raw && typeof raw === 'object') {
+      if (raw.pageContent !== undefined) out.pageContent = raw.pageContent;
+      if (raw.links !== undefined) out.links = raw.links;
+      if (raw.tabs !== undefined) out.tabs = raw.tabs;
+      if (raw.report !== undefined) out.report = raw.report;
+      if (raw.data !== undefined) out.data = raw.data;
+      if (raw.content !== undefined) out.content = raw.content;
+      if (raw.dataUrl !== undefined) out.dataUrl = raw.dataUrl;
+    }
+
+    return out;
+  }
+
+  // Capability metadata normalizer (lightweight)
+  // Provides sensible defaults and normalizes enum-like fields while preserving extra keys.
+  function validateCapabilities(caps) {
+    const defaults = {
+      readOnly: true,
+      requiresVisibleElement: false,
+      requiresContentScript: false,
+      framesSupport: 'all',   // 'none' | 'same-origin' | 'all'
+      shadowDom: 'partial',   // 'none' | 'partial' | 'full'
+      navigation: {
+        causesNavigation: false,
+        waitsForLoad: false
+      }
+    };
+    const out = { ...defaults, ...(caps || {}) };
+
+    // Normalize enums safely
+    const validFrames = new Set(['none', 'same-origin', 'all']);
+    const validShadow = new Set(['none', 'partial', 'full']);
+    if (!validFrames.has(out.framesSupport)) out.framesSupport = defaults.framesSupport;
+    if (!validShadow.has(out.shadowDom)) out.shadowDom = defaults.shadowDom;
+
+    // Normalize nested navigation block
+    if (typeof out.navigation !== 'object' || out.navigation === null) {
+      out.navigation = { ...defaults.navigation };
+    } else {
+      out.navigation = {
+        causesNavigation: !!out.navigation.causesNavigation,
+        waitsForLoad: !!out.navigation.waitsForLoad
+      };
+    }
+
+    // Ensure booleans
+    out.readOnly = !!out.readOnly;
+    out.requiresVisibleElement = !!out.requiresVisibleElement;
+    out.requiresContentScript = !!out.requiresContentScript;
+
     return out;
   }
 
@@ -123,8 +174,53 @@
       if (!def || typeof def !== 'object') throw new Error('Tool definition required');
       if (!def.id || typeof def.id !== 'string') throw new Error('Tool id is required');
       if (registry.has(def.id)) registry.delete(def.id);
-      registry.set(def.id, Object.freeze({ ...def }));
-      try { LOGGER?.info?.("register", { id: def.id, hasSchema: !!def.inputSchema, retry: def.retryPolicy?.maxAttempts || 1 }); } catch (_) {}
+
+      // Normalize/validate capabilities; warn if missing (back-compat safe)
+      const hasCaps = !!def.capabilities;
+      if (!hasCaps) {
+        try { LOGGER?.warn?.("register_missing_capabilities", { id: def.id }); } catch (_) {}
+      }
+      const caps = validateCapabilities(def.capabilities);
+
+      // Compose preconditions: capability guards first, then user-defined preconditions
+      const userPreconditions = typeof def.preconditions === 'function' ? def.preconditions : null;
+      const composedPreconditions = async (ctx, input) => {
+        // Capability-aware guardrails
+        try {
+          // requiresContentScript: ensure content script is available or fail fast
+          if (caps.requiresContentScript) {
+            const hasEnsure = !!(ctx && typeof ctx.ensureContentScript === 'function');
+            const hasTabId = Number.isFinite(ctx?.tabId);
+            if (!hasEnsure || !hasTabId) {
+              try { LOGGER?.warn?.("capability_guard_missing_ctx", { id: def.id, hasEnsure, hasTabId }); } catch (_) {}
+              return { ok: false, observation: 'Content script requirement cannot be satisfied (missing ctx.ensureContentScript or tabId)' };
+            }
+            const ensured = await ctx.ensureContentScript(ctx.tabId);
+            if (!ensured) {
+              return { ok: false, observation: 'Content script unavailable' };
+            }
+          }
+        } catch (e) {
+          try { LOGGER?.warn?.("capability_guard_exception", { id: def.id, error: String(e?.message || e) }); } catch (_) {}
+          return { ok: false, observation: 'Capability guard failed' };
+        }
+
+        // User-defined preconditions (preserved)
+        if (userPreconditions) {
+          const res = await userPreconditions(ctx, input);
+          if (res && res.ok === false) return res;
+        }
+        return { ok: true };
+      };
+
+      const normalized = {
+        ...def,
+        capabilities: caps,
+        preconditions: composedPreconditions
+      };
+
+      registry.set(def.id, Object.freeze(normalized));
+      try { LOGGER?.info?.("register", { id: def.id, hasSchema: !!def.inputSchema, retry: def.retryPolicy?.maxAttempts || 1, hasCaps }); } catch (_) {}
       return true;
     },
     getTool(id) {
@@ -132,6 +228,10 @@
     },
     listTools() {
       return Array.from(registry.values());
+    },
+    getCapabilities(id) {
+      const def = registry.get(id);
+      return def ? def.capabilities || null : null;
     },
     async runTool(id, ctx, input) {
       const def = registry.get(id);

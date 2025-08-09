@@ -18,6 +18,13 @@
   </div>
 </header>
 
+<!-- Experimental Feature Flags -->
+  <div id="featureFlags" class="feature-flags" role="group" aria-label="Experimental features">
+    <label class="toggle"><input id="flagGraphMode" type="checkbox" /> Graph Mode</label>
+    <label class="toggle"><input id="flagFastMode" type="checkbox" title="Reduce waits and visuals for faster actions" /> Fast Mode</label>
+    <label class="toggle"><input id="flagReactPlanner" type="checkbox" /> ReAct Planner</label>
+    <span id="plannerStatusPill" class="planner-pill linear" title="Planner used for last run">Planner: Linear</span>
+  </div>
 <!-- Split layout: left chat pane, right activity drawer -->
 <main class="sp-layout" id="spLayout">
   <section class="sp-chat" id="chatPane" role="region" aria-label="Chat">
@@ -44,6 +51,17 @@
         <button id="qaExtractLinks" class="quick-btn" title="Extract all links from this page" aria-label="Extract all links from this page">Extract links</button>
         <button id="qaOutline" class="quick-btn" title="Create an outline of this page" aria-label="Create an outline of this page">Outline</button>
         <button id="qaNavigate" class="quick-btn" title="Prepare navigation request" aria-label="Prepare navigation request">Navigate to…</button>
+      </div>
+
+      <!-- Autonomous Task Templates -->
+      <div class="automation-templates" id="automationTemplates" role="region" aria-label="Autonomous task templates">
+        <div class="templates-header">
+          <h3>🤖 Autonomous Tasks</h3>
+          <small>Let the AI agent perform complex multi-step tasks automatically</small>
+        </div>
+        <div class="templates-grid" id="templatesGrid">
+          <!-- Templates will be populated dynamically -->
+        </div>
       </div>
     </div>
   </section>
@@ -123,6 +141,7 @@
   <div id="toastContainer" class="toast-container" aria-live="polite" aria-atomic="true"></div>
 
   <script src="../common/messages.js"></script>
+  <script src="../common/automation-templates.js"></script>
   <script src="../common/prompts.js"></script>
   <script src="../lib/marked.min.js"></script>
   <script src="../sidepanel/sidepanel.js" type="module"></script>

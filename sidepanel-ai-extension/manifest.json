@@ -36,6 +36,8 @@
       ],
       "js": [
         "common/messages.js",
+        "content/element-ranker.js",
+        "content/dom-agent.js",
         "content/content.js"
       ],
       "run_at": "document_idle"

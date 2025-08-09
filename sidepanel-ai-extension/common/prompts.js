@@ -27,21 +27,25 @@ function buildSummarizePrompt(pageText, userPrompt = "") {
  * Build a planning prompt for autonomous Agent Mode.
  * The assistant must reply ONLY with a single JSON object using this schema:
  * {
- *   "tool": string, // one of: "goto_url","click_element","type_text","scroll_to","wait_for_selector","take_screenshot","tabs.query","switch_tab","close_tab","done"
+ *   "tool": string, // allowed: "navigateToUrl","clickElement","typeText","scrollTo","waitForSelector","readPageContent","analyzeUrls","extractStructuredContent","extractLinks","take_screenshot","tabs.query","tabs.activate","tabs.close","recordFinding","done","getInteractiveElements","scrapeSelector"
  *   "params": object, // as required by the tool (see constraints)
  *   "rationale": string, // brief reason for the chosen action
  *   "done": boolean // true when the overall goal is met
  * }
  * Constraints per tool:
- * - navigate|goto_url: { "url": "https://..." }
- * - click_element: { "selector": "CSS selector" }
- * - type_text: { "selector": "CSS selector", "text": "text" }
- * - scroll_to: { "selector": "CSS selector" } OR { "direction": "top"|"bottom" }
- * - wait_for_selector: { "selector": "CSS selector", "timeoutMs": number (optional, default 5000) }
+ * - navigateToUrl: { "url": "https://..." }
+ * - clickElement: { "selector": "CSS selector" } OR { "elementIndex": number } // Prefer a robust "selector" using text/aria/role/title; use elementIndex only as a last resort
+ * - typeText: { "selector": "CSS selector", "text": "text" } OR { "elementIndex": number, "text": "text" } // Prefer "selector" built from accessibleName/aria-label/placeholder/name
+ * - scrollTo: { "selector": "CSS selector" } OR { "direction": "top"|"bottom" }
+ * - waitForSelector: { "selector": "CSS selector", "timeoutMs": number (optional, default 5000) }
+ * - readPageContent: { "maxChars": number (optional) }
+ * - extractStructuredContent: { }
+ * - extractLinks: { "includeExternal": boolean (optional), "maxLinks": number (optional) }
  * - take_screenshot: { "reason": "optional string" }
  * - tabs.query: { "titleContains": "optional", "urlContains": "optional" }
  * - tabs.activate: { "tabId": number }
  * - tabs.close: { "tabId": number }
+ * - recordFinding: { "finding": object }
  * - done: use when you judge the goal is achieved; params can be {}
  *
  * Safety:
@@ -49,6 +53,7 @@ function buildSummarizePrompt(pageText, userPrompt = "") {
  * - Prefer simple and robust selectors; only click visible, interactive elements.
  * - One step per JSON; do not return arrays.
  * - Respond with JSON only, no markdown or prose.
+ * - Do NOT use "generateReport" in automation workflows; it is not an allowed tool in this mode.
  */
 function buildAgentPlanPrompt(fullGoal, currentSubTask, context = {}) {
   const {
@@ -89,18 +94,35 @@ ${JSON.stringify(successCriteria, null, 2)}
     : "";
 
   const elementsLog = interactiveElements.length > 0
-    ? `Available Interactive Elements (prioritized by relevance):
----
-${JSON.stringify(interactiveElements.slice(0, 15), null, 2)}
----`
+    ? `Available Interactive Elements (prioritized by relevance and score):
+  ---
+  ${JSON.stringify(interactiveElements.slice(0, 15).map(el => ({ ...el, score: el.score || 'N/A', purpose: el.purpose || 'N/A' })), null, 2)}
+  ---`
     : "No interactive elements found. Consider navigation or page loading issues.";
 
   const contextualInsights = generateContextualInsights(history, lastAction, lastObservation, failurePatterns);
   
   const progressAnalysis = analyzeProgress(history, currentSubTask, progressMetrics);
 
+  // Get template suggestions based on the goal for enhanced autonomous decision-making
+  const AutomationTemplatesRef = (typeof window !== 'undefined' && window.AutomationTemplates) || 
+                                 (typeof globalThis !== 'undefined' && globalThis.AutomationTemplates);
+  const templateSuggestions = AutomationTemplatesRef ? 
+    AutomationTemplatesRef.suggestTemplates(fullGoal) : [];
+  
+  const templateGuidance = templateSuggestions.length > 0 ? 
+    `\n\nAUTONOMOUS WORKFLOW GUIDANCE:
+Based on your goal, these proven automation patterns may help:
+${templateSuggestions.map(t => 
+  `• ${t.name}: ${t.description}
+    Recommended sites: ${t.sites?.join(', ') || t.platforms?.join(', ') || t.sources?.join(', ') || 'Multiple sources'}
+    Key steps: ${t.workflow.slice(0, 4).join(' → ')}`
+).join('\n')}
+
+Use these patterns to guide your autonomous decision-making and site selection.` : '';
+
   return (
-`You are an intelligent web automation agent with contextual reasoning capabilities.
+`You are an intelligent web automation agent with advanced contextual reasoning and autonomous decision-making capabilities.
 
 MISSION CONTEXT:
 Overall Goal: ${fullGoal}
@@ -114,6 +136,7 @@ Content Available: ${pageContent ? 'Yes' : 'No'}
 Interactive Elements: ${interactiveElements.length} found
 
 ${elementsLog}
+${templateGuidance}
 
 EXECUTION CONTEXT:
 ${progressAnalysis}
@@ -129,20 +152,31 @@ Action: ${JSON.stringify(lastAction) || "None"}
 Result: ${lastObservation || "No observation"}
 ${contextualInsights}
 
-CONTEXTUAL REASONING:
+ENHANCED AUTONOMOUS REASONING:
 Before deciding your next action, consider:
 1. PROGRESS: Are you making meaningful progress toward the sub-task?
 2. PATTERNS: Have you tried similar actions before? What were the results?
 3. CONTEXT: Does the current page state align with your sub-task requirements?
 4. EFFICIENCY: Is there a more direct path to accomplish the goal?
 5. VALIDATION: Can you verify if previous actions actually succeeded?
+6. TEMPLATES: Do the workflow guidance patterns above suggest better approaches or sites?
+7. AUTONOMY: Can you independently navigate to relevant sites without explicit user direction?
 
-DECISION FRAMEWORK:
-- If stuck in a loop, try a different approach or navigate elsewhere
-- If elements aren't found, consider waiting, scrolling, or page navigation
-- If actions fail repeatedly, reassess the sub-task or mark as done to move forward
-- Prioritize actions that directly advance the current sub-task
-- Use screenshots for complex pages or when validation is needed
+ADVANCED DECISION FRAMEWORK:
+- Autonomous Navigation: You can proactively navigate to relevant websites (Amazon, Google, Wikipedia, etc.) based on the goal type, without waiting for explicit navigation instructions
+- Smart Site Selection: Use the template guidance above to choose the most appropriate websites for different task types
+- Multi-Source Strategy: For research tasks, automatically plan to visit multiple authoritative sources
+- Contextual Adaptation: Adapt your approach based on what type of content/functionality each website offers
+- Plan before acting: internally enumerate the next 2–4 concrete steps required to reach the sub-task goal. Then output ONLY the next action as JSON.
+- If stuck in a loop, proactively try different websites or approaches based on template guidance
+- Enhanced Reliability Mode: Elements are now always fetched fresh for each interaction to prevent bfcache issues. The system automatically refreshes elements before clicks/typing.
+- Redundant sensing optimization: If recent Page Content is available, DO NOT propose "readPageContent" again unless the page has significantly changed. Focus on concrete actions using available content.
+- If your last two proposed tools were "readPageContent" or "getInteractiveElements" and were skipped as redundant, you MUST NOT propose them again; choose a concrete action instead.
+- When selecting an element, heavily weigh its "purpose", "accessibleName", and labels (aria-label, placeholder, name, text, title). **CRITICAL: Do NOT use \`elementIndex\` unless there is no robust selector.** Prefer selectors like: button[aria-label="Send"], [role="button"]:has-text("Send"), input[name="to"], input[placeholder*="Subject"].
+- For “finalizing” actions (submit/send/confirm), explicitly prefer elements whose purpose/score indicates finalization over nearby formatting/attachment/settings controls.
+- If actions fail repeatedly, reassess the sub-task or mark as done to move forward.
+- Prioritize actions that directly advance the current sub-task.
+- Use screenshots only for complex visual disambiguation or validation—not as a default sensing step.
 
 Page Content Preview (first 2000 chars):
 ---
@@ -151,13 +185,14 @@ ${(pageContent || "").substring(0, 2000)}${pageContent && pageContent.length > 2
 
 Return ONLY a JSON object with your next action. Your entire reply must be a single JSON object with no extra commentary or markdown:
 {
-  "tool": "read_page_content|navigate|goto_url|click_element|type_text|scroll_to|wait_for_selector|take_screenshot|tabs.query|tabs.activate|tabs.close|generate_report|done|record_finding",
+  "tool": "readPageContent|navigateToUrl|clickElement|typeText|scrollTo|waitForSelector|take_screenshot|tabs.query|tabs.activate|tabs.close|done|recordFinding|analyzeUrls|extractStructuredContent|extractLinks|scrapeSelector|getInteractiveElements",
   "params": { /* tool-specific parameters */ },
   "rationale": "Clear reasoning for this action based on context and progress",
+  "element_analysis": "Brief analysis of the chosen element and why it was selected",
   "confidence": 0.85,
   "done": false
 }
-
+ 
 Choose the most contextually appropriate action to advance the current sub-task efficiently.`
   );
 }
@@ -213,6 +248,17 @@ function analyzeProgress(history, currentSubTask, progressMetrics) {
 }
 
 function buildTaskDecompositionPrompt(goal, pageInfo = {}) {
+  // Get template suggestions for enhanced planning
+  const AutomationTemplatesRef = (typeof window !== 'undefined' && window.AutomationTemplates) || 
+                                 (typeof globalThis !== 'undefined' && globalThis.AutomationTemplates);
+  const suggestions = AutomationTemplatesRef ? 
+    AutomationTemplatesRef.suggestTemplates(goal).slice(0, 2) : [];
+  
+  const templateContext = suggestions.length > 0 ? 
+    `\n\nRELEVANT AUTOMATION TEMPLATES:\n${suggestions.map(t => 
+      `- ${t.name}: ${t.description}\n  Typical workflow: ${t.workflow.slice(0, 3).join(' → ')}`
+    ).join('\n')}` : '';
+
   return (
 `You are an expert task planner with deep understanding of web automation workflows. Your job is to break down complex goals into a series of logical, executable sub-tasks that build upon each other.
 
@@ -221,20 +267,23 @@ User Goal: ${goal}
 Current Page Context:
 - URL: ${pageInfo.url || 'unknown'}
 - Title: ${pageInfo.title || 'unknown'}
+${templateContext}
 
-PLANNING PRINCIPLES:
+ENHANCED PLANNING PRINCIPLES:
 1. **STRICT Step Limit:** The plan must have a STRICT MAXIMUM of 5 steps. Be extremely concise.
-2. **Simplicity First:** Prioritize the simplest, most direct path. Avoid redundant steps.
-3. **Logical Dependencies:** Tasks must follow a logical order (e.g., navigate before interacting).
-4. **Mandatory Navigation:** If the current page is not relevant, the first step MUST be navigation (e.g., to google.com).
-5. **Atomic & Verifiable:** Each sub-task should be a single, clear action.
-6. **Final Synthesis:** The final step should typically be to synthesize information or generate a report.
+2. **Template-Guided Planning:** If relevant templates exist above, adapt their proven workflows to the user's specific goal.
+3. **Simplicity First:** Prioritize the simplest, most direct path. Avoid redundant steps.
+4. **Logical Dependencies:** Tasks must follow a logical order (e.g., navigate before interacting).
+5. **Mandatory Navigation:** If the current page is not relevant, the first step MUST be navigation (e.g., to google.com).
+6. **Atomic & Verifiable:** Each sub-task should be a single, clear action.
+7. **Final Synthesis:** The final step should typically be to synthesize information or generate a report.
 
-TASK CATEGORIES TO CONSIDER:
-- Navigation: Moving between pages/sites
-- Search: Finding information or content
-- Interaction: Clicking, filling forms, scrolling
-- Validation: Checking if actions succeeded
+AUTONOMOUS TASK CATEGORIES:
+- Navigation: Moving between pages/sites (use proven URLs from templates when available)
+- Search: Finding information or content (leverage template search strategies)
+- Interaction: Clicking, filling forms, scrolling (use template-specific selectors/approaches)
+- Data Collection: Extract and organize information (follow template data patterns)
+- Validation: Checking if actions succeeded (template-based success criteria)
 - Data Extraction: Gathering specific information
 - Synthesis: Combining information from multiple sources
 
@@ -315,19 +364,20 @@ Current Context:
 - Page Content: ${context.pageContent ? context.pageContent.substring(0, 500) + '...' : 'Not available'}
 
 Available Tools (ONLY use these exact tool names):
-- goto_url: Go to a specific URL
-- click_element: Click on elements using CSS selectors
-- type_text: Fill input fields with text
-- scroll_to: Scroll to find more content. direction must be "up", "down", "top" or "bottom".
-- wait_for_selector: Wait for elements to appear
+- navigateToUrl: Go to a specific URL
+- clickElement: Click on elements using CSS selectors
+- typeText: Fill input fields with text
+- scrollTo: Scroll to find more content. direction must be "up", "down", "top" or "bottom".
+- waitForSelector: Wait for elements to appear
 - take_screenshot: Take a screenshot
 - done: Mark task as complete
 
 For YouTube tasks, follow this approach:
 1. If not on YouTube, navigate to youtube.com first
-2. Use the search box to search for content (use "type_text" tool)
+2. Use the search box to search for content (use "typeText" tool)
 3. Click on relevant video results
 4. Handle any popups or overlays that might appear
+5. When the page shows indexed overlays, prefer using a robust CSS selector that includes text or a unique attribute. Use "elementIndex" only as a last resort if a stable selector cannot be found.
 
 Important YouTube selectors:
 - Search box: 'input#search' or '[name="search_query"]'
@@ -337,13 +387,13 @@ Important YouTube selectors:
 
 Return your next action as JSON (use ONLY the exact tool names listed above):
 {
-  "tool": "goto_url|click_element|type_text|scroll_to|wait_for_selector|take_screenshot|done",
+  "tool": "navigateToUrl|clickElement|typeText|scrollTo|waitForSelector|take_screenshot|done",
   "params": {
-    "url": "https://youtube.com" (for goto_url only),
-    "selector": "CSS selector" (for click_element/type_text/scroll_to/wait_for_selector),
-    "text": "text to type" (for type_text only),
-    "direction": "up|down|top|bottom" (for scroll_to only),
-    "timeoutMs": 5000 (for wait_for_selector only)
+    "url": "https://youtube.com" (for navigateToUrl only),
+    "selector": "CSS selector" (for clickElement/typeText/scrollTo/waitForSelector),
+    "text": "text to type" (for typeText only),
+    "direction": "up|down|top|bottom" (for scrollTo only),
+    "timeoutMs": 5000 (for waitForSelector only)
   },
   "rationale": "Why this action will help achieve the goal",
   "done": false
@@ -368,11 +418,11 @@ Current Context:
 - Last Observation: ${context.lastObservation || 'None'}
 
 Available Tools (ONLY use these exact tool names):
-- goto_url: Go to a specific URL
-- click_element: Click on elements using CSS selectors
-- type_text: Fill input fields with text
-- scroll_to: Scroll to find more content
-- wait_for_selector: Wait for elements to appear
+- navigateToUrl: Go to a specific URL
+- clickElement: Click on elements using CSS selectors
+- typeText: Fill input fields with text
+- scrollTo: Scroll to find more content
+- waitForSelector: Wait for elements to appear
 - take_screenshot: Take a screenshot to see current state
 - done: Mark task as complete
 
@@ -383,16 +433,17 @@ Action Guidelines:
 4. Click on relevant links or buttons to progress toward the goal
 5. Fill forms or input fields as needed
 6. Wait for elements to load when necessary
+7. Prefer using a robust CSS "selector" that includes text or a unique attribute. Use "elementIndex" (overlay number) only as a last resort if a stable selector cannot be found.
 
 Return your next action as JSON (use ONLY the exact tool names listed above):
 {
-  "tool": "goto_url|click_element|type_text|scroll_to|wait_for_selector|take_screenshot|done",
+  "tool": "navigateToUrl|clickElement|typeText|scrollTo|waitForSelector|take_screenshot|done",
   "params": {
-    "url": "full URL" (for goto_url only),
-    "selector": "CSS selector" (for click_element/type_text/scroll_to/wait_for_selector),
-    "text": "text to type" (for type_text only),
-    "direction": "up|down|top|bottom" (for scroll_to only),
-    "timeoutMs": 5000 (for wait_for_selector only)
+    "url": "full URL" (for navigateToUrl only),
+    "selector": "CSS selector" (for clickElement/typeText/scrollTo/waitForSelector),
+    "text": "text to type" (for typeText only),
+    "direction": "up|down|top|bottom" (for scrollTo only),
+    "timeoutMs": 5000 (for waitForSelector only)
   },
   "rationale": "Brief explanation of why this action helps achieve the goal",
   "done": false
@@ -410,89 +461,77 @@ function buildSelfCorrectPrompt(fullGoal, currentSubTask, context = {}) {
     history = [],
     failedAction = {},
     observation = "",
+    errorInfo = {}, // Enhanced error info
     taskContext = {},
     attemptCount = 1
   } = context || {};
-  
-  const historyLog = history.map((h, i) => {
+
+  const historyLog = history.slice(-3).map((h, i) => {
     const success = h.observation && !h.observation.toLowerCase().includes('failed') && !h.observation.toLowerCase().includes('error');
-    return `Step ${i + 1}: ${success ? '✓' : '✗'}
-- Action: ${JSON.stringify(h.action)}
-- Observation: ${h.observation}`;
-  }).join("\n\n");
+    return `Step ${history.length - 3 + i}: ${success ? '✓' : '✗'} Action: ${h.action?.tool}, Params: ${JSON.stringify(h.action?.params)}, Observation: ${(h.observation || "").substring(0, 80)}`;
+  }).join("\n");
 
-  const elementsLog = interactiveElements.length > 0
-    ? `Available Interactive Elements:
----
-${JSON.stringify(interactiveElements.slice(0, 15), null, 2)}
----`
-    : "No interactive elements found - may need navigation or page refresh.";
+  const trimmedElements = interactiveElements.slice(0, 12).map(el => ({
+    idx: (el.index !== undefined ? el.index : (el.idx !== undefined ? el.idx : (el.elementIndex !== undefined ? el.elementIndex : null))),
+    tag: el.tag || el.tagName || null,
+    id: el.id || null,
+    name: el.name || null,
+    label: el.label || el.ariaLabel || null,
+    placeholder: el.placeholder || null,
+    text: el.text ? (el.text.length > 60 ? el.text.slice(0, 60) + '...' : el.text) : null,
+    role: el.role || null,
+    score: (el.score !== undefined ? el.score : null)
+  }));
 
-  // Analyze failure patterns
+  const elementsLog = trimmedElements.length > 0
+    ? `Available Interactive Elements (Top 12, trimmed):\n---\n${JSON.stringify(trimmedElements, null, 2)}\n---`
+    : "No interactive elements found.";
+
   const failureAnalysis = analyzeFailurePattern(failedAction, observation, history);
   const recoveryStrategy = suggestRecoveryStrategy(failedAction, observation, history, attemptCount);
 
   return (
-`You are an intelligent web automation agent with advanced error recovery capabilities. You just encountered a failure and need to adapt your strategy.
+`You are an expert error recovery agent. Your task is to analyze a failed web automation action and propose a single, precise correction to fix it.
 
-MISSION CONTEXT:
-Overall Goal: ${fullGoal}
-Current Sub-Task: ${currentSubTask}
-Task Type: ${taskContext.taskType || 'general'}
-Attempt #: ${attemptCount}
+MISSION:
+- Overall Goal: ${fullGoal}
+- Current Sub-Task: ${currentSubTask}
 
-CURRENT ENVIRONMENT:
-Page: ${title} (${url})
-Elements Available: ${interactiveElements.length}
+FAILURE CONTEXT:
+- Page: ${title} (${url})
+- Failed Action: ${JSON.stringify(failedAction)}
+- Observation: "${observation}"
+- Error Code: "${errorInfo.code || 'N/A'}"
+- Attempt: ${attemptCount}
 
+ANALYSIS & STRATEGY:
+- Failure Analysis: ${failureAnalysis}
+- Suggested Strategy: ${recoveryStrategy}
+
+AVAILABLE ELEMENTS & HISTORY:
 ${elementsLog}
 
-FAILURE ANALYSIS:
-${failureAnalysis}
-
-RECOVERY STRATEGY:
-${recoveryStrategy}
-
-EXECUTION HISTORY (last ${Math.min(history.length, 8)} steps):
+Recent History (last 3 steps):
 ---
-${historyLog || "No previous actions"}
+${historyLog || "No recent actions."}
 ---
 
-FAILED ACTION DETAILS:
-Action: ${JSON.stringify(failedAction)}
-Result: ${observation}
-Error Type: ${categorizeError(observation)}
+INSTRUCTIONS:
+1.  **Analyze the Root Cause**: Based on the observation, error code, and available elements, determine why the action failed.
+2.  **Propose a Correction**: Generate a *single* new action to overcome the failure.
+3.  **Prioritize Small Changes**: Prefer modifying the failed action (e.g., correcting a selector or index) over drastic changes like navigating away.
+4.  **Avoid Redundant Sensing**: If interactive elements are already available or page content was just read, do NOT propose "readPageContent" or "getInteractiveElements" again. Advance with a concrete action (e.g., clickElement, typeText, waitForSelector, scrollTo).
+5.  **Use Reliable Selectors**: Prefer correcting the CSS selector to be more specific (e.g., using text or an \`aria-label\`). Use \`elementIndex\` only as a last resort if a stable selector cannot be found.
+6.  **Be Precise**: Do not explain or chat. Your entire response must be a single JSON object.
 
-RECOVERY DECISION FRAMEWORK:
-1. ROOT CAUSE: What specifically caused the failure?
-2. ALTERNATIVES: What other approaches could work?
-3. CONTEXT: Has the page state changed since the action was planned?
-4. PROGRESSION: Should we try a variation or completely different approach?
-5. FALLBACK: Should we navigate elsewhere or try a different sub-task?
-
-RECOVERY OPTIONS (in order of preference):
-A) RETRY WITH VARIATION: Modify the failed action (different selector, timing, etc.)
-B) ALTERNATIVE APPROACH: Try a completely different method for the same goal
-C) CONTEXT REFRESH: Take screenshot, scroll, or wait for page changes
-D) NAVIGATION RECOVERY: Go to a different page or restart the flow
-E) SUB-TASK SKIP: Mark current sub-task as done and move to next
-
-Page Content Preview (first 1500 chars):
----
-${(pageContent || "").substring(0, 1500)}${pageContent && pageContent.length > 1500 ? "..." : ""}
----
-
-Based on the failure analysis and available options, return your recovery action:
+Respond with ONLY a valid JSON object for the corrected action:
 {
-  "tool": "navigate|goto_url|click_element|type_text|scroll_to|wait_for_selector|take_screenshot|tabs.query|tabs.activate|tabs.close|done",
-  "params": { /* parameters for the recovery action */ },
-  "rationale": "Detailed explanation of why this recovery approach will work",
-  "confidence": 0.75,
-  "recoveryType": "retry|alternative|refresh|navigate|skip",
+  "tool": "...",
+  "params": { ... },
+  "rationale": "A brief, clear reason for this specific correction.",
+  "confidence": 0.9,
   "done": false
-}
-
-Choose a recovery action that addresses the root cause and maximizes chance of success.`
+}`
   );
 }
 
@@ -540,12 +579,12 @@ function suggestRecoveryStrategy(failedAction, observation, history, attemptCoun
   }
   
   // Specific strategies based on action type
-  if (failedAction.tool === 'click') {
-    strategies.push("Click failure options: try different selector, wait for element, or scroll to element");
-  } else if (failedAction.tool === 'fill') {
-    strategies.push("Fill failure options: try different selector, clear field first, or use different input method");
-  } else if (failedAction.tool === 'navigate') {
-    strategies.push("Navigation failure options: retry with delay, check URL validity, or try alternative URL");
+  if (failedAction.tool === 'clickElement') {
+      strategies.push("Click failure options: try a more specific CSS selector, use 'waitForSelector' before clicking, or scroll the element into view.");
+  } else if (failedAction.tool === 'typeText') {
+      strategies.push("Type failure options: ensure the element is a visible input/textarea, try clearing the field first, or use a different selector.");
+  } else if (failedAction.tool === 'navigateToUrl') {
+      strategies.push("Navigation failure options: double-check the URL for typos, try a different URL, or check for network issues.");
   }
   
   return strategies.join('\n');
@@ -661,30 +700,30 @@ DISCOVERED URLS & LINKS:
 ${context.interactiveElements ? analyzePageUrls(context.interactiveElements) : 'No URL analysis available'}
 
 AVAILABLE RESEARCH TOOLS:
-- read_page_content: Read and process the full content of the current page. This should be used after navigating to a new page.
+- readPageContent: Read and process the full content of the current page. This should be used after navigating to a new page.
 - smart_navigate: Intelligently navigate to the best source for your query (location-aware)
 - multi_search: Perform multiple location-aware searches for comprehensive results
 - research_url: Automatically research a specific URL with depth control (supports recursive reading)
 - analyze_url_depth: Analyze if current page URLs are worth reading deeper
-- analyze_urls: Analyze all URLs on current page for research relevance
-- get_page_links: Extract and rank relevant links from current page
-- navigate|goto_url: Go to a specific URL
-- click_element: Click on elements using CSS selectors
-- type_text: Fill input fields with text
-- scroll_to: Scroll to find more content
-- wait_for_selector: Wait for elements to appear
+- analyzeUrls: Analyze all URLs on current page for research relevance
+- extractLinks: Extract and rank relevant links from current page
+- navigateToUrl: Go to a specific URL
+- clickElement: Click on elements using CSS selectors
+- typeText: Fill input fields with text
+- scrollTo: Scroll to find more content
+- waitForSelector: Wait for elements to appear
 - take_screenshot: Take a screenshot for visual analysis
-- extract_structured_content: Get enhanced content extraction with metadata
+- extractStructuredContent: Get enhanced content extraction with metadata
 - extract_with_regex: Extract specific information from text using a regex pattern.
-- record_finding: Saves a structured data object to your findings. CRITICAL: All data MUST be passed in a single 'finding' object. DO NOT invent other parameters. Example: { "tool": "record_finding", "params": { "finding": { "exchange_rate": "3.45", "currency_pair": "SGD_to_MYR" } } }
-- generate_report: Create a comprehensive research report. You can only use this when the success criteria are met.
+- recordFinding: Saves a structured data object to your findings. CRITICAL: All data MUST be passed in a single 'finding' object. DO NOT invent other parameters. Example: { "tool": "recordFinding", "params": { "finding": { "exchange_rate": "3.45", "currency_pair": "SGD_to_MYR" } } }
+- generateReport: Create a comprehensive research report. You can only use this when the success criteria are met.
 - done: Mark research complete. You can only use this when the success criteria are met.
 
 // CORE_ACTION_LOOP:
-// 1. **Sense**: After navigating, ALWAYS use \`read_page_content\` to understand the environment.
-// 2. **Extract**: Use tools like \`extract_structured_content\` to get specific data.
+// 1. **Sense**: After navigating, ALWAYS use \`readPageContent\` to understand the environment.
+// 2. **Extract**: Use tools like \`extractStructuredContent\` to get specific data.
 // 3. **Validate**: Check if the extracted data fits the SUCCESS CRITERIA.
-// 4. **Record**: Use \`record_finding\` to save the validated data.
+// 4. **Record**: Use \`recordFinding\` to save the validated data.
 // 5. **Repeat**: Continue until all success criteria are met.
 
 LOCATION-AWARE FEATURES:
@@ -709,7 +748,7 @@ Consider these factors for your next action:
 4. **Research Depth**: Do you need more specific or general information?
 5. **Synthesis Readiness**: Do you have enough information to provide comprehensive insights?
 
-// **CRITICAL RULE 1: DO NOT use the \`generate_report\` tool until you have gathered sufficient information from at least 2-3 different sources.** If you have not gathered enough information, you MUST use tools like \`smart_navigate\`, \`research_url\`, or \`multi_search\` first.
+// **CRITICAL RULE 1: DO NOT use the \`generateReport\` tool until you have gathered sufficient information from at least 2-3 different sources.** If you have not gathered enough information, you MUST use tools like \`smart_navigate\`, \`research_url\`, or \`multi_search\` first.
 // **CRITICAL RULE 2: DO NOT be repetitive. If you have already performed a search, analyze the results and navigate to a link. Do not perform the same search again.**
 
 HUMAN-LIKE RESEARCH BEHAVIOR:

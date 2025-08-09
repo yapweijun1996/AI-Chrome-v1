@@ -17,6 +17,7 @@ const MSG = window.MessageTypes?.MSG || {
   AGENT_STATUS: "AGENT_STATUS",
   AGENT_LOG: "AGENT_LOG",
   AGENT_PROGRESS: "AGENT_PROGRESS",
+  AGENT_STATUS_UPDATE: "AGENT_STATUS_UPDATE",
   AGENT_FINDING: "AGENT_FINDING",
   SHOW_REPORT: "SHOW_REPORT",
   AGENT_ACTION_RESULT: "AGENT_ACTION_RESULT",
@@ -73,6 +74,10 @@ const els = {
   qaNavigate: document.getElementById("qaNavigate"),
   contextChips: document.getElementById("contextChips"),
   
+  // Automation Templates
+  automationTemplates: document.getElementById("automationTemplates"),
+  templatesGrid: document.getElementById("templatesGrid"),
+  
   // Legacy quick actions (compat)
   btnSummarize: document.getElementById("btnSummarize"),
   btnAgentMode: document.getElementById("btnAgentMode"),
@@ -95,6 +100,12 @@ const els = {
   taskTitle: document.getElementById("taskTitle"),
   addTaskBtn: document.getElementById("addTaskBtn"),
   taskList: document.getElementById("taskList"),
+  // Feature flags (Graph/Planner)
+  featureFlags: document.getElementById("featureFlags"),
+  flagGraphMode: document.getElementById("flagGraphMode"),
+  flagFastMode: document.getElementById("flagFastMode"),
+  flagReactPlanner: document.getElementById("flagReactPlanner"),
+  plannerStatusPill: document.getElementById("plannerStatusPill"),
 };
 
 const storageKeys = {
@@ -1682,15 +1693,33 @@ function wireBasics() {
 // Listen for background logs
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === MSG.AGENT_LOG && message.entry) {
-    addAgentLogToChat(message.entry);
-    if (message.entry.step !== undefined && currentPlanMessage) {
-      updatePlan(message.entry.step);
+    const entry = message.entry;
+    // Update planner status pill based on background telemetry
+    try {
+      if (entry?.msg === "Graph mode starting") {
+        const kind = entry.planner === "react" ? "react" : "linear";
+        setPlannerStatusPill(kind);
+        try { chrome.storage.local.set({ LAST_PLANNER_USED: kind }); } catch (_) {}
+      } else if (entry?.msg === "ReAct plan generated") {
+        setPlannerStatusPill("react");
+        try { chrome.storage.local.set({ LAST_PLANNER_USED: "react" }); } catch (_) {}
+      } else if (entry?.msg === "Agentic loop started") {
+        setPlannerStatusPill("legacy");
+        try { chrome.storage.local.set({ LAST_PLANNER_USED: "legacy" }); } catch (_) {}
+      }
+      try { updatePlannerStatsTooltip(); } catch (_) {}
+    } catch (_) {}
+    addAgentLogToChat(entry);
+    if (entry.step !== undefined && currentPlanMessage) {
+      updatePlan(entry.step);
     }
   } else if (message?.type === MSG.AGENT_PROGRESS && message.message) {
     updateStatusBubble(message.message, message.step, message.timestamp);
     if (typeof updateStepperProgress === 'function') {
       updateStepperProgress(message.step, message.totalSteps, message.message);
     }
+  } else if (message?.type === MSG.AGENT_STATUS_UPDATE && message.message) {
+    updateStatusBubble(message.message, currentAgentSession?.step, message.timestamp);
   } else if (message?.type === MSG.AGENT_FINDING && message.finding) {
     addFindingMessage(message.finding, message.timestamp);
   } else if (message?.type === MSG.SHOW_REPORT && message.report) {
@@ -1774,6 +1803,8 @@ async function loadChatHistoryOnStart() {
 
 async function main() {
   wireBasics();
+  await initFeatureFlagsUI();
+  await initPlannerStatusPillFromStorage();
   await loadAgentSettings();
   await initTasksUI();
   await loadChatHistoryOnStart();
@@ -2086,30 +2117,77 @@ function addFindingMessage(finding, timestamp) {
 
   switch (tool) {
     case 'record_finding':
+    case 'recordFinding':
       contentHtml = `
         <div class="action-result-bubble">
           <div class="action-result-title">✅ Finding Recorded</div>
           <div class="action-result-content"><pre><code>${escapeHtml(JSON.stringify(data, null, 2))}</code></pre></div>
         </div>`;
       break;
+
     case 'read_page_content':
+    case 'readPageContent':
       contentHtml = `
         <div class="action-result-bubble">
           <div class="action-result-title">📄 Page Content Read</div>
           <div class="action-result-content">
-            <p>${escapeHtml(data.summary)}</p>
-            <a href="${escapeHtml(data.url)}" target="_blank" class="action-result-link">${escapeHtml(data.title)}</a>
+            <p>${escapeHtml(data?.summary || '')}</p>
+            <a href="${escapeHtml(data?.url || '')}" target="_blank" class="action-result-link">${escapeHtml(data?.title || 'Page')}</a>
           </div>
         </div>`;
       break;
+
     case 'navigate':
+    case 'goto_url':
+    case 'navigateToUrl':
       contentHtml = `
         <div class="action-result-bubble">
           <div class="action-result-title">🌐 Navigation Complete</div>
           <div class="action-result-content">
             <p>Navigated to:</p>
-            <a href="${escapeHtml(data.url)}" target="_blank" class="action-result-link">${escapeHtml(data.title)}</a>
+            <a href="${escapeHtml(data?.url || '')}" target="_blank" class="action-result-link">${escapeHtml(data?.title || data?.url || '')}</a>
           </div>
+        </div>`;
+      break;
+
+    case 'click_element':
+    case 'clickElement':
+    case 'click': {
+      const idx = (data && Number.isFinite(data.elementIndex)) ? `#\${data.elementIndex}` : '';
+      const sel = data && data.selector ? `"\${escapeHtml(String(data.selector).slice(0, 120))}"` : '';
+      const target = idx || sel || 'element';
+      contentHtml = `
+        <div class="action-result-bubble">
+          <div class="action-result-title">👆 Clicked</div>
+          <div class="action-result-content"><p>Target: ${target}</p></div>
+        </div>`;
+      break;
+    }
+
+    case 'type_text':
+    case 'typeText':
+    case 'fill': {
+      const idx = (data && Number.isFinite(data.elementIndex)) ? `#\${data.elementIndex}` : '';
+      const sel = data && data.selector ? `"\${escapeHtml(String(data.selector).slice(0, 120))}"` : '';
+      const target = idx || sel || 'field';
+      const preview = data && typeof data.textPreview === 'string' ? escapeHtml(data.textPreview) : '';
+      contentHtml = `
+        <div class="action-result-bubble">
+          <div class="action-result-title">✏️ Typed</div>
+          <div class="action-result-content">
+            <p>Into: ${target}</p>
+            ${preview ? `<p>Text: "${preview}"</p>` : ''}
+          </div>
+        </div>`;
+      break;
+    }
+
+    default:
+      // Fallback generic renderer for unknown tools
+      contentHtml = `
+        <div class="action-result-bubble">
+          <div class="action-result-title">🔧 ${escapeHtml(tool || 'Action')}</div>
+          <div class="action-result-content"><pre><code>${escapeHtml(JSON.stringify(data, null, 2))}</code></pre></div>
         </div>`;
       break;
   }
@@ -2200,3 +2278,314 @@ function formatChatError(error) {
   // Default error message with the actual error for debugging
   return `❌ **Unexpected Error**\n\nSomething went wrong while processing your request.\n\n**Error details:** ${errorMessage}\n\n**You can try:**\n• Refreshing the page\n• Restarting the extension\n• Checking the browser console for more details`;
 }
+// ===== Feature Flags UI (Graph Mode + ReAct Planner) =====
+async function initFeatureFlagsUI() {
+  try {
+    const g = await chrome.storage.local.get(["EXPERIMENTAL_GRAPH_MODE", "REACT_PLANNER_MODE", "FAST_MODE"]);
+    const graphOn = !!g.EXPERIMENTAL_GRAPH_MODE;
+    const reactExplicit = (typeof g.REACT_PLANNER_MODE === "boolean") ? g.REACT_PLANNER_MODE : undefined;
+    const reactEffective = (reactExplicit !== undefined) ? reactExplicit : (graphOn ? true : false);
+    const fastMode = !!g.FAST_MODE;
+
+    // Initialize controls
+    if (els.flagGraphMode) els.flagGraphMode.checked = graphOn;
+    if (els.flagFastMode) els.flagFastMode.checked = fastMode;
+    if (els.flagReactPlanner) {
+      els.flagReactPlanner.checked = reactEffective;
+      els.flagReactPlanner.disabled = !graphOn;
+    }
+
+    // Listeners
+    els.flagGraphMode?.addEventListener("change", async (e) => {
+      const on = !!e.target.checked;
+      await chrome.storage.local.set({ EXPERIMENTAL_GRAPH_MODE: on });
+
+      // Enable/disable React planner toggle; when enabling Graph mode and RPM is unset, default UI to true
+      try {
+        const { REACT_PLANNER_MODE } = await chrome.storage.local.get(["REACT_PLANNER_MODE"]);
+        if (els.flagReactPlanner) {
+          els.flagReactPlanner.disabled = !on;
+          els.flagReactPlanner.checked = (typeof REACT_PLANNER_MODE === "boolean") ? REACT_PLANNER_MODE : (on ? true : false);
+        }
+      } catch (_) {}
+
+      try { showToast(`Graph Mode ${on ? "enabled" : "disabled"}`, on ? "success" : "warn"); } catch (_) {}
+    });
+
+    els.flagReactPlanner?.addEventListener("change", async (e) => {
+      const on = !!e.target.checked;
+      await chrome.storage.local.set({ REACT_PLANNER_MODE: on });
+      try { showToast(`ReAct Planner ${on ? "enabled" : "disabled"}`, on ? "success" : "warn"); } catch (_) {}
+    });
+
+    els.flagFastMode?.addEventListener("change", async (e) => {
+      const on = !!e.target.checked;
+      await chrome.storage.local.set({ FAST_MODE: on });
+      // Reduce nonessential logging when Fast Mode is ON
+      try { chrome.runtime.sendMessage({ type: "MSG.LOG_SET_CONFIG", config: { level: on ? "warn" : "info" } }); } catch (_) {}
+      try { showToast(`Fast Mode ${on ? "enabled" : "disabled"}`, on ? "success" : "warn"); } catch (_) {}
+    });
+  } catch (e) {
+    console.warn("initFeatureFlagsUI failed:", e);
+  }
+}
+
+// Minimal status pill updater driven by background telemetry (AgentLog)
+function setPlannerStatusPill(kind) {
+  const pill = els.plannerStatusPill;
+  if (!pill) return;
+  pill.classList.remove("react", "linear", "legacy");
+  let label = "Linear";
+  if (kind === "react") {
+    pill.classList.add("react");
+    label = "ReAct";
+  } else if (kind === "legacy") {
+    pill.classList.add("legacy");
+    label = "Legacy";
+  } else {
+    pill.classList.add("linear");
+    label = "Linear";
+  }
+  pill.textContent = `Planner: ${label}`;
+  pill.title = `Planner used for last run: ${label}`;
+  // Append usage counters asynchronously
+  try { updatePlannerStatsTooltip(); } catch (_) {}
+}
+
+// Initialize the planner status pill from persisted storage
+async function initPlannerStatusPillFromStorage() {
+  try {
+    const { LAST_PLANNER_USED } = await chrome.storage.local.get("LAST_PLANNER_USED");
+    const val = String(LAST_PLANNER_USED || "").toLowerCase();
+    if (val === "react" || val === "linear" || val === "legacy") {
+      setPlannerStatusPill(val);
+    } else {
+      setPlannerStatusPill("linear");
+    }
+  } catch (_) {
+    setPlannerStatusPill("linear");
+  }
+  try { await updatePlannerStatsTooltip(); } catch (_) {}
+}
+
+// Read PLANNER_STATS and update the pill tooltip to show usage counts
+async function updatePlannerStatsTooltip() {
+  try {
+    const pill = els.plannerStatusPill;
+    if (!pill) return;
+    const { PLANNER_STATS } = await chrome.storage.local.get("PLANNER_STATS");
+    const s = PLANNER_STATS || {};
+    const react = Number(s?.react || 0);
+    const linear = Number(s?.linear || 0);
+    const legacy = Number(s?.legacy || 0);
+    const base = (pill.title && pill.title.split && pill.title.split("\n")[0]) || pill.title || "Planner";
+    pill.title = `${base}\nReAct: ${react}, Linear: ${linear}, Legacy: ${legacy}`;
+  } catch (_) {
+    // no-op
+  }
+}
+
+/* ---------- Automation Templates ---------- */
+
+// Template icons for different categories
+const TEMPLATE_ICONS = {
+  'ecommerce': '🛒',
+  'socialMedia': '📱',
+  'research': '🔍',
+  'productivity': '⚡',
+  'media': '🎵'
+};
+
+// Initialize automation templates UI
+function initAutomationTemplates() {
+  if (!window.AutomationTemplates || !els.templatesGrid) return;
+  
+  // Get featured templates (2-3 from each category)
+  const featuredTemplates = [
+    // E-commerce
+    window.AutomationTemplates.getEcommerceTemplates()['product-research'],
+    window.AutomationTemplates.getEcommerceTemplates()['price-tracking'],
+    
+    // Research  
+    window.AutomationTemplates.getResearchTemplates()['market-research'],
+    window.AutomationTemplates.getResearchTemplates()['news-aggregation'],
+    
+    // Productivity
+    window.AutomationTemplates.getProductivityTemplates()['data-collection'],
+    window.AutomationTemplates.getProductivityTemplates()['email-management']
+  ].filter(Boolean);
+  
+  // Clear and populate templates grid
+  els.templatesGrid.innerHTML = '';
+  
+  featuredTemplates.forEach(template => {
+    const card = createTemplateCard(template);
+    els.templatesGrid.appendChild(card);
+  });
+  
+  // Add "More Templates" card
+  const moreCard = createMoreTemplatesCard();
+  els.templatesGrid.appendChild(moreCard);
+}
+
+// Create individual template card
+function createTemplateCard(template) {
+  const card = document.createElement('div');
+  card.className = 'template-card';
+  card.dataset.templateId = template.id;
+  
+  // Determine category for icon
+  const category = Object.keys(TEMPLATE_ICONS).find(cat => 
+    window.AutomationTemplates.getAllTemplates()[cat]?.[template.id]
+  ) || 'productivity';
+  
+  const icon = TEMPLATE_ICONS[category] || '🤖';
+  
+  card.innerHTML = `
+    <span class="template-icon">${icon}</span>
+    <div class="template-name">${template.name}</div>
+    <div class="template-desc">${template.description}</div>
+    <div class="template-badge">Auto</div>
+  `;
+  
+  // Add click handler to start automation
+  card.addEventListener('click', () => {
+    startTemplateAutomation(template);
+  });
+  
+  return card;
+}
+
+// Create "More Templates" card
+function createMoreTemplatesCard() {
+  const card = document.createElement('div');
+  card.className = 'template-card';
+  card.innerHTML = `
+    <span class="template-icon">⚙️</span>
+    <div class="template-name">More Templates</div>
+    <div class="template-desc">Explore all automation workflows</div>
+  `;
+  
+  card.addEventListener('click', () => {
+    showAllTemplatesModal();
+  });
+  
+  return card;
+}
+
+// Start automation from template
+async function startTemplateAutomation(template) {
+  if (!await checkApiKeyWarn()) return;
+  
+  // Create goal from template
+  const goal = window.AutomationTemplates.createGoalFromTemplate(template);
+  
+  // Use template settings
+  const settings = {
+    allowCrossDomain: true,
+    allowTabMgmt: true,
+    autoScreenshots: template.settings?.autoScreenshots || false,
+    maxSteps: template.settings?.maxSteps || 15,
+    timeoutMs: template.settings?.timeoutMs || 6000
+  };
+  
+  // Add messages
+  addMessage('user', `🤖 Start ${template.name}`);
+  addMessage('assistant', `Starting autonomous ${template.name.toLowerCase()}. I'll follow the proven workflow for this task type and keep you updated on my progress.`);
+  
+  try {
+    const res = await bgSend({ type: MSG.AGENT_RUN, goal, settings });
+    if (!res?.ok) {
+      const errorMsg = getAgentErrorMessage(res?.error, res?.errorType);
+      addMessage('assistant', `Failed to start automation: ${errorMsg}`);
+    } else {
+      startStatusMonitoring();
+      showToast(`${template.name} automation started`, 'success');
+    }
+  } catch (error) {
+    addMessage('assistant', `Error starting automation: ${error.message}`);
+  }
+}
+
+// Show modal with all available templates
+function showAllTemplatesModal() {
+  // Create modal dynamically
+  const modal = document.createElement('div');
+  modal.className = 'modal show';
+  modal.innerHTML = `
+    <div class="modal-content" style="max-width: 700px;">
+      <div class="modal-header">
+        <h3>🤖 Automation Templates</h3>
+        <button class="close-btn">&times;</button>
+      </div>
+      <div class="modal-body" style="max-height: 70vh; overflow-y: auto;">
+        <div class="templates-categories"></div>
+      </div>
+    </div>
+  `;
+  
+  document.body.appendChild(modal);
+  
+  // Populate categories
+  const categoriesContainer = modal.querySelector('.templates-categories');
+  const allTemplates = window.AutomationTemplates.getAllTemplates();
+  
+  Object.entries(allTemplates).forEach(([categoryKey, templates]) => {
+    const categorySection = document.createElement('div');
+    categorySection.className = 'template-category';
+    
+    const categoryTitle = {
+      'ecommerce': '🛒 E-commerce & Shopping',
+      'socialMedia': '📱 Social Media',
+      'research': '🔍 Research & Analysis', 
+      'productivity': '⚡ Productivity',
+      'media': '🎵 Media & Entertainment'
+    }[categoryKey] || categoryKey;
+    
+    categorySection.innerHTML = `
+      <h4 style="margin-bottom: 8px; color: var(--accent);">${categoryTitle}</h4>
+      <div class="category-templates" style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px;"></div>
+    `;
+    
+    const templatesGrid = categorySection.querySelector('.category-templates');
+    Object.values(templates).forEach(template => {
+      const card = createTemplateCard(template);
+      card.style.fontSize = '11px';
+      templatesGrid.appendChild(card);
+    });
+    
+    categoriesContainer.appendChild(categorySection);
+  });
+  
+  // Close handler
+  modal.querySelector('.close-btn').addEventListener('click', () => {
+    modal.remove();
+  });
+  
+  // Click outside to close
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) {
+      modal.remove();
+    }
+  });
+}
+
+// Error handling for template automation
+function getAgentErrorMessage(error, errorType) {
+  switch (errorType) {
+    case ERROR_TYPES.AGENT_ALREADY_RUNNING:
+      return "An agent is already running. Please wait for it to finish or use the STOP button.";
+    case ERROR_TYPES.RESTRICTED_URL:
+      return "Cannot run automation on this page. Try navigating to a regular website first.";
+    case ERROR_TYPES.CONTENT_SCRIPT_UNAVAILABLE:
+      return "Unable to access this page. Please refresh or navigate to a different site.";
+    default:
+      return error || "Unknown error occurred";
+  }
+}
+
+// Initialize templates when page loads
+document.addEventListener('DOMContentLoaded', () => {
+  // Small delay to ensure AutomationTemplates is loaded
+  setTimeout(initAutomationTemplates, 100);
+});

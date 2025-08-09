@@ -14,12 +14,14 @@
   const API_KEY_ROTATION = MT.API_KEY_ROTATION || {
     MAX_KEYS: 10,
     RETRY_DELAY_MS: 1000,
-    KEY_COOLDOWN_MS: 300000,
+    KEY_COOLDOWN_MS: 300000, // 5 minutes for general failures
+    KEY_QUOTA_COOLDOWN_MS: 60000, // 1 minute for quota errors
     MAX_CONSECUTIVE_FAILURES: 3,
     HEALTH_CHECK_INTERVAL_MS: 60000
   };
   const ERROR_TYPES = MT.ERROR_TYPES || {
-    AUTHENTICATION_ERROR: "AUTHENTICATION_ERROR"
+    AUTHENTICATION_ERROR: "AUTHENTICATION_ERROR",
+    QUOTA_EXCEEDED: "QUOTA_EXCEEDED"
   };
   const LOG_LEVELS = MT.LOG_LEVELS || {
     ERROR: "error", WARN: "warn", INFO: "info", DEBUG: "debug"
@@ -27,7 +29,7 @@
 
   class ApiKeyManager {
   constructor() {
-    this.keys = []; // Array of { key, name, status, consecutiveFailures, lastFailure, lastUsed }
+    this.keys = []; // Array of { key, name, status, consecutiveFailures, lastFailure, lastUsed, cooldownUntil }
     this.currentIndex = 0;
     this.healthCheckInterval = null;
     this.initialized = false;
@@ -48,7 +50,8 @@
           status: 'active',
           consecutiveFailures: 0,
           lastFailure: null,
-          lastUsed: null
+          lastUsed: null,
+          cooldownUntil: null
         }];
         await this.saveKeys();
       } else if (result.GEMINI_API_KEYS) {
@@ -91,7 +94,8 @@
       status: 'active',
       consecutiveFailures: 0,
       lastFailure: null,
-      lastUsed: null
+      lastUsed: null,
+      cooldownUntil: null
     };
 
     this.keys.push(keyObj);
@@ -135,16 +139,32 @@
     if (key.status === 'disabled') return false;
 
     // If status drifted but no failure metadata, treat as active
-    if (key.status === 'cooldown' && (!key.lastFailure || !Number.isFinite(key.lastFailure))) {
+    if (key.status === 'cooldown' && !key.cooldownUntil && !key.lastFailure) {
       key.status = 'active';
       key.consecutiveFailures = 0;
+      key.cooldownUntil = null;
       return true;
     }
-    
-    // Check if key is in cooldown after failures
+
+    // Check if key is in a specific cooldown period
+    if (key.status === 'cooldown' && key.cooldownUntil) {
+      if (Date.now() < key.cooldownUntil) {
+        return false; // Still in cooldown
+      } else {
+        // Cooldown finished
+        key.status = 'active';
+        key.consecutiveFailures = 0;
+        key.lastFailure = null;
+        key.cooldownUntil = null;
+        return true;
+      }
+    }
+
+    // Check for general failure cooldown (legacy)
     if (key.lastFailure && (key.consecutiveFailures || 0) >= API_KEY_ROTATION.MAX_CONSECUTIVE_FAILURES) {
       const cooldownEnd = key.lastFailure + API_KEY_ROTATION.KEY_COOLDOWN_MS;
       if (Date.now() < cooldownEnd) {
+        key.status = 'cooldown'; // Ensure status is set
         return false;
       } else {
         // Reset after cooldown window
@@ -154,7 +174,7 @@
         return true;
       }
     }
-    
+
     return key.status === 'active';
   }
 
@@ -166,19 +186,27 @@
       currentKey.consecutiveFailures++;
       currentKey.lastFailure = Date.now();
       
-      // Determine if this is a permanent failure
-      const permanentErrors = [
+      // Determine failure type and handle accordingly
+      const isPermanent = [
         ERROR_TYPES.AUTHENTICATION_ERROR,
         'API_KEY_INVALID',
         'INVALID_API_KEY'
-      ];
-      
-      if (permanentErrors.some(e => errorType?.includes(e))) {
+      ].some(e => String(errorType || '').includes(e));
+
+      const isQuotaExceeded = String(errorType || '').includes(ERROR_TYPES.QUOTA_EXCEEDED);
+
+      if (isPermanent) {
         currentKey.status = 'disabled';
         console.log(`[API Key Manager] Key disabled due to authentication error: ${currentKey.name}`);
+      } else if (isQuotaExceeded) {
+        currentKey.status = 'cooldown';
+        currentKey.cooldownUntil = Date.now() + API_KEY_ROTATION.KEY_QUOTA_COOLDOWN_MS;
+        const secs = Math.round((API_KEY_ROTATION.KEY_QUOTA_COOLDOWN_MS || 0) / 1000);
+        console.log(`[API Key Manager] Key marked quota-limited; will retry after ${secs}s: ${currentKey.name}`);
       } else if (currentKey.consecutiveFailures >= API_KEY_ROTATION.MAX_CONSECUTIVE_FAILURES) {
         currentKey.status = 'cooldown';
-        console.log(`[API Key Manager] Key in cooldown: ${currentKey.name}`);
+        currentKey.cooldownUntil = Date.now() + API_KEY_ROTATION.KEY_COOLDOWN_MS;
+        console.log(`[API Key Manager] Key in cooldown for 5m: ${currentKey.name}`);
       }
     }
 
@@ -207,9 +235,11 @@
     if (currentKey) {
       currentKey.consecutiveFailures = 0;
       currentKey.lastUsed = Date.now();
-      if (currentKey.status === 'cooldown') {
+      if (currentKey.status !== 'active') {
         currentKey.status = 'active';
       }
+      currentKey.lastFailure = null;
+      currentKey.cooldownUntil = null;
       this.saveKeys();
     }
   }
@@ -245,6 +275,7 @@
       consecutiveFailures: key.consecutiveFailures,
       lastFailure: key.lastFailure,
       lastUsed: key.lastUsed,
+      cooldownUntil: key.cooldownUntil,
       isCurrent: index === this.currentIndex,
       // Don't expose the actual key for security
       keyPreview: key.key ? `${key.key.substring(0, 8)}...` : ''
@@ -298,12 +329,13 @@
     let updated = false;
     
     for (const key of this.keys) {
-      if (key.status === 'cooldown' && key.lastFailure) {
-        const cooldownEnd = key.lastFailure + API_KEY_ROTATION.KEY_COOLDOWN_MS;
+      if (key.status === 'cooldown') {
+        const cooldownEnd = key.cooldownUntil || (key.lastFailure ? key.lastFailure + API_KEY_ROTATION.KEY_COOLDOWN_MS : 0);
         if (Date.now() >= cooldownEnd) {
           key.status = 'active';
           key.consecutiveFailures = 0;
           key.lastFailure = null;
+          key.cooldownUntil = null;
           console.log(`[API Key Manager] Key restored from cooldown: ${key.name}`);
           updated = true;
         }
@@ -325,6 +357,7 @@
         key.status = 'active';
         key.consecutiveFailures = 0;
         key.lastFailure = null;
+        key.cooldownUntil = null;
         updated = true;
         console.log(`[API Key Manager] Reset key: ${key.name}`);
       }
@@ -370,12 +403,18 @@
       if (/permission|unauthorized|api key|invalid|forbidden/.test(errText)) {
         return { valid: false, error: result?.error || 'Authentication error', errorType: ERROR_TYPES.AUTHENTICATION_ERROR };
       }
+      if (/quota|rate limit/.test(errText)) {
+        return { valid: false, error: result?.error || 'Quota exceeded', errorType: ERROR_TYPES.QUOTA_EXCEEDED };
+      }
       return { valid: false, error: result?.error || 'Test call failed' };
     } catch (error) {
       const msg = error && (error.message || String(error));
       const low = String(msg || '').toLowerCase();
       if (/permission|unauthorized|api key|invalid|forbidden/.test(low)) {
         return { valid: false, error: msg || 'Authentication error', errorType: ERROR_TYPES.AUTHENTICATION_ERROR };
+      }
+      if (/quota|rate limit/.test(low)) {
+        return { valid: false, error: msg || 'Quota exceeded', errorType: ERROR_TYPES.QUOTA_EXCEEDED };
       }
       return { valid: false, error: msg || 'Validation error' };
     }
@@ -411,31 +450,33 @@
         key.status = 'active';
         key.lastUsed = Date.now();
         key.lastFailure = null;
+        key.cooldownUntil = null;
         console.log(`[API Key Manager] Key validated OK: ${key.name}`);
       } else {
-        // Only update failure status if validation actually ran (not just "API function not available")
-        if (validation.error !== 'API function not available in worker context' &&
-            validation.error !== 'API function not available') {
-          
-          // classify and mutate status accordingly
-          const errorText = (validation.error || '').toLowerCase();
-          const isPermanent = validation.errorType === ERROR_TYPES.AUTHENTICATION_ERROR ||
-                              /invalid|authentication|unauthorized|forbidden|api key/.test(errorText);
+        // Only update failure status if validation actually ran (not just a system error like "API function not available")
+        if (validation.error && !validation.error.includes('API function not available')) {
+          const isPermanent = validation.errorType === ERROR_TYPES.AUTHENTICATION_ERROR;
+          const isQuotaExceeded = validation.errorType === ERROR_TYPES.QUOTA_EXCEEDED;
 
           if (isPermanent) {
             key.status = 'disabled';
-            console.log(`[API Key Manager] Key disabled due to authentication error: ${key.name} - ${validation.error}`);
+            console.log(`[API Key Manager] Key disabled during validation: ${key.name} - ${validation.error}`);
+          } else if (isQuotaExceeded) {
+            key.status = 'cooldown';
+            key.cooldownUntil = Date.now() + API_KEY_ROTATION.KEY_QUOTA_COOLDOWN_MS;
+            console.log(`[API Key Manager] Key in quota cooldown during validation: ${key.name}`);
           } else {
-            // Only increment failures for actual API errors, not system errors
+            // Only increment failures for other actual API errors
             key.consecutiveFailures = (key.consecutiveFailures || 0) + 1;
             if (key.consecutiveFailures >= API_KEY_ROTATION.MAX_CONSECUTIVE_FAILURES) {
               key.status = 'cooldown';
-              key.lastFailure = Date.now();
-              console.log(`[API Key Manager] Key put in cooldown: ${key.name}`);
+              key.cooldownUntil = Date.now() + API_KEY_ROTATION.KEY_COOLDOWN_MS;
+              key.lastFailure = Date.now(); // Keep for legacy check
+              console.log(`[API Key Manager] Key put in cooldown during validation: ${key.name}`);
             }
           }
         } else {
-          console.log(`[API Key Manager] Skipping failure increment for system error: ${key.name} - ${validation.error}`);
+          console.log(`[API Key Manager] Skipping failure update for system error during validation: ${key.name} - ${validation.error}`);
         }
       }
 

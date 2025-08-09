@@ -152,18 +152,21 @@
       return { ok: !!rawOk, observation: observation || (rawOk ? 'OK' : 'ERROR'), durationMs, ...(extra || {}) };
     };
 
-    try { LOGGER?.debug?.('graph_node_dispatch', { id: node.id, kind: node.kind }); } catch (_) {}
-    await emitGeneric(tabId, 'graph_node_started', { nodeId: node.id, kind: node.kind });
+    const graphMeta = options?.__graph || {};
+    const correlationId = graphMeta.correlationId || '';
+
+    try { LOGGER?.debug?.('graph_node_dispatch', { id: node.id, kind: node.kind, graphId: graphMeta.graphId, correlationId }); } catch (_) {}
+    await emitGeneric(tabId, 'graph_node_started', { nodeId: node.id, kind: node.kind, graphId: graphMeta.graphId, correlationId });
 
     if (node.kind === 'noop') {
-      await emitGeneric(tabId, 'graph_node_finished', { nodeId: node.id, status: 'success' });
+      await emitGeneric(tabId, 'graph_node_finished', { nodeId: node.id, status: 'success', graphId: graphMeta.graphId, correlationId });
       return resultEnvelope(true, 'noop');
     }
 
     if (node.kind === 'delay') {
       const ms = Math.max(0, Number(node.delayMs || 0));
       await new Promise(r => setTimeout(r, ms));
-      await emitGeneric(tabId, 'graph_node_finished', { nodeId: node.id, status: 'success', delayMs: ms });
+      await emitGeneric(tabId, 'graph_node_finished', { nodeId: node.id, status: 'success', delayMs: ms, graphId: graphMeta.graphId, correlationId });
       return resultEnvelope(true, `delay ${ms}ms`);
     }
 
@@ -174,9 +177,12 @@
       }
       const toolId = String(node.toolId || '');
       const input = node.input || {};
+      const capabilities = (ToolsRegistry && typeof ToolsRegistry.getCapabilities === 'function')
+        ? ToolsRegistry.getCapabilities(toolId)
+        : null;
       // Mirror standard tool events
-      try { LOGGER?.info?.('tool_started', { nodeId: node.id, toolId }); } catch (_) {}
-      await emitToolStarted(tabId, toolId, input);
+      try { LOGGER?.info?.('tool_started', { nodeId: node.id, toolId, graphId: graphMeta.graphId, correlationId, capabilities }); } catch (_) {}
+      await emitToolStarted(tabId, toolId, { ...(input || {}), __meta: { graphId: graphMeta.graphId, nodeId: node.id, correlationId, capabilities } });
       let out;
       try {
         const defTimeout = Number(options.defaultToolTimeoutMs || 0);
@@ -193,16 +199,17 @@
         ...out,
         durationMs: out?.durationMs ?? Math.max(0, nowMs() - startedAt)
       };
+      const enriched = { ...summary, graphId: graphMeta.graphId, nodeId: node.id, correlationId, capabilities };
       try {
-        const s = { ok: out?.ok !== false, observation: String(out?.observation || '').slice(0, 200), durationMs: summary.durationMs };
-        LOGGER?.info?.('tool_result', { nodeId: node.id, toolId, ...s });
+        const s = { ok: out?.ok !== false, observation: String(out?.observation || '').slice(0, 200), durationMs: enriched.durationMs, graphId: graphMeta.graphId, correlationId };
+        LOGGER?.info?.('tool_result', { nodeId: node.id, toolId, ...s, capabilities });
       } catch (_) {}
-      await emitToolResult(tabId, toolId, summary);
-      await emitGeneric(tabId, 'graph_node_finished', { nodeId: node.id, status: summary.ok === false ? 'error' : 'success' });
-      return summary;
+      await emitToolResult(tabId, toolId, enriched);
+      await emitGeneric(tabId, 'graph_node_finished', { nodeId: node.id, status: enriched.ok === false ? 'error' : 'success', graphId: graphMeta.graphId, correlationId, capabilities });
+      return enriched;
     }
 
-    await emitGeneric(tabId, 'graph_node_finished', { nodeId: node.id, status: 'error', error: 'Unknown node kind' });
+    await emitGeneric(tabId, 'graph_node_finished', { nodeId: node.id, status: 'error', error: 'Unknown node kind', graphId: graphMeta.graphId, correlationId });
     return resultEnvelope(false, `Unknown node kind: ${node.kind}`, { error: 'unknown_kind' });
   }
 
@@ -214,8 +221,11 @@
     const abortSignal = options?.signal;
     const ctx = options?.ctx || { tabId };
 
-    try { LOGGER?.info?.('graph_started', { graphId, nodes: graph?.nodes?.length || 0 }); } catch (_) {}
-    await emitRunState(tabId, 'started', { graphId, nodes: graph?.nodes?.length || 0 });
+    const requestId = graph?.meta?.requestId;
+    const goal = graph?.meta?.goal;
+    const correlationId = requestId || graphId;
+    try { LOGGER?.info?.('graph_started', { graphId, nodes: graph?.nodes?.length || 0, correlationId, requestId }); } catch (_) {}
+    await emitRunState(tabId, 'started', { graphId, nodes: graph?.nodes?.length || 0, correlationId, requestId, goal });
 
     const nodeMap = graph.__map || new Map((graph.nodes || []).map(n => [n.id, n]));
     const inDegree = { ...(graph.__inDegree || {}) };
@@ -273,7 +283,7 @@
       for (let attempt = 1; attempt <= attempts; attempt++) {
         try {
           if (abortSignal?.aborted) throw new Error('Aborted');
-          last = await runNode(tabId, node, options || {}, ctx);
+          last = await runNode(tabId, node, { ...(options || {}), __graph: { graphId, correlationId } }, ctx);
           if (last && last.ok !== false) break;
         } catch (e) {
           last = { ok: false, observation: String(e?.message || e), error: e, durationMs: last?.durationMs || 0 };
@@ -330,9 +340,9 @@
 
     const durationMs = Math.max(0, nowMs() - startTs);
     const allOk = Object.values(state).every(s => s.status === 'success' || s.status === 'skipped');
-    try { LOGGER?.info?.('graph_finished', { graphId, durationMs, ok: allOk }); } catch (_) {}
-    await emitGeneric(tabId, 'graph_finished', { graphId, durationMs, ok: allOk });
-    await emitRunState(tabId, 'finished', { graphId, durationMs, ok: allOk });
+    try { LOGGER?.info?.('graph_finished', { graphId, durationMs, ok: allOk, correlationId, requestId }); } catch (_) {}
+    await emitGeneric(tabId, 'graph_finished', { graphId, durationMs, ok: allOk, correlationId, requestId });
+    await emitRunState(tabId, 'finished', { graphId, durationMs, ok: allOk, correlationId, requestId });
 
     return {
       ok: allOk,
@@ -342,9 +352,79 @@
     };
   }
 
+  // Phase A.2: Minimal linear planner that converts subTasks to a simple DAG
+  // Heuristic mapping:
+  // - If a sub-task contains a URL, plan: navigateToUrl -> readPageContent -> extractStructuredContent
+  // - If it mentions "analyze", add analyzeUrls (after a read if not already planned)
+  // - If it mentions "read"/"content", add readPageContent
+  // - Otherwise default to readPageContent
+  function planLinearFromSubTasks(subTasks, opts) {
+    const nodes = [];
+    const tasks = Array.isArray(subTasks) ? subTasks : [];
+    let lastId = null;
+    const maxChars = Number(opts?.maxChars || 15000);
+
+    function enqueue(node) {
+      const n = { retryPolicy: { maxAttempts: 1 }, ...node };
+      if (lastId && (!n.dependsOn || n.dependsOn.length === 0)) {
+        n.dependsOn = [lastId];
+      }
+      nodes.push(n);
+      lastId = n.id;
+    }
+
+    function isUrl(s) {
+      return /^https?:\/\//i.test(String(s || '').trim());
+    }
+    function extractFirstUrl(text) {
+      const m = String(text || '').match(/https?:\/\/[^\s"'()<>]+/i);
+      return m ? m[0] : null;
+    }
+
+    tasks.forEach((st, idx) => {
+      const text = String(st || '').trim();
+      const i = idx + 1;
+      const lower = text.toLowerCase();
+
+      const url = extractFirstUrl(text);
+      if (url && isUrl(url)) {
+        enqueue({ id: `s${i}_nav`, kind: 'tool', toolId: 'navigateToUrl', input: { url } });
+        enqueue({ id: `s${i}_read`, kind: 'tool', toolId: 'readPageContent', input: { maxChars } });
+        enqueue({ id: `s${i}_extract`, kind: 'tool', toolId: 'extractStructuredContent' });
+        return;
+      }
+
+      // Non-URL tasks: choose a sensible default sequence
+      const mentionsAnalyze = lower.includes('analyze') || lower.includes('analysis') || lower.includes('links');
+      const mentionsRead = lower.includes('read') || lower.includes('content') || lower.includes('extract');
+
+      // Always start with a read to prime context (safe, read-only)
+      enqueue({ id: `s${i}_read`, kind: 'tool', toolId: 'readPageContent', input: { maxChars } });
+
+      if (mentionsAnalyze) {
+        enqueue({ id: `s${i}_analyze`, kind: 'tool', toolId: 'analyzeUrls' });
+      } else if (mentionsRead) {
+        enqueue({ id: `s${i}_extract`, kind: 'tool', toolId: 'extractStructuredContent' });
+      } else {
+        // Default: try structured extraction after read to capture metadata
+        enqueue({ id: `s${i}_extract`, kind: 'tool', toolId: 'extractStructuredContent' });
+      }
+    });
+
+    return nodes;
+  }
+
+  // Convenience: create a graph from subTasks directly
+  function createLinearGraphFromSubTasks(subTasks, meta, opts) {
+    const nodes = planLinearFromSubTasks(subTasks, opts);
+    return createGraph(nodes, meta || {});
+  }
+
   const TaskGraphEngine = {
     createGraph,
     run,
+    planLinearFromSubTasks,
+    createLinearGraphFromSubTasks,
     __LOCKED__: true
   };
 

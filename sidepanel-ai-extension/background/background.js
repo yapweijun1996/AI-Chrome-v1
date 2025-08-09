@@ -19,7 +19,9 @@
 
   // Import in strict order; if any fails, we will know which.
   safeImport("../common/messages.js");        // defines globalThis.MessageTypes
+  safeImport("../common/utils.js");           // defines globalThis.Utils
   safeImport("../common/api.js");             // API wrapper (classic script)
+  safeImport("../common/automation-templates.js");  // Automation templates library
   safeImport("../common/prompts.js");         // Prompt builders (classic script)
   safeImport("../common/planner.js");         // New multi-step planner
   safeImport("../common/enhanced-intent-classifier.js");  // Enhanced intent classification
@@ -32,10 +34,14 @@
   safeImport("../common/tools-registry.js");    // Tool Registry (contracts, runTool)
   // Observer for structured timeline events
   safeImport("./observer.js");                  // AgentObserver (run/tool events to UI + storage)
+  safeImport("./session-manager.js");         // Session management
+  safeImport("./permission-manager.js");      // Permission management (CapabilityRegistry, PermissionManager)
   // Namespaced console logger (globalThis.Log)
   safeImport("../common/logger.js");           // Logger: globalThis.Log with levels/namespaces
   // Task Graph Engine (experimental)
   safeImport("../common/task-graph.js");
+  // ReAct planner (experimental)
+  safeImport("../common/react-planner.js");
   // api-key-manager.js is optional; guard its absence
   try {
     safeImport("../common/api-key-manager.js");  // API key rotation/manager (if present)
@@ -74,178 +80,125 @@ const BG_LOG = (globalThis.Log && globalThis.Log.createLogger) ? globalThis.Log.
 
 // Extract centralized message types and constants
 const { MSG, PARAM_LIMITS, TIMEOUTS, ERROR_TYPES, LOG_LEVELS, API_KEY_ROTATION } = MessageTypes;
-// Capability Registry to define risky actions
-const CapabilityRegistry = {
-  'click_element': { risky: true },
-  'type_text': { risky: true },
-  'select_option': { risky: true },
-  // Canonical navigation tool
-  'navigate': { risky: true, crossOrigin: true },
-  // Back-compat alias (to be removed after schema/tooling migration)
-  'goto_url': { risky: true, crossOrigin: true },
-  'close_tab': { risky: true },
-  'download_link': { risky: true },
-  'set_cookie': { risky: true },
-  // Non-risky actions
-  'wait_for_selector': { risky: false },
-  'scroll_to': { risky: false },
-  'take_screenshot': { risky: false },
-  'create_tab': { risky: false },
-  'switch_tab': { risky: false },
-  'read_page_content': { risky: false },
-  'scrape': { risky: false },
-  'think': { risky: false },
-  'tabs.query': { risky: false },
-  'record_finding': { risky: false },
+
+// Fast Mode (background) flag and per-tool Port RPC timeouts
+let FAST_MODE_BG = false;
+(async () => {
+  try {
+    const o = await chrome.storage.local.get("FAST_MODE");
+    FAST_MODE_BG = !!o?.FAST_MODE;
+  } catch (_) {}
+})();
+try {
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && Object.prototype.hasOwnProperty.call(changes, "FAST_MODE")) {
+      FAST_MODE_BG = !!changes.FAST_MODE.newValue;
+    }
+  });
+} catch (_) {}
+
+const FAST_PORT_TIMEOUTS = {
+  settle: 1200,
+  clickElement: 2000,
+  typeText: 2500,
+  waitForSelector: 3000,
+  scrollTo: 1200,
+  checkSelector: 1000,
+  getInteractiveElements: 3000,
+  readPageContent: 5000,
+  extractStructuredContent: 5000
 };
 
-class PermissionManager {
-  constructor(storage) {
-    this.storage = storage;
-    this.pendingRequests = new Map(); // correlationId -> { resolve, reject }
+function getFastTimeout(toolId, normalMs) {
+  if (FAST_MODE_BG) {
+    const v = FAST_PORT_TIMEOUTS[toolId];
+    return Number.isFinite(v) ? v : (Number.isFinite(normalMs) ? normalMs : 3000);
   }
-
-  async hasPermission(tabId, action) {
-    const { tool, params } = action;
-    const capability = CapabilityRegistry[tool];
-
-    // Non-risky actions: always allowed
-    if (!capability || !capability.risky) {
-      return { granted: true };
-    }
-
-    // Determine origin safely (may be chrome:// or restricted)
-    let origin = 'unknown';
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      try {
-        origin = new URL(tab.url).origin;
-      } catch (_) {
-        origin = 'unknown';
-      }
-    } catch (_) {
-      // ignore inability to read tab
-    }
-
-    // Full-auto mode: auto-grant all risky actions, no user prompt
-    try {
-      emitAgentLog(tabId, {
-        level: LOG_LEVELS.INFO,
-        msg: "Permission auto-granted",
-        tool,
-        origin,
-        autoGrant: true
-      });
-    } catch (_) {}
-
-    // Mirror legacy "remember for 24h" behavior to keep downstream logic simple
-    try {
-      const permissionKey = `permission_${origin}_${tool}`;
-      const expiry = Date.now() + (24 * 60 * 60 * 1000);
-      await this.storage.set(permissionKey, { granted: true, expires: expiry, autoGrant: true });
-    } catch (_) {
-      // non-fatal
-    }
-
-    return { granted: true };
-  }
-
-  async requestPermission(tabId, origin, tool, action) {
-    const correlationId = `perm_${tabId}_${Date.now()}`;
-    
-    return new Promise((resolve, reject) => {
-      this.pendingRequests.set(correlationId, { resolve, reject });
-
-      chrome.runtime.sendMessage({
-        type: MSG.AGENT_PERMISSION_REQUEST,
-        tabId,
-        payload: {
-          correlationId,
-          origin,
-          tool,
-          params: action.params,
-          rationale: action.rationale,
-        }
-      }).catch(err => {
-        this.pendingRequests.delete(correlationId);
-        reject(new Error(`Failed to send permission request: ${err.message}`));
-      });
-
-      // Timeout for the permission request
-      setTimeout(() => {
-        if (this.pendingRequests.has(correlationId)) {
-          this.pendingRequests.delete(correlationId);
-          reject(new Error('Permission request timed out.'));
-        }
-      }, 60000); // 60 second timeout
+  return Number.isFinite(normalMs) ? normalMs : undefined;
+}
+// CapabilityRegistry is provided by background/permission-manager.js
+// Safe wrapper to consume chrome.runtime.lastError for fire-and-forget messages
+function safeRuntimeSendMessage(message) {
+  try {
+    chrome.runtime.sendMessage(message, () => {
+      // Consume lastError to avoid "Unchecked runtime.lastError" noise
+      void chrome.runtime.lastError;
     });
-  }
-
-  async handlePermissionDecision(decision) {
-    const { correlationId, granted, remember, origin, tool } = decision;
-    const request = this.pendingRequests.get(correlationId);
-
-    if (!request) {
-      console.warn(`No pending permission request found for correlationId: ${correlationId}`);
-      return;
-    }
-
-    this.pendingRequests.delete(correlationId);
-
-    if (granted) {
-      if (remember) {
-        const permissionKey = `permission_${origin}_${tool}`;
-        const expiry = Date.now() + (24 * 60 * 60 * 1000); // 24 hours
-        await this.storage.set(permissionKey, { granted: true, expires: expiry });
-      }
-      request.resolve({ granted: true });
-    } else {
-      request.reject(new Error('Permission denied by user.'));
-    }
-  }
+  } catch (_) {}
 }
 
-const permissionManager = new PermissionManager({
+// PermissionManager is provided by background/permission-manager.js
+
+const permissionManager = new globalThis.PermissionManager({
   get: async (key) => (await chrome.storage.local.get(key))[key],
   set: async (key, value) => await chrome.storage.local.set({ [key]: value }),
 });
 
-// Simple in-memory agent sessions keyed by tabId
-const agentSessions = new Map(); // tabId -> { running, stopped, step, goal, subTasks: [], currentTaskIndex: 0, settings, logs: [], history: [], lastAction, lastObservation }
+const agentSessions = globalThis.SessionManager.agentSessions;
 
-function initializeNewSession(tabId, goal, subTasks, settings, selectedModel, taskContext) {
-  return {
-    running: false,
-    stopped: false,
-    step: 0,
-    goal,
-    subTasks,
-    currentTaskIndex: 0,
-    settings,
-    selectedModel,
-    logs: [],
-    lastAction: "",
-    lastObservation: "",
-    history: [],
-    scratchpad: [],
-    requestId: `agent_${tabId}_${Date.now()}`,
-    taskContext: taskContext || {},
-    contextCache: {},
-    failureCount: 0,
-    consecutiveFailures: 0,
-    findings: {},
-    successCriteria: {},
-    subTaskStep: 0,
-    maxSubTaskSteps: 15,
-    domainVisitCount: {},
-    maxDomainVisits: 5,
-    noProgressCounter: 0,
-    maxNoProgressSteps: 4,
-    lastProgressObservation: "",
-    chatTranscript: [],
-    sessionId: tabId,
-  };
+// Per-tab content script capability cache
+const contentScriptCaps = new Map(); // tabId -> { capabilities }
+
+/**
+ * BFCache/Navigation resilience: proactively invalidate Port + caps when tab navigates or history state changes.
+ * This prevents "message channel is closed" errors caused by BFCache moving pages.
+ */
+function invalidateTabCommChannel(tabId, reason = "navigation") {
+  try { AgentPortManager.invalidate(tabId); } catch (_) {}
+  try { contentScriptCaps.delete(tabId); } catch (_) {}
+  const sess = agentSessions.get(tabId);
+  if (sess) {
+    // Element caching removed for bfcache compatibility - always fetch fresh elements
+    // sess.currentInteractiveElements = [];
+    sess.currentPageContent = "";
+  }
+  try {
+    emitAgentLog?.(tabId, { level: LOG_LEVELS.DEBUG, msg: `Comm channel invalidated due to ${reason}` });
+  } catch (_) {}
 }
+
+// Invalidate on tab URL change/loading (covers hard navigations)
+try {
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    // Invalidate when URL changes or page starts loading to avoid stale ports
+    if ((typeof changeInfo.status === 'string' && changeInfo.status === 'loading') ||
+        (typeof changeInfo.url === 'string' && changeInfo.url)) {
+      invalidateTabCommChannel(tabId, changeInfo.url ? "url_change" : "loading");
+      
+      // Clear all caches on navigation
+      try {
+        clearElementCache(tabId, changeInfo.url ? "url_change" : "loading");
+        // Also clear connection health cache and retry state on navigation
+        connectionHealthCache.delete(tabId);
+        refreshRetryState.delete(tabId);
+      } catch (error) {
+        console.warn(`[BG] Failed to clear caches:`, error);
+      }
+    }
+  });
+} catch (_) {}
+
+// Invalidate on SPA route changes (pushState/replaceState updates)
+try {
+  if (chrome.webNavigation && chrome.webNavigation.onHistoryStateUpdated) {
+    chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
+      if (Number.isFinite(details.tabId)) {
+        invalidateTabCommChannel(details.tabId, "history_state_updated");
+      }
+    });
+  }
+} catch (_) {}
+
+// Invalidate on committed navigation (new document)
+try {
+  if (chrome.webNavigation && chrome.webNavigation.onCommitted) {
+    chrome.webNavigation.onCommitted.addListener((details) => {
+      if (Number.isFinite(details.tabId)) {
+        invalidateTabCommChannel(details.tabId, "navigation_committed");
+      }
+    });
+  }
+} catch (_) {}
 
 // Enhanced functionality instances
 let enhancedIntentClassifier = null;
@@ -292,64 +245,10 @@ const progressThrottle = new Map(); // tabId -> { lastProgressTime, messageCount
 const PROGRESS_THROTTLE_MS = 2000; // Minimum 2 seconds between progress messages
 const MAX_PROGRESS_BURST = 3; // Maximum 3 messages in quick succession
 
-// Session persistence functions using IndexedDB
-async function saveSessionToStorage(tabId, session) {
-  try {
-    // Ensure the session object has the key for IndexedDB
-    const sessionData = {
-      ...session,
-      sessionId: tabId,
-      // Limit logs to avoid excessive storage usage
-      logs: session.logs ? session.logs.slice(-100) : [],
-      history: session.history ? session.history.slice(-20) : [],
-    };
-    await saveSession(sessionData);
-  } catch (e) {
-    console.warn('[BG] Failed to save session to IndexedDB:', e);
-  }
-}
-
-async function restoreSessionFromStorage(tabId) {
-  try {
-    const sessionData = await loadSession(tabId);
-    
-    if (sessionData) {
-      // Restore session but mark as not running (service worker restart)
-      const restoredSession = {
-        ...sessionData,
-        running: false, // Always reset running state after restart
-        stopped: true   // Mark as stopped to prevent auto-continuation
-      };
-      agentSessions.set(tabId, restoredSession);
-      console.log(`[BG] Restored session for tab ${tabId} from IndexedDB`);
-      return restoredSession;
-    }
-  } catch (e) {
-    console.warn(`[BG] Failed to restore session for tab ${tabId} from IndexedDB:`, e);
-  }
-  return null;
-}
-
-// No cleanup needed for now with IndexedDB, but can be added later if necessary.
-async function cleanupOldSessions() {
-    // This function is now a no-op but kept for structural integrity.
-    // In a production scenario, you might implement a cleanup based on session timestamps.
-    console.log("[BG] Skipping session cleanup for IndexedDB implementation.");
-}
-
-// Timeout wrapper functions
-function withTimeout(promise, timeoutMs, operation) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => 
-      setTimeout(() => reject(new Error(`${operation} timed out after ${timeoutMs}ms`)), timeoutMs)
-    )
-  ]);
-}
 
 async function callModelWithTimeout(apiKey, prompt, options, timeoutMs = TIMEOUTS.MODEL_CALL_MS) {
   try {
-    return await withTimeout(
+    return await Utils.withTimeout(
       callGeminiGenerateText(apiKey, prompt, options),
       timeoutMs,
       'Model call'
@@ -453,8 +352,9 @@ async function callModelWithRotation(prompt, options, timeoutMs = TIMEOUTS.MODEL
               }
             } catch (_) {}
             // Add jitter 0.5x-1.5x
-            const jitter = 0.5 + Math.random();
-            await new Promise(resolve => setTimeout(resolve, Math.max(500, Math.floor(delayMs * jitter))));
+            // The user has requested to remove the delay.
+            // const jitter = 0.5 + Math.random();
+            // await new Promise(resolve => setTimeout(resolve, Math.max(500, Math.floor(delayMs * jitter))));
             continue; // Try again with the newly selected key
           } else {
             console.warn("[BG] No more API keys available for rotation");
@@ -497,6 +397,191 @@ async function callModelWithRotation(prompt, options, timeoutMs = TIMEOUTS.MODEL
 
 async function dispatchActionWithTimeout(tabId, action, settings, timeoutMs = TIMEOUTS.DOM_ACTION_MS) {
   const startedAt = Date.now();
+
+  // Inline mapper: translate legacy/canonical action.tool to ToolsRegistry tool + input
+  function mapActionToRegistry(a) {
+    if (!a || typeof a !== 'object') return null;
+    const tool = String(a.tool || '').trim();
+    const p = a.params || {};
+
+    // Navigation
+    if (tool === 'navigate' || tool === 'goto_url' || tool === 'navigateToUrl') {
+      return { toolId: 'navigateToUrl', input: { url: String(p.url || '') } };
+    }
+    // Composite click-and-wait (aliases)
+    if (tool === 'click_and_wait' || tool === 'clickAndWait') {
+      const input = { selector: String(p.selector || '') };
+      const waitFor = {};
+      if (typeof p.waitForSelector === 'string' && p.waitForSelector) {
+        waitFor.selector = p.waitForSelector;
+      }
+      if (p.waitForDisappear === true) {
+        waitFor.disappear = true;
+      }
+      if (p.urlChange === true) {
+        waitFor.urlChange = true;
+      }
+      if (typeof p.timeoutMs === 'number') {
+        waitFor.timeoutMs = p.timeoutMs;
+      }
+      if (Object.keys(waitFor).length > 0) input.waitFor = waitFor;
+      return { toolId: 'clickAndWait', input };
+    }
+
+    // Page reading and analysis
+    if (tool === 'read_page_content' || tool === 'readPageContent') {
+      return { toolId: 'readPageContent', input: { maxChars: Number(p.maxChars || 15000) } };
+    }
+    if (tool === 'analyze_urls' || tool === 'analyzeUrls') {
+      return { toolId: 'analyzeUrls', input: {} };
+    }
+    if (tool === 'extract_structured_content' || tool === 'extractStructuredContent') {
+      return { toolId: 'extractStructuredContent', input: {} };
+    }
+    if (tool === 'get_page_links' || tool === 'getPageLinks' || tool === 'extractLinks') {
+      return {
+        toolId: 'extractLinks',
+        input: {
+          includeExternal: p.includeExternal !== false,
+          maxLinks: Number(p.maxLinks || 20)
+        }
+      };
+    }
+
+    // DOM interactions
+    if (tool === 'click_element' || tool === 'click' || tool === 'clickElement') {
+      const input = {};
+      // Priority: semantic_selector -> selector -> elementIndex
+      try {
+        if (typeof p.semantic_selector === 'string' && p.semantic_selector.trim()) {
+          const sem = p.semantic_selector.trim();
+          // Convert semantic selector to a robust selector the content script understands
+          // Supported:
+          //   text:Send   -> text=Send
+          //   aria:Send   -> [aria-label="Send"]
+          //   role:button name:Send -> text=Send (fallback to text-based)
+          //   already in text=... or [aria-label="..."] passes through via selector normalization
+          let sel = '';
+          const mText = sem.match(/^text\s*:\s*(.+)$/i);
+          const mAria = sem.match(/^aria\s*:\s*(.+)$/i);
+          const mRoleName = sem.match(/^role\s*:\s*([a-z]+)\s+name\s*:\s*(.+)$/i);
+          if (mText) {
+            sel = `text=${mText[1].trim()}`;
+          } else if (mAria) {
+            const val = mAria[1].trim().replace(/^["']|["']$/g, '');
+            sel = `[aria-label="${val}"]`;
+          } else if (mRoleName) {
+            const name = mRoleName[2].trim().replace(/^["']|["']$/g, '');
+            sel = `text=${name}`;
+          } else if (/^\s*text\s*=/.test(sem) || /^\s*\[?\s*aria-label\s*=/.test(sem)) {
+            sel = sem;
+          } else {
+            sel = `text=${sem}`;
+          }
+          if (sel) input.selector = sel;
+        }
+      } catch (_) {}
+      if (!input.selector && typeof p.selector === 'string' && p.selector) input.selector = String(p.selector);
+      const idx = Number(p.elementIndex);
+      if (Number.isFinite(idx) && idx > 0) input.elementIndex = idx;
+      return { toolId: 'clickElement', input };
+    }
+    if (tool === 'type_text' || tool === 'fill' || tool === 'typeText') {
+      const input = {
+        text: String((p.text ?? p.value) || '')
+      };
+      // Priority: semantic_selector -> selector
+      try {
+        if (typeof p.semantic_selector === 'string' && p.semantic_selector.trim()) {
+          const sem = p.semantic_selector.trim();
+          let sel = '';
+          const mText = sem.match(/^text\s*:\s*(.+)$/i);
+          const mAria = sem.match(/^aria\s*:\s*(.+)$/i);
+          const mRoleName = sem.match(/^role\s*:\s*([a-z]+)\s+name\s*:\s*(.+)$/i);
+          if (mText) {
+            sel = `text=${mText[1].trim()}`;
+          } else if (mAria) {
+            const val = mAria[1].trim().replace(/^["']|["']$/g, '');
+            sel = `[aria-label="${val}"]`;
+          } else if (mRoleName) {
+            const name = mRoleName[2].trim().replace(/^["']|["']$/g, '');
+            sel = `text=${name}`;
+          } else if (/^\s*text\s*=/.test(sem) || /^\s*\[?\s*aria-label\s*=/.test(sem)) {
+            sel = sem;
+          } else {
+            sel = `text=${sem}`;
+          }
+          if (sel) input.selector = sel;
+        }
+      } catch (_) {}
+      if (!input.selector && typeof p.selector === 'string' && p.selector) input.selector = String(p.selector);
+      // Preserve label hint for selector inference in ToolsRegistry.typeText
+      if (typeof p.label === 'string' && p.label) input.label = String(p.label);
+      const idx = Number(p.elementIndex);
+      if (Number.isFinite(idx) && idx > 0) input.elementIndex = idx;
+      return { toolId: 'typeText', input };
+    }
+    if (tool === 'wait_for_selector' || tool === 'waitForSelector') {
+      return {
+        toolId: 'waitForSelector',
+        input: {
+          selector: String(p.selector || ''),
+          timeoutMs: Number(p.timeoutMs || 5000)
+        }
+      };
+    }
+    if (tool === 'scroll_to' || tool === 'scroll' || tool === 'scrollTo') {
+      const input = {};
+      if (typeof p.selector === 'string' && p.selector) input.selector = p.selector;
+      if (typeof p.direction === 'string' && p.direction) input.direction = p.direction;
+      if (typeof p.amountPx !== 'undefined') input.amountPx = Number(p.amountPx);
+      return { toolId: 'scrollTo', input };
+    }
+    if (tool === 'scrape' || tool === 'scrapeSelector') {
+      return { toolId: 'scrapeSelector', input: { selector: String(p.selector || '') } };
+    }
+    if (tool === 'get_interactive_elements' || tool === 'getInteractiveElements') {
+      return { toolId: 'getInteractiveElements', input: {} };
+    }
+    if (tool === 'record_finding' || tool === 'recordFinding') {
+      return { toolId: 'recordFinding', input: { finding: p.finding } };
+    }
+    // Yield two frames to allow DOM to settle in Fast Mode pipelines or when explicitly requested
+    if (tool === 'settle') {
+      return { toolId: 'settle', input: {} };
+    }
+
+    return null;
+  }
+
+  // If this action is backed by a ToolsRegistry tool, delegate via runRegisteredTool
+  const mapped = mapActionToRegistry(action);
+  if (mapped) {
+    // Preserve permission checks for risky capabilities
+    try {
+      const permission = await permissionManager.hasPermission(tabId, action);
+      if (!permission.granted) {
+        return { ok: false, observation: "Permission denied by user." };
+      }
+    } catch (e) {
+      return { ok: false, observation: e.message || "Permission check failed" };
+    }
+
+    // Delegate to registry. Avoid duplicate timeline events:
+    // runRegisteredTool already emits tool_started/tool_result via AgentObserver.
+    try {
+      const result = await runRegisteredTool(tabId, mapped.toolId, mapped.input);
+      return result;
+    } catch (error) {
+      return {
+        ok: false,
+        observation: `Action failed: ${error.message}`,
+        errorType: ERROR_TYPES.DOM_ERROR
+      };
+    }
+  }
+
+  // Legacy path (non-registered actions): maintain existing behavior with timeout + explicit timeline events
   try {
     // Emit tool_started to timeline
     try {
@@ -505,7 +590,7 @@ async function dispatchActionWithTimeout(tabId, action, settings, timeoutMs = TI
       }
     } catch (_) {}
 
-    const res = await withTimeout(
+    const res = await Utils.withTimeout(
       dispatchAgentAction(tabId, action, settings),
       timeoutMs,
       'DOM action'
@@ -548,96 +633,6 @@ async function dispatchActionWithTimeout(tabId, action, settings, timeoutMs = TI
   }
 }
 
-// JSON extraction with retry capability
-function extractJSONWithRetry(text, context = 'JSON') {
-  // Try fenced code block first
-  const fencedMatch = text.match(/```json\s*\n([\s\S]*?)\n\s*```/i);
-  if (fencedMatch) {
-    try {
-      const raw = fencedMatch[1];
-      try {
-        return { success: true, data: JSON.parse(raw) };
-      } catch (e1) {
-        const cleaned = sanitizeModelJson(raw);
-        return { success: true, data: JSON.parse(cleaned) };
-      }
-    } catch (e) {
-      console.warn('Failed to parse fenced JSON:', e);
-    }
-  }
-  
-  // Fallback to brace search
-  const jsonStart = text.indexOf("{");
-  const jsonEnd = text.lastIndexOf("}");
-  if (jsonStart >= 0 && jsonEnd > jsonStart) {
-    const jsonStr = text.slice(jsonStart, jsonEnd + 1);
-    try {
-      try {
-        return { success: true, data: JSON.parse(jsonStr) };
-      } catch (e1) {
-        const cleaned = sanitizeModelJson(jsonStr);
-        return { success: true, data: JSON.parse(cleaned) };
-      }
-    } catch (e) {
-      console.warn('Failed to parse brace-extracted JSON:', e);
-    }
-  }
-  
-  return { 
-    success: false, 
-    error: `Failed to extract valid JSON from ${context}`,
-    rawText: text.substring(0, 500) + (text.length > 500 ? '...' : '')
-  };
-}
-
-// Attempt to repair common model JSON issues: comments, trailing commas, single quotes
-function sanitizeModelJson(input) {
-  let s = String(input || '');
-  // Strip surrounding code fences if present (any fence)
-  s = s.replace(/^```[a-zA-Z]*\n([\s\S]*?)\n```\s*$/m, '$1');
-  // Remove block comments /* ... */
-  s = s.replace(/\/\*[\s\S]*?\*\//g, '');
-  // Remove line comments // ... (to end of line)
-  s = s.replace(/^\s*\/\/.*$/gm, '');
-  // Remove trailing commas before } or ]
-  s = s.replace(/,\s*([}\]])/g, '$1');
-  // Convert single-quoted property names to double-quoted
-  s = s.replace(/'([A-Za-z0-9_]+)'\s*:/g, '"$1":');
-  // Convert single-quoted string values to double-quoted (simple case)
-  s = s.replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, ': "$1"');
-  // Normalize whitespace
-  s = s.trim();
-  return s;
-}
-
-// Deep merge utility for findings
-function deepMerge(target, source) {
-  const output = { ...target };
-
-  if (isObject(target) && isObject(source)) {
-    Object.keys(source).forEach(key => {
-      if (isObject(source[key])) {
-        if (!(key in target)) {
-          Object.assign(output, { [key]: source[key] });
-        } else {
-          output[key] = deepMerge(target[key], source[key]);
-        }
-      } else if (Array.isArray(source[key])) {
-        const targetArray = target[key] || [];
-        // Simple concat, can be improved with unique checks if needed
-        output[key] = targetArray.concat(source[key]);
-      } else {
-        Object.assign(output, { [key]: source[key] });
-      }
-    });
-  }
-
-  return output;
-}
-
-function isObject(item) {
-  return (item && typeof item === 'object' && !Array.isArray(item));
-}
 
 // Template variable resolution system
 function resolveTemplateVariables(params, sess, tabId) {
@@ -958,6 +953,22 @@ function validateAction(action) {
     }
   }
 
+  // Tool-specific required parameters
+  const toolRequirements = {
+    'click_element': [['selector', 'semantic_selector', 'elementIndex']],
+    'type_text': [['text'], ['selector', 'semantic_selector', 'elementIndex']],
+    'wait_for_selector': [['selector']],
+    'scroll_to': [['selector', 'direction']],
+  };
+
+  if (toolRequirements[action.tool]) {
+    for (const requirement of toolRequirements[action.tool]) {
+      if (!requirement.some(param => action.params && param in action.params)) {
+        errors.push(`Tool '${action.tool}' requires one of '${requirement.join("', '")}'.`);
+      }
+    }
+  }
+
   return {
     valid: errors.length === 0,
     errors: errors
@@ -972,11 +983,14 @@ function tryParseJSONMaybe(text) {
 function normalizeRecordFindingParams(params) {
   const normalized = { ...(params || {}) };
 
-  // If finding exists as string JSON, parse it
+  // If finding exists as string JSON, parse it; otherwise coerce to an object
   if (typeof normalized.finding === 'string') {
     const parsed = tryParseJSONMaybe(normalized.finding);
     if (parsed && typeof parsed === 'object') {
       normalized.finding = parsed;
+    } else {
+      // Coerce plain string to a minimal structured object
+      normalized.finding = { summary: normalized.finding };
     }
   }
 
@@ -1051,7 +1065,7 @@ function normalizeRecordFindingParams(params) {
 function preNormalizeAction(action) {
   if (!action || typeof action !== 'object') return action;
   const out = { ...action, params: { ...(action.params || {}) } };
-  if (out.tool === 'record_finding') {
+  if (out.tool === 'record_finding' || out.tool === 'recordFinding') {
     out.params = normalizeRecordFindingParams(out.params);
   }
   return out;
@@ -1059,52 +1073,85 @@ function preNormalizeAction(action) {
 
 // Action normalization shim: map aliases and remove unknown params to satisfy schema
 function normalizeActionAliases(action) {
-  if (!action || typeof action !== 'object') return action;
+ if (!action || typeof action !== 'object') return action;
 
-  const schema = globalThis.ACTION_SCHEMA || {};
-  const allowedParamKeys = Object.keys(
-    (schema.properties && schema.properties.params && schema.properties.params.properties) || {}
-  );
+ const schema = globalThis.ACTION_SCHEMA || {};
+ const allowedParamKeys = Object.keys(
+   (schema.properties && schema.properties.params && schema.properties.params.properties) || {}
+ );
 
-  const toolAliasMap = {
-    click: 'click_element',
-    fill: 'type_text',
-    waitForSelector: 'wait_for_selector',
-    screenshot: 'take_screenshot',
-    readPageContent: 'read_page_content',
-    extractStructuredContent: 'extract_structured_content',
-    analyzeUrls: 'analyze_urls',
-    getPageLinks: 'get_page_links',
-  };
+ const toolAliasMap = {
+   click: 'click_element',
+   fill: 'type_text',
+   clearElement: 'type_text', // Map clearElement to type_text
+   waitForSelector: 'wait_for_selector',
+   screenshot: 'take_screenshot',
+   readPageContent: 'read_page_content',
+   extractStructuredContent: 'extract_structured_content',
+   analyzeUrls: 'analyze_urls',
+   getPageLinks: 'get_page_links',
+   recordFinding: 'record_finding'
+ };
 
-  const out = {
-    ...action,
-    tool: toolAliasMap[action.tool] || action.tool,
-    params: { ...(action.params || {}) }
-  };
+ const out = {
+   ...action,
+   tool: toolAliasMap[action.tool] || action.tool,
+   params: { ...(action.params || {}) }
+ };
 
-  // Normalize common parameter aliases and cleanups
-  if (typeof out.params.selector === 'string') {
-    out.params.selector = out.params.selector.trim();
-  }
+ // Normalize common parameter aliases and cleanups
+ if (typeof out.params.selector === 'string') {
+   out.params.selector = out.params.selector.trim();
+ }
+ 
+ // Normalize element index aliases and coerce to integer
+ try {
+   const idxCandidates = ['elementIndex', 'element_index', 'index', 'elementId', 'element_id'];
+   for (const key of idxCandidates) {
+     const v = out.params[key];
+     if (typeof v === 'string' && /^\d+$/.test(v)) {
+       out.params.elementIndex = Math.max(1, parseInt(v, 10));
+       break;
+     }
+     if (typeof v === 'number' && Number.isFinite(v)) {
+       out.params.elementIndex = Math.max(1, Math.floor(v));
+       break;
+     }
+   }
+   // Cleanup aliases to avoid schema noise
+   ['element_index', 'index', 'elementId', 'element_id'].forEach(k => { if (k in out.params) delete out.params[k]; });
+ } catch (_) {}
+ 
+ // Remove non-canonical/LLM-only fields
+ if ('selector_type' in out.params) delete out.params.selector_type;
+ if ('state' in out.params) delete out.params.state;
+ 
+ // Normalize typing parameter
+ if (out.tool === 'type_text' && typeof out.params.text === 'undefined' && typeof out.params.value !== 'undefined') {
+   out.params.text = out.params.value;
+ }
+ // Preserve label and map name to label if label is not present
+ if (typeof out.params.label === 'undefined' && typeof out.params.name === 'string') {
+   out.params.label = out.params.name;
+ }
+ // If the original tool was clearElement, ensure the text is an empty string.
+ if (action.tool === 'clearElement') {
+   out.params.text = "";
+ }
 
-  // Remove non-canonical/LLM-only fields
-  if ('selector_type' in out.params) delete out.params.selector_type;
-  if ('state' in out.params) delete out.params.state;
+ // Drop any params not present in the global schema to pass validation
+ for (const k of Object.keys(out.params)) {
+   if (!allowedParamKeys.includes(k)) {
+     delete out.params[k];
+   }
+ }
 
-  // Normalize typing parameter
-  if (out.tool === 'type_text' && typeof out.params.text === 'undefined' && typeof out.params.value !== 'undefined') {
-    out.params.text = out.params.value;
-  }
+ // If not recording a finding, drop stray 'finding' param to avoid schema/type errors from LLM noise
+ if (out.tool !== 'record_finding' && 'finding' in out.params) {
+   delete out.params.finding;
+ }
 
-  // Drop any params not present in the global schema to pass validation
-  for (const k of Object.keys(out.params)) {
-    if (!allowedParamKeys.includes(k)) {
-      delete out.params[k];
-    }
-  }
-
-  return out;
+ return out;
 }
 
 
@@ -1177,7 +1224,7 @@ function emitAgentLog(tabId, entry) {
   // The call here is removed to avoid redundant writes.
   
   try {
-    chrome.runtime.sendMessage({ type: MSG.AGENT_LOG, tabId, entry: logEntry });
+    safeRuntimeSendMessage({ type: MSG.AGENT_LOG, tabId, entry: logEntry });
   } catch (_) {}
 
   // Send progress updates to chat for key events (with throttling)
@@ -1193,7 +1240,7 @@ function emitAgentLog(tabId, entry) {
           timestamp: Date.now()
         });
 
-        chrome.runtime.sendMessage({
+        safeRuntimeSendMessage({
           type: MSG.AGENT_PROGRESS,
           tabId,
           message: progressMessage,
@@ -1241,12 +1288,78 @@ function shouldThrottleProgressMessage(tabId, message) {
   return false;
 }
 
-// Determine which log entries should be sent as chat progress updates
+ // Determine which log entries should be sent as chat progress updates
 function shouldSendProgressToChat(entry) {
   // Always send errors (they're important)
   if (entry.level === LOG_LEVELS.ERROR) return true;
-  
-  // Send progress for key milestones and important events
+
+  if (FAST_MODE_BG) {
+    const lowerMsg = (entry.msg || '').toLowerCase();
+
+    // Allow key DOM actions even in Fast Mode
+    if (lowerMsg.includes('executing tool')) {
+      const toolId = entry.tool || entry.action?.tool;
+      if (['click','click_element','clickElement','type_text','typeText','fill','wait_for_selector','waitForSelector','scroll_to','scrollTo'].includes(toolId)) {
+        return true;
+      }
+      // Otherwise suppress execution chatter
+      return false;
+    }
+
+    // Surface watchdog/self-correction warnings
+    if (entry.level === LOG_LEVELS.WARN && (lowerMsg.includes('watchdog') || lowerMsg.includes('self-correction') || lowerMsg.includes('re-executing'))) {
+      return true;
+    }
+
+    if (entry.level === LOG_LEVELS.INFO && entry.msg) {
+      const m = String(entry.msg || '').trim().toLowerCase();
+
+      // Planning milestones
+      if (
+        m.startsWith('plan generated') ||
+        m.startsWith('multi-step plan generated') ||
+        m.startsWith('react plan generated')
+      ) {
+        return true;
+      }
+
+      // Navigation milestones
+      if (
+        m.startsWith('navigated to') ||
+        m.startsWith('navigation') ||
+        m.startsWith('smart navigation')
+      ) {
+        return true;
+      }
+
+      // Report milestones
+      if (
+        m.startsWith('generating final report') ||
+        m.includes('report generated')
+      ) {
+        return true;
+      }
+
+      // Graph engine milestones
+      if (
+        m.startsWith('graph mode starting') ||
+        m.includes('graph run completed')
+      ) {
+        return true;
+      }
+
+      return false;
+    }
+
+    if (entry.level === LOG_LEVELS.SUCCESS && entry.tool) {
+      const allowedTools = ['generate_report', 'generateReport', 'done'];
+      return allowedTools.includes(entry.tool);
+    }
+
+    return false;
+  }
+
+  // Non-fast mode: Send progress for key milestones and important events
   if (entry.level === LOG_LEVELS.INFO && entry.msg) {
     const msg = entry.msg.toLowerCase();
     // Key progress indicators - be more selective
@@ -1257,21 +1370,29 @@ function shouldSendProgressToChat(entry) {
         msg.includes('report generated')) {
       return true;
     }
-    
+
     // Skip generic "completed" messages to reduce noise
     if (msg.includes('completed') && !msg.includes('plan completed')) {
       return false;
     }
   }
-  
+
+  // Surface warnings for stuck/correction events
+  if (entry.level === LOG_LEVELS.WARN && entry.msg) {
+    const m = entry.msg.toLowerCase();
+    if (m.includes('watchdog') || m.includes('self-correction') || m.includes('re-executing')) {
+      return true;
+    }
+  }
+
   // Send success messages for important tools only
   if (entry.level === LOG_LEVELS.SUCCESS && entry.tool) {
-    const importantTools = ['navigate', 'smart_navigate', 'research_url', 'multi_search', 'generate_report'];
+    const importantTools = ['navigate', 'navigateToUrl', 'smart_navigate', 'research_url', 'multi_search', 'generate_report', 'generateReport', 'done'];
     if (importantTools.includes(entry.tool)) {
       return true;
     }
   }
-  
+
   return false;
 }
 
@@ -1301,12 +1422,35 @@ function formatProgressMessage(entry, sess) {
   // Tool execution messages - be more specific about what's happening
   if (msg.includes('Executing Tool')) {
     const tool = entry.tool || entry.action?.tool || 'action';
+    const p = entry.action?.params || {};
+    // Click actions
+    if (['click', 'click_element', 'clickElement'].includes(tool)) {
+      const target = Number.isFinite(p.elementIndex) ? `#${p.elementIndex}` : (p.selector ? `"${String(p.selector).slice(0, 80)}"` : 'element');
+      return `${stepPrefix} 👆 Clicking ${target}`;
+    }
+    // Typing actions
+    if (['type_text', 'typeText', 'fill'].includes(tool)) {
+      const txt = typeof p.text === 'string' ? String(p.text).slice(0, 50) : '';
+      const target = Number.isFinite(p.elementIndex) ? `#${p.elementIndex}` : (p.selector ? `"${String(p.selector).slice(0, 80)}"` : '');
+      const into = target ? ` into ${target}` : '';
+      return `${stepPrefix} ✏️ Typing "${txt}"${into}`;
+    }
+    // Wait/scroll actions
+    if (['wait_for_selector', 'waitForSelector'].includes(tool)) {
+      const sel = p.selector ? `"${String(p.selector).slice(0,80)}"` : '';
+      return `${stepPrefix} ⏳ Waiting for ${sel || 'selector'}`;
+    }
+    if (['scroll_to','scrollTo'].includes(tool)) {
+      const dir = p.direction ? `towards ${p.direction}` : '';
+      return `${stepPrefix} 📜 Scrolling ${dir}`.trim();
+    }
+    // Fallback
     return `${stepPrefix} 🔧 ${getToolEmoji(tool)} ${getToolDescription(tool)}`;
   }
   
   // Action completion messages - only show for important tools
   if (entry.level === LOG_LEVELS.SUCCESS && entry.tool) {
-    const importantTools = ['navigate', 'smart_navigate', 'research_url', 'multi_search', 'generate_report'];
+    const importantTools = ['navigate', 'navigateToUrl', 'smart_navigate', 'research_url', 'multi_search', 'generate_report', 'generateReport'];
     if (importantTools.includes(entry.tool)) {
       return `${stepPrefix} ✅ ${getToolDescription(entry.tool)} completed`;
     }
@@ -1346,22 +1490,71 @@ function formatProgressMessage(entry, sess) {
 // Get emoji for different tools
 function getToolEmoji(tool) {
   const emojiMap = {
+    // Canonical tool ids
     'navigate': '🌐',
-    'click': '👆',
-    'fill': '✏️',
-    'scroll': '📜',
-    'screenshot': '📸',
-    'scrape': '✂️',
-    'think': '🤔',
+    'goto_url': '🌐',
+    'navigateToUrl': '🌐',
+
+    'click_element': '👆',
+    'clickElement': '👆',
+
+    'type_text': '✏️',
+    'typeText': '✏️',
+
+    'select_option': '🎚️',
+
+    'scroll_to': '📜',
+    'scrollTo': '📜',
+
+    'wait_for_selector': '⏳',
     'waitForSelector': '⏳',
+
+    'take_screenshot': '📸',
+
+    'create_tab': '🆕',
+    'close_tab': '❌',
+    'switch_tab': '🔄',
+
     'tabs.query': '🗂️',
     'tabs.activate': '🔄',
     'tabs.close': '❌',
+
+    'scrape': '✂️',
+    'scrapeSelector': '✂️',
+
+    'read_page_content': '📖',
+    'readPageContent': '📖',
+
+    'extract_structured_content': '🧩',
+    'extractStructuredContent': '🧩',
+
+    'record_finding': '📝',
+    'recordFinding': '📝',
+
+    'analyze_urls': '🔍',
+    'analyzeUrls': '🔍',
+
+    'get_page_links': '🔗',
+    'extractLinks': '🔗',
+    'getInteractiveElements': '🔗',
+
     'smart_navigate': '🧭',
     'research_url': '🔬',
     'multi_search': '🔍',
-    'analyze_urls': '🔍',
-    'generate_report': '📄'
+    'continue_multi_search': '➡️',
+    'analyze_url_depth': '📊',
+
+    'generate_report': '📄',
+    'generateReport': '📄',
+
+    'think': '🤔',
+    'done': '✅',
+    // Legacy synonyms (back-compat for logs)
+    'click': '👆',
+    'fill': '✏️',
+    'scroll': '📜',
+    'waitForSelector': '⏳',
+    'screenshot': '📸'
   };
   return emojiMap[tool] || '🔧';
 }
@@ -1369,22 +1562,70 @@ function getToolEmoji(tool) {
 // Get user-friendly description for tools
 function getToolDescription(tool) {
   const descriptionMap = {
+    // Canonical tool ids
     'navigate': 'Opening webpage',
-    'click': 'Clicking element',
-    'fill': 'Filling form field',
-    'scroll': 'Scrolling page',
-    'scrape': 'Scraping content',
-    'think': 'Thinking',
-    'screenshot': 'Taking screenshot',
+    'goto_url': 'Opening webpage',
+    'navigateToUrl': 'Opening webpage',
+
+    'click_element': 'Clicking element',
+    'clickElement': 'Clicking element',
+
+    'type_text': 'Filling form field',
+    'typeText': 'Filling form field',
+
+    'select_option': 'Selecting option',
+
+    'scroll_to': 'Scrolling page',
+    'scrollTo': 'Scrolling page',
+
+    'wait_for_selector': 'Waiting for element',
     'waitForSelector': 'Waiting for element',
+
+    'take_screenshot': 'Taking screenshot',
+
+    'create_tab': 'Creating new tab',
+    'close_tab': 'Closing tab',
+    'switch_tab': 'Switching tab',
     'tabs.query': 'Searching tabs',
     'tabs.activate': 'Switching tab',
     'tabs.close': 'Closing tab',
+
+    'scrape': 'Scraping content',
+    'scrapeSelector': 'Scraping content',
+
+    'read_page_content': 'Reading page content',
+    'readPageContent': 'Reading page content',
+
+    'extract_structured_content': 'Extracting structured content',
+    'extractStructuredContent': 'Extracting structured content',
+
+    'record_finding': 'Recording finding',
+    'recordFinding': 'Recording finding',
+
+    'analyze_urls': 'Analyzing links',
+    'analyzeUrls': 'Analyzing links',
+
+    'get_page_links': 'Extracting links',
+    'extractLinks': 'Extracting links',
+    'getInteractiveElements': 'Listing interactive elements',
+
     'smart_navigate': 'Smart navigation',
     'research_url': 'Researching content',
     'multi_search': 'Multi-source search',
-    'analyze_urls': 'Analyzing links',
-    'generate_report': 'Creating report'
+    'continue_multi_search': 'Continuing multi-search',
+    'analyze_url_depth': 'Analyzing URL depth',
+
+    'generate_report': 'Creating report',
+    'generateReport': 'Creating report',
+
+    'think': 'Thinking',
+    'done': 'Task complete',
+    // Legacy synonyms (back-compat for logs)
+    'click': 'Clicking element',
+    'fill': 'Filling form field',
+    'scroll': 'Scrolling page',
+    'waitForSelector': 'Waiting for element',
+    'screenshot': 'Taking screenshot'
   };
   return descriptionMap[tool] || `Using ${tool}`;
 }
@@ -1404,12 +1645,18 @@ function stopAgent(tabId, reason = "STOP requested") {
   } catch (_) {}
   
   // Persist final session state
-  saveSessionToStorage(tabId, sess);
+  SessionManager.saveSessionToStorage(tabId, sess);
 
   // If the agent is stopping because the goal is achieved, clear the session from DB
   if (reason.includes("Goal achieved") || reason.includes("done")) {
     console.log(`[BG] Task for tab ${tabId} is complete. Clearing session from IndexedDB.`);
-    clearSession(tabId).catch(e => console.warn(`[BG] Failed to clear session ${tabId}:`, e));
+    try {
+      SessionManager.clearSession
+        ? SessionManager.clearSession(tabId).catch(e => console.warn(`[BG] Failed to clear session ${tabId}:`, e))
+        : null;
+    } catch (e) {
+      console.warn(`[BG] Failed to clear session ${tabId}:`, e);
+    }
   }
 }
 
@@ -1428,20 +1675,659 @@ function isRestrictedUrl(url = "") {
 }
 
 async function ensureContentScript(tabId) {
+  // Manual timeout wrapper for sendMessage (since the API has no timeout option)
+  const ping = (timeoutMs = 400) =>
+    new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error("PING_TIMEOUT"));
+      }, timeoutMs);
+
+      try {
+        chrome.tabs.sendMessage(tabId, { type: "__PING_CONTENT__" }, (res) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+          } else {
+            resolve(res);
+          }
+        });
+      } catch (err) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      }
+    });
+
   try {
-    await chrome.tabs.sendMessage(tabId, { type: "__PING_CONTENT__" });
-    return true;
+    // Try a quick ping to see if the current content script is responsive
+    const resp = await ping(300);
+    if (resp && resp.ok === true) {
+      // Full capability handshake
+      try {
+        const caps = await sendContentRPC(tabId, { type: MSG.AGENT_CAPS }, 800);
+        if (caps?.ok && caps.capabilities) {
+          contentScriptCaps.set(tabId, caps.capabilities);
+          const sess = agentSessions.get(tabId);
+          if (sess) {
+            sess.contentScriptCaps = caps.capabilities;
+          }
+          return true;
+        }
+      } catch (e) {
+        // Handshake failed; attempt injection below
+        console.warn(`[BG] AGENT_CAPS handshake failed for tab ${tabId}:`, e);
+      }
+    }
   } catch {
+    // No listener or timed out — attempt to inject the latest scripts
+  }
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      // Ensure ranker is present before DOMAgent so DOMAgent.getInteractiveElements works
+      files: ["common/messages.js", "content/element-ranker.js", "content/dom-agent.js", "content/content.js"]
+    });
+    // Confirm the newly injected script is responsive
+    const resp2 = await ping(800);
+    if (resp2 && resp2.ok === true) {
+      // Retry handshake after injection
+      try {
+        const caps = await sendContentRPC(tabId, { type: MSG.AGENT_CAPS }, 800);
+        if (caps?.ok && caps.capabilities) {
+          contentScriptCaps.set(tabId, caps.capabilities);
+          const sess = agentSessions.get(tabId);
+          if (sess) {
+            sess.contentScriptCaps = caps.capabilities;
+          }
+          return true;
+        }
+      } catch (e) {
+        console.warn(`[BG] AGENT_CAPS handshake failed after injection for tab ${tabId}:`, e);
+      }
+      return true; // Assume basic functionality even if handshake fails
+    }
+    return false;
+  } catch (injectionError) {
+    console.error(`[BG] Failed to inject or ping content script for tab ${tabId}:`, injectionError);
+    return false;
+  }
+}
+
+// Persistent Port channel manager to reduce per-action message overhead
+const AgentPortManager = (() => {
+  const ports = new Map();   // tabId -> { port, pending: Map<id, {resolve,reject,to}>, heartbeat: intervalId }
+  let nextId = 1;
+
+  function getEntry(tabId) {
+    let entry = ports.get(tabId);
+    if (entry && entry.port) return entry;
+
+    const port = chrome.tabs.connect(tabId, { name: "agent-port" });
+    const pending = new Map();
+
+    port.onMessage.addListener((packet) => {
+      try {
+        const id = packet && packet.id;
+        if (id === '__HEARTBEAT_PONG__') return; // Ignore heartbeat responses
+        const res = pending.get(id);
+        if (!res) return;
+        pending.delete(id);
+        try { clearTimeout(res.to); } catch (_) {}
+        try { res.resolve(packet.result); } catch (_) {}
+      } catch (_) {}
+    });
+
+    port.onDisconnect.addListener(() => {
+      try {
+        const e = ports.get(tabId);
+        if (e) {
+          if (e.heartbeat) clearInterval(e.heartbeat);
+          if (e.pending) {
+            e.pending.forEach((p) => {
+              try { clearTimeout(p.to); } catch (_) {}
+              try { p.reject(new Error("Port disconnected")); } catch (_) {}
+            });
+            e.pending.clear();
+          }
+        }
+      } catch (_) {}
+      ports.delete(tabId);
+    });
+
+    // Heartbeat to detect BFCache disconnections
+    const heartbeat = setInterval(() => {
+      try {
+        port.postMessage({ id: '__HEARTBEAT_PING__' });
+      } catch (e) {
+        // Port is likely closed, trigger disconnect logic
+        port.disconnect();
+      }
+    }, 15000); // Send a ping every 15 seconds
+
+    entry = { port, pending, heartbeat };
+    ports.set(tabId, entry);
+    return entry;
+  }
+
+  async function request(tabId, message, timeoutMs) {
+    const entry = getEntry(tabId);
+    const id = (nextId++ & 0x7fffffff);
+    const payload = { id, message };
+    return await new Promise((resolve, reject) => {
+      const to = setTimeout(() => {
+        try { entry.pending.delete(id); } catch (_) {}
+        reject(new Error(`Port RPC timeout after ${timeoutMs || (MessageTypes?.TIMEOUTS?.DOM_ACTION_MS || 10000)}ms`));
+      }, Math.max(500, Number(timeoutMs || (MessageTypes?.TIMEOUTS?.DOM_ACTION_MS || 10000))));
+      entry.pending.set(id, { resolve, reject, to });
+      try {
+        entry.port.postMessage(payload);
+      } catch (e) {
+        try { clearTimeout(to); } catch (_) {}
+        try { entry.pending.delete(id); } catch (_) {}
+        reject(e);
+      }
+    });
+  }
+
+  function invalidate(tabId) {
+    const entry = ports.get(tabId);
+    try { entry?.port?.disconnect(); } catch (_) {}
+    ports.delete(tabId);
+  }
+
+  return { request, invalidate };
+})();
+
+// Enhanced action executor with immediate element refresh strategy
+// Cache for recent element fetches to avoid redundancy
+const elementFetchCache = new Map(); // tabId -> { timestamp, elements, operationType }
+
+// Adaptive cache TTL based on operation complexity
+const CACHE_TTL_CONFIG = {
+  'click': 1500,      // Clicks may cause navigation, longer TTL
+  'type': 2000,       // Typing often follows clicks, longer TTL
+  'navigation': 500,  // Navigation changes everything, short TTL
+  'wait': 3000,       // Wait operations need stable state, longest TTL
+  'default': 1000     // Default TTL
+};
+
+// Connection health cache to prevent excessive checking
+const connectionHealthCache = new Map(); // tabId -> { timestamp, isHealthy }
+const CONNECTION_HEALTH_TTL = 500; // 500ms throttling for connection checks
+
+// Retry coordination to prevent redundant refresh cycles
+const refreshRetryState = new Map(); // tabId -> { timestamp, attemptCount, actionType }
+const MAX_REFRESH_ATTEMPTS = 2;
+const RETRY_COOLDOWN = 1000; // 1 second cooldown between retry cycles
+
+// Get adaptive TTL based on operation type
+function getAdaptiveTTL(operationType) {
+  return CACHE_TTL_CONFIG[operationType] || CACHE_TTL_CONFIG.default;
+}
+
+// Clear element cache on navigation or BFCache events
+function clearElementCache(tabId, reason = 'unknown') {
+  if (elementFetchCache.has(tabId)) {
+    console.log(`[BG] Clearing element cache for tab ${tabId}, reason: ${reason}`);
+    elementFetchCache.delete(tabId);
+  }
+}
+
+// Enhanced BFCache error detection
+function isBFCacheError(error) {
+  const errorMsg = String(error?.message || error || '').toLowerCase();
+  return /back.*forward.*cache|message channel.*closed|port.*disconnected|extension port.*moved|keeping.*extension.*moved|page.*keeping.*extension.*port.*moved|moved.*into.*back.*forward.*cache/.test(errorMsg);
+}
+
+// Global error handler for uncaught BFCache errors
+if (typeof window !== 'undefined' && window.chrome?.runtime) {
+  // Handle uncaught runtime errors that might be BFCache related
+  const originalAddListener = chrome.runtime.onMessage.addListener;
+  chrome.runtime.onMessage.addListener = function(callback) {
+    const wrappedCallback = function(message, sender, sendResponse) {
+      try {
+        return callback(message, sender, sendResponse);
+      } catch (error) {
+        if (isBFCacheError(error)) {
+          console.log(`[BG] Caught BFCache error in message handler:`, error.message);
+          if (sender?.tab?.id) {
+            clearElementCache(sender.tab.id, 'uncaught_bfcache_error');
+          }
+        }
+        throw error;
+      }
+    };
+    return originalAddListener.call(this, wrappedCallback);
+  };
+}
+
+// Enhanced timing safeguards for page interactivity
+async function waitForPageStability(tabId, maxWaitMs = 2000, skipIfRecentFetch = true) {
+  // Check DOM readiness first before element fetching
+  const domCheck = await checkDOMReadiness(tabId, 500);
+  if (!domCheck.ready) {
+    console.warn(`[BG] DOM not ready for tab ${tabId}: ${domCheck.readyState}, elements: ${domCheck.elementCount}`);
+    // Continue anyway but with awareness of DOM state
+  }
+  
+  // Check if we have a recent element fetch to avoid redundancy
+  if (skipIfRecentFetch) {
+    const cached = elementFetchCache.get(tabId);
+    if (cached && Date.now() - cached.timestamp < getAdaptiveTTL('stability_check')) {
+      console.log(`[BG] Using recent element fetch (${cached.elements.length} elements) from ${Date.now() - cached.timestamp}ms ago`);
+      return cached.elements.length;
+    }
+  }
+  
+  const start = Date.now();
+  let lastElementCount = 0;
+  let stableCount = 0;
+  
+  while (Date.now() - start < maxWaitMs) {
     try {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        files: ["common/messages.js", "content/content.js"]
+      const mapRes = await sendContentRPC(tabId, { type: "GET_ELEMENT_MAP" }, getFastTimeout('getInteractiveElements'));
+      const currentCount = (mapRes?.ok && mapRes.elements) ? mapRes.elements.length : 0;
+      
+      if (currentCount === lastElementCount && currentCount > 0) {
+        stableCount++;
+        if (stableCount >= 2) { // Elements stable for 2 checks
+          console.log(`[BG] Page stable with ${currentCount} elements after ${Date.now() - start}ms`);
+          
+          // Cache the result to avoid redundant fetches
+          elementFetchCache.set(tabId, {
+            timestamp: Date.now(),
+            elements: mapRes.elements || [],
+            operationType: 'stability_check'
+          });
+          
+          return currentCount;
+        }
+      } else {
+        stableCount = 0;
+        lastElementCount = currentCount;
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, 300)); // Wait 300ms between checks
+    } catch (error) {
+      console.warn(`[BG] Page stability check failed:`, error.message);
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+  }
+  
+  console.warn(`[BG] Page stability timeout after ${maxWaitMs}ms, proceeding anyway`);
+  return lastElementCount;
+}
+
+async function refreshElementsAndExecute(tabId, targetSelector, targetIndex, actionType = "interaction") {
+  // Check retry state to prevent excessive refresh cycles
+  const retryState = refreshRetryState.get(tabId);
+  if (retryState && retryState.actionType === actionType) {
+    const timeSinceLastAttempt = Date.now() - retryState.timestamp;
+    if (timeSinceLastAttempt < RETRY_COOLDOWN && retryState.attemptCount >= MAX_REFRESH_ATTEMPTS) {
+      console.warn(`[BG] Skipping refresh for ${actionType} on tab ${tabId} - max attempts reached (${retryState.attemptCount}/${MAX_REFRESH_ATTEMPTS})`);
+      // Return cached elements if available
+      const cached = elementFetchCache.get(tabId);
+      if (cached) {
+        return { element: null, allElements: cached.elements, usedFallback: false };
+      }
+      throw new Error(`Max refresh attempts reached for ${actionType}`);
+    }
+  }
+  
+  // Update retry state
+  const currentAttempts = (retryState && retryState.actionType === actionType && Date.now() - retryState.timestamp < RETRY_COOLDOWN) 
+    ? retryState.attemptCount + 1 : 1;
+  refreshRetryState.set(tabId, {
+    timestamp: Date.now(),
+    attemptCount: currentAttempts,
+    actionType: actionType
+  });
+  
+  console.log(`[BG] Refreshing elements before ${actionType} on tab ${tabId} (attempt ${currentAttempts}/${MAX_REFRESH_ATTEMPTS})`);
+  
+  try {
+    // Check for recent cached elements first to avoid redundant calls
+    const cached = elementFetchCache.get(tabId);
+    let mapRes;
+    
+    const adaptiveTTL = getAdaptiveTTL(actionType);
+    if (cached && Date.now() - cached.timestamp < adaptiveTTL) {
+      console.log(`[BG] Using cached elements from ${Date.now() - cached.timestamp}ms ago for ${actionType} (TTL: ${adaptiveTTL}ms)`);
+      mapRes = { ok: true, elements: cached.elements };
+    } else {
+      // Enhanced timing safeguards - wait for page stability and use its results
+      const stableElements = await waitForPageStability(tabId, 2000, false); // Don't skip, get fresh elements
+      
+      // Check if waitForPageStability already populated our cache
+      const newCached = elementFetchCache.get(tabId);
+      if (newCached && Date.now() - newCached.timestamp < 200) { // Very recent cache from stability check
+        console.log(`[BG] Using elements from stability check (${newCached.elements.length} elements)`);
+        mapRes = { ok: true, elements: newCached.elements };
+      } else {
+        // Fallback: do one more fetch but with minimal delay
+        console.log(`[BG] Stability check didn't cache elements, doing direct fetch`);
+        await sendContentRPC(tabId, { type: MSG.SETTLE }, getFastTimeout("settle")).catch(() => {});
+        mapRes = await sendContentRPC(tabId, { type: "GET_ELEMENT_MAP" }, getFastTimeout('getInteractiveElements'));
+        
+        // Cache the fresh result
+        if (mapRes?.ok && mapRes.elements) {
+          elementFetchCache.set(tabId, {
+            timestamp: Date.now(),
+            elements: mapRes.elements,
+            operationType: actionType
+          });
+        }
+      }
+    }
+    
+    if (!mapRes?.ok) {
+      throw new Error(`Failed to refresh elements: ${mapRes?.error || "Unknown error"}`);
+    }
+    
+    const elements = (mapRes.elements || (mapRes.map && mapRes.map.elements)) || [];
+    console.log(`[BG] Refreshed ${elements.length} elements on tab ${tabId}`);
+    
+    // Enhanced element selection with fuzzy matching
+    if (targetSelector) {
+      // First try exact match
+      let matchingElement = elements.find(el => el.selector === targetSelector);
+      
+      if (!matchingElement) {
+        console.warn(`[BG] Exact selector '${targetSelector}' not found, trying fuzzy matching`);
+        
+        // Try partial matches (for dynamic selectors that may change)
+        const selectorParts = targetSelector.split(/[\s>+~]/).filter(p => p.trim());
+        if (selectorParts.length > 0) {
+          const mainPart = selectorParts[selectorParts.length - 1]; // Get the last part
+          matchingElement = elements.find(el => 
+            el.selector && el.selector.includes(mainPart)
+          );
+          
+          if (matchingElement) {
+            console.log(`[BG] Found fuzzy match for '${mainPart}': ${matchingElement.selector}`);
+          }
+        }
+        
+        // Try text/label based matching if selector matching fails
+        if (!matchingElement && elements.length > 0) {
+          const textToMatch = targetSelector.match(/text\(["']([^"']+)["']\)|:has-text\(["']([^"']+)["']\)|\[[^\]]*=["']([^"']+)["']\]/)?.[1];
+          if (textToMatch) {
+            matchingElement = elements.find(el => 
+              el.text?.includes(textToMatch) ||
+              el.ariaLabel?.includes(textToMatch) ||
+              el.name?.includes(textToMatch)
+            );
+            
+            if (matchingElement) {
+              console.log(`[BG] Found text-based match for '${textToMatch}': ${matchingElement.selector}`);
+            }
+          }
+        }
+        
+        // Final fallback to index if available
+        if (!matchingElement && Number.isFinite(targetIndex) && targetIndex > 0 && targetIndex <= elements.length) {
+          const fallbackElement = elements[targetIndex - 1];
+          console.log(`[BG] Using element index ${targetIndex} as final fallback:`, fallbackElement);
+          return { element: fallbackElement, allElements: elements, usedFallback: true };
+        }
+      } else {
+        console.log(`[BG] Found exact matching element for selector '${targetSelector}':`, matchingElement);
+      }
+      
+      if (matchingElement) {
+        return { element: matchingElement, allElements: elements, usedFallback: false };
+      }
+    }
+    
+    // If we have an index, use it
+    if (Number.isFinite(targetIndex) && targetIndex > 0 && targetIndex <= elements.length) {
+      const indexElement = elements[targetIndex - 1];
+      console.log(`[BG] Using element at index ${targetIndex}:`, indexElement);
+      return { element: indexElement, allElements: elements, usedFallback: false };
+    }
+    
+    // Clear retry state on successful completion
+    refreshRetryState.delete(tabId);
+    
+    // Return all elements for further selection
+    return { element: null, allElements: elements, usedFallback: false };
+  } catch (error) {
+    console.error(`[BG] Failed to refresh elements for ${actionType}:`, error);
+    throw error;
+  }
+}
+
+// Enhanced communication layer with robust connection checking
+async function checkConnectionHealth(tabId, timeoutMs = 300) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error("HEALTH_CHECK_TIMEOUT"));
+    }, timeoutMs);
+
+    try {
+      chrome.tabs.sendMessage(tabId, { type: "__PING_CONTENT__" }, (res) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else if (res?.ok === true) {
+          resolve(true);
+        } else {
+          reject(new Error("UNHEALTHY_RESPONSE"));
+        }
       });
+    } catch (err) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    }
+  });
+}
+
+// Enhanced DOM ready state checking
+async function checkDOMReadiness(tabId, timeoutMs = 1000) {
+  try {
+    // First check tab loading status
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.status !== 'complete') {
+      throw new Error(`Tab status is ${tab.status}, not complete`);
+    }
+    
+    // Then check document readiness via content script
+    const result = await sendContentRPC(tabId, { 
+      type: "GET_DOM_STATE" 
+    }, timeoutMs).catch(() => null);
+    
+    if (result?.readyState === 'complete' && result?.elementCount > 0) {
+      return {
+        ready: true,
+        elementCount: result.elementCount,
+        readyState: result.readyState
+      };
+    }
+    
+    return {
+      ready: false,
+      elementCount: result?.elementCount || 0,
+      readyState: result?.readyState || 'unknown'
+    };
+  } catch (error) {
+    return {
+      ready: false,
+      elementCount: 0,
+      readyState: 'error',
+      error: error.message
+    };
+  }
+}
+
+// Enhanced connection manager with automatic recovery
+async function ensureRobustConnection(tabId) {
+  // Check if we recently verified this connection
+  const cached = connectionHealthCache.get(tabId);
+  if (cached && Date.now() - cached.timestamp < CONNECTION_HEALTH_TTL) {
+    if (cached.isHealthy) {
+      console.log(`[BG] Using cached connection health for tab ${tabId} (${Date.now() - cached.timestamp}ms ago)`);
       return true;
-    } catch {
+    }
+  }
+  
+  console.log(`[BG] Ensuring robust connection for tab ${tabId}`);
+  
+  try {
+    // Step 1: Quick health check
+    await checkConnectionHealth(tabId, 300);
+    console.log(`[BG] Connection healthy for tab ${tabId}`);
+    
+    // Cache positive result
+    connectionHealthCache.set(tabId, {
+      timestamp: Date.now(),
+      isHealthy: true
+    });
+    
+    return true;
+  } catch (healthError) {
+    console.warn(`[BG] Connection unhealthy for tab ${tabId}:`, healthError.message);
+    
+    // Cache negative result for shorter time
+    connectionHealthCache.set(tabId, {
+      timestamp: Date.now(),
+      isHealthy: false
+    });
+    
+    // Step 2: Attempt content script re-injection
+    try {
+      console.log(`[BG] Re-injecting content scripts for tab ${tabId}`);
+      await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        files: ["common/messages.js", "content/element-ranker.js", "content/dom-agent.js", "content/content.js"]
+      });
+      
+      // Step 3: Verify connection after injection
+      await checkConnectionHealth(tabId, 800);
+      console.log(`[BG] Connection restored for tab ${tabId}`);
+      return true;
+    } catch (injectionError) {
+      console.error(`[BG] Failed to restore connection for tab ${tabId}:`, injectionError);
       return false;
     }
   }
+}
+
+// Helper that prefers Port RPC and falls back to sendMessage for resilience
+async function sendContentRPC(tabId, message, timeoutMs) {
+  // Pre-flight connection check for critical operations
+  const isCriticalOperation = message.type === "GET_ELEMENT_MAP" || 
+                              message.type === "CLICK_SELECTOR" || 
+                              message.type === "FILL_SELECTOR" ||
+                              message.type === "DEBUG_CLICK_INDEX" ||
+                              message.type === "DEBUG_FILL_INDEX";
+  
+  if (isCriticalOperation) {
+    try {
+      await ensureRobustConnection(tabId);
+    } catch (connectionError) {
+      throw new Error(`Failed to establish robust connection: ${connectionError.message}`);
+    }
+  }
+  
+  try {
+    return await AgentPortManager.request(tabId, message, timeoutMs);
+  } catch (e) {
+    const msg = String(e?.message || e || "");
+    const retriable = /Port RPC timeout|Port disconnected|message channel is closed|back\/forward cache|Could not establish connection/i.test(msg);
+      
+      // Enhanced BFCache error handling with better logging
+      if (isBFCacheError(msg)) {
+        console.warn(`[BG] BFCache error detected for tab ${tabId}: ${msg}`);
+        try {
+          clearElementCache(tabId, 'bfcache_error');
+        } catch (error) {
+          console.warn(`[BG] Failed to clear element cache on BFCache error:`, error);
+        }
+      }
+    if (retriable) {
+      console.warn(`[BG] Retriable error for tab ${tabId}, attempting recovery:`, msg);
+      
+      // Invalidate any stale channel and ensure content script is present before retry
+      try { AgentPortManager.invalidate(tabId); } catch (_) {}
+      
+      // Enhanced connection recovery
+      const connectionRestored = await ensureRobustConnection(tabId);
+      if (!connectionRestored) {
+        throw new Error("Failed to restore connection after multiple attempts");
+      }
+      
+      // Attempt one fresh Port retry after ensuring content script
+      try {
+        return await AgentPortManager.request(tabId, message, timeoutMs);
+      } catch (e2) {
+        // Fallback to classic sendMessage on second failure
+        return new Promise((resolve, reject) => {
+          chrome.tabs.sendMessage(tabId, message, (response) => {
+            if (chrome.runtime.lastError) {
+              // Consume the error but reject the promise to signal failure
+              reject(new Error(chrome.runtime.lastError.message));
+              return;
+            }
+            // Handle structured errors from content script
+            if (response && response.ok === false && response.errorCode) {
+              const error = new Error(response.error || "Content script error");
+              error.errorCode = response.errorCode;
+              reject(error);
+            } else {
+              resolve(response);
+            }
+          });
+        });
+      }
+    }
+    // If not a retriable port error, re-throw
+    throw e;
+  }
+}
+
+// Debug overlay helpers (best-effort; never throw)
+async function showOverlayForDebug(tabId, options = {}) {
+  try {
+    if (!(await ensureContentScript(tabId))) return;
+    const payload = {
+      type: MSG.DEBUG_SHOW_OVERLAY,
+      limit: Number.isFinite(options.limit) ? options.limit : 50,
+      minScore: Number.isFinite(options.minScore) ? options.minScore : 0,
+      colorScheme: options.colorScheme || "type",
+      fixedColor: options.fixedColor,
+      clickableBadges: !!options.clickableBadges
+    };
+    await sendContentRPC(tabId, payload, getFastTimeout("getInteractiveElements"));
+  } catch (_) {}
+}
+
+async function updateOverlayForDebug(tabId) {
+  try {
+    if (!(await ensureContentScript(tabId))) return;
+    await sendContentRPC(tabId, { type: MSG.DEBUG_UPDATE_OVERLAY }, getFastTimeout("getInteractiveElements"));
+  } catch (_) {}
+}
+
+async function highlightSelectorForDebug(tabId, selector, label, color = "#ff9800", durationMs = 1200) {
+  try {
+    if (!selector) return;
+    if (!(await ensureContentScript(tabId))) return;
+    await sendContentRPC(tabId, { type: MSG.DEBUG_HIGHLIGHT_SELECTOR, selector, label, color, durationMs }, 1500);
+  } catch (_) {}
 }
 
 /**
@@ -1461,6 +2347,14 @@ async function ensureContentScript(tabId) {
       id: "navigateToUrl",
       title: "Navigate to URL",
       description: "Open the specified URL in the current tab.",
+      capabilities: {
+        readOnly: false,
+        requiresVisibleElement: false,
+        requiresContentScript: false,
+        framesSupport: "all",
+        shadowDom: "none",
+        navigation: { causesNavigation: true, waitsForLoad: true }
+      },
       inputSchema: {
         type: "object",
         properties: {
@@ -1489,6 +2383,14 @@ async function ensureContentScript(tabId) {
       id: "extractLinks",
       title: "Extract Page Links",
       description: "Extract relevant links from the current page.",
+      capabilities: {
+        readOnly: true,
+        requiresVisibleElement: false,
+        requiresContentScript: true,
+        framesSupport: "same-origin",
+        shadowDom: "partial",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
       inputSchema: {
         type: "object",
         properties: {
@@ -1505,7 +2407,7 @@ async function ensureContentScript(tabId) {
         if (!(await ctx.ensureContentScript(tabId))) {
           return { ok: false, observation: "Content script unavailable" };
         }
-        const res = await chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_LINKS", includeExternal, maxLinks });
+        const res = await sendContentRPC(tabId, { type: "GET_PAGE_LINKS", includeExternal, maxLinks });
         if (res?.ok) {
           return {
             ok: true,
@@ -1522,6 +2424,14 @@ async function ensureContentScript(tabId) {
       id: "readPageContent",
       title: "Read Page Content",
       description: "Reads textual content from the current page.",
+      capabilities: {
+        readOnly: true,
+        requiresVisibleElement: false,
+        requiresContentScript: true,
+        framesSupport: "same-origin",
+        shadowDom: "partial",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
       inputSchema: {
         type: "object",
         properties: {
@@ -1535,7 +2445,7 @@ async function ensureContentScript(tabId) {
           return { ok: false, observation: "Content script unavailable" };
         }
         const maxChars = Number(input?.maxChars || 15000);
-        const res = await chrome.tabs.sendMessage(tabId, { type: "READ_PAGE_CONTENT", maxChars });
+        const res = await sendContentRPC(tabId, { type: "READ_PAGE_CONTENT", maxChars });
         if (res?.ok) {
           return { ok: true, observation: `Read page content (${res.text?.length || 0} chars)`, pageContent: res.text };
         }
@@ -1548,6 +2458,14 @@ async function ensureContentScript(tabId) {
       id: "analyzeUrls",
       title: "Analyze Page URLs",
       description: "Analyzes current page for relevant links/URLs.",
+      capabilities: {
+        readOnly: true,
+        requiresVisibleElement: false,
+        requiresContentScript: true,
+        framesSupport: "same-origin",
+        shadowDom: "partial",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
       inputSchema: { type: "object", properties: {} },
       retryPolicy: { maxAttempts: 1 },
       run: async (ctx) => {
@@ -1555,7 +2473,7 @@ async function ensureContentScript(tabId) {
         if (!(await ctx.ensureContentScript(tabId))) {
           return { ok: false, observation: "Content script unavailable" };
         }
-        const res = await chrome.tabs.sendMessage(tabId, { type: MSG.ANALYZE_PAGE_URLS });
+        const res = await sendContentRPC(tabId, { type: MSG.ANALYZE_PAGE_URLS });
         if (res?.ok) {
           return {
             ok: true,
@@ -1572,6 +2490,14 @@ async function ensureContentScript(tabId) {
       id: "extractStructuredContent",
       title: "Extract Structured Content",
       description: "Extracts structured content (JSON-LD, metadata) from the page.",
+      capabilities: {
+        readOnly: true,
+        requiresVisibleElement: false,
+        requiresContentScript: true,
+        framesSupport: "same-origin",
+        shadowDom: "partial",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
       inputSchema: { type: "object", properties: {} },
       retryPolicy: { maxAttempts: 1 },
       run: async (ctx) => {
@@ -1579,7 +2505,7 @@ async function ensureContentScript(tabId) {
         if (!(await ctx.ensureContentScript(tabId))) {
           return { ok: false, observation: "Content script unavailable" };
         }
-        const res = await chrome.tabs.sendMessage(tabId, { type: MSG.EXTRACT_STRUCTURED_CONTENT });
+        const res = await sendContentRPC(tabId, { type: MSG.EXTRACT_STRUCTURED_CONTENT });
         if (res?.ok) {
           return { ok: true, observation: `Structured content extracted via ${res.content?.source || 'unknown'}`, content: res.content };
         }
@@ -1592,6 +2518,14 @@ async function ensureContentScript(tabId) {
       id: "recordFinding",
       title: "Record Finding",
       description: "Stores a structured finding into the current session.",
+      capabilities: {
+        readOnly: false,
+        requiresVisibleElement: false,
+        requiresContentScript: false,
+        framesSupport: "none",
+        shadowDom: "none",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
       inputSchema: {
         type: "object",
         properties: {
@@ -1611,9 +2545,9 @@ async function ensureContentScript(tabId) {
           return { ok: false, observation: "No active session" };
         }
         try {
-          sess.findings = deepMerge(sess.findings || {}, finding);
+          sess.findings = Utils.deepMerge(sess.findings || {}, finding);
           emitAgentLog(tabId, { level: LOG_LEVELS.SUCCESS, msg: "Recorded finding to session (via ToolsRegistry)", finding });
-          await saveSessionToStorage(tabId, sess);
+          await SessionManager.saveSessionToStorage(tabId, sess);
           return { ok: true, observation: "Finding recorded" };
         } catch (e) {
           return { ok: false, observation: `Failed to record finding: ${String(e?.message || e)}` };
@@ -1621,7 +2555,920 @@ async function ensureContentScript(tabId) {
       }
     });
 
-    console.log("[BG] Core tools registered: navigateToUrl, extractLinks, readPageContent, analyzeUrls, extractStructuredContent, recordFinding");
+    // DOM interaction tools leveraging content script + DOMAgent (when present)
+    // clickElement
+    globalThis.ToolsRegistry.registerTool({
+      id: "clickElement",
+      title: "Click Element",
+      description: "Click an element specified by CSS selector.",
+      capabilities: {
+        readOnly: false,
+        requiresVisibleElement: true,
+        requiresContentScript: true,
+        framesSupport: "all",
+        shadowDom: "full",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
+      inputSchema: {
+        type: "object",
+        properties: {
+          selector: { type: "string", maxLength: 2000 },
+          elementIndex: { type: ["integer","number"] }
+        }
+      },
+      retryPolicy: { maxAttempts: 2, backoffMs: 200 },
+      run: async (ctx, input) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+        
+        const idx = Number(input?.elementIndex);
+        const selector = input?.selector;
+        
+        // SMART LOGIC LAYER: Always refresh elements before interaction
+        try {
+          const elementData = await refreshElementsAndExecute(tabId, selector, idx, "click");
+          
+          // Strategy 1: If we have a specific element from refresh, use its current selector
+          if (elementData.element) {
+            const currentSelector = elementData.element.selector;
+            const currentIndex = elementData.allElements.findIndex(el => el.selector === currentSelector) + 1;
+            
+            console.log(`[BG] Using refreshed element for click: selector=${currentSelector}, index=${currentIndex}`);
+            
+            // Try selector-based click first (more reliable than index)
+            const selectorRes = await sendContentRPC(tabId, { type: MSG.CLICK_SELECTOR, selector: currentSelector }, getFastTimeout('clickElement'));
+            if (selectorRes?.ok) {
+              return { ok: true, observation: selectorRes.msg || "Clicked refreshed element" };
+            }
+            
+            // Fallback to index-based clicking if selector failed
+            if (currentIndex > 0) {
+              console.log(`[BG] Selector click failed, trying index ${currentIndex}`);
+              const res = await sendContentRPC(tabId, { type: "DEBUG_CLICK_INDEX", index: currentIndex }, getFastTimeout('clickElement'));
+              if (res?.ok) {
+                return { ok: true, observation: res.msg || `Clicked refreshed element at index ${currentIndex}` };
+              }
+            }
+            
+            console.log(`[BG] Both selector and index click failed for refreshed element`);
+          }
+          
+          // Strategy 2: Try selector-based click if provided
+          if (selector) {
+            const res = await sendContentRPC(tabId, { type: MSG.CLICK_SELECTOR, selector: selector }, getFastTimeout('clickElement'));
+            if (res?.ok) {
+              return { ok: true, observation: res.msg || "Clicked" };
+            }
+            console.log(`[BG] Direct selector click failed: ${res?.error}`);
+          }
+          
+          // Strategy 3: Try index-based click with overlay refresh
+          if (Number.isFinite(idx) && idx > 0 && idx <= elementData.allElements.length) {
+            // First ensure overlay is updated for reliable index mapping
+            try {
+              await sendContentRPC(tabId, { type: MSG.DEBUG_UPDATE_OVERLAY }, getFastTimeout('debugUpdate'));
+            } catch (e) {
+              console.warn(`[BG] Could not update overlay before click: ${e.message}`);
+            }
+            
+            const res = await sendContentRPC(tabId, { type: "DEBUG_CLICK_INDEX", index: idx }, getFastTimeout('clickElement'));
+            if (res?.ok) {
+              return { ok: true, observation: res.msg || `Clicked index ${idx}` };
+            }
+            console.log(`[BG] Index click failed: ${res?.error}`);
+          }
+          
+          // Enhanced error reporting with element context and better guidance
+          const availableElements = elementData.allElements.slice(0, 10).map((el, i) => {
+            const description = el.purpose || el.accessibleName || el.text || el.tagName || 'element';
+            const shortDesc = String(description).slice(0, 50);
+            const isClickable = el.tagName && ['A', 'BUTTON', 'INPUT'].includes(el.tagName.toUpperCase());
+            const clickIcon = isClickable ? '👆' : '◦';
+            return `${clickIcon} ${i+1}. ${shortDesc} (${el.selector})`;
+          }).join('\n');
+          
+          return { 
+            ok: false, 
+            observation: `Click failed - please specify elementIndex (1-${elementData.allElements.length}) or valid selector. Available elements:\n${availableElements}\n\n💡 Tip: Use elementIndex like {"elementIndex": 1} to click the first element.` 
+          };
+        } catch (error) {
+          return { ok: false, observation: `Element refresh failed: ${error.message}` };
+        }
+      }
+    });
+
+    // typeText
+    globalThis.ToolsRegistry.registerTool({
+      id: "typeText",
+      title: "Type Text",
+      description: "Type text into a form field specified by CSS selector.",
+      capabilities: {
+        readOnly: false,
+        requiresVisibleElement: true,
+        requiresContentScript: true,
+        framesSupport: "all",
+        shadowDom: "full",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
+      inputSchema: {
+        type: "object",
+        properties: {
+          selector: { type: "string", maxLength: 2000 },
+          elementIndex: { type: ["integer","number"] },
+          text: { type: "string", maxLength: 8000 },
+          label: { "type": "string", "maxLength": 500 }
+        },
+        required: ["text"]
+      },
+      retryPolicy: { maxAttempts: 2, backoffMs: 200 },
+      run: async (ctx, input) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+        
+        const idx = Number(input?.elementIndex);
+        const selector = input?.selector;
+        const sess = agentSessions.get(tabId);
+        const caps = sess?.contentScriptCaps || contentScriptCaps.get(tabId) || {};
+
+        // SMART LOGIC LAYER: Always refresh elements before interaction
+        try {
+          const elementData = await refreshElementsAndExecute(tabId, selector, idx, "type");
+          
+          // If we have a specific element from refresh, use its current index/selector
+          if (elementData.element) {
+            const currentSelector = elementData.element.selector;
+            const currentIndex = elementData.allElements.findIndex(el => el.selector === currentSelector) + 1;
+            
+            console.log(`[BG] Using refreshed element for typing: selector=${currentSelector}, index=${currentIndex}`);
+            
+            // Strategy: Prefer index-based fill if overlay is active and content script supports it
+            if (caps.supportsIndexFill && currentIndex > 0) {
+              try {
+                const fillRes = await sendContentRPC(tabId, { type: MSG.DEBUG_FILL_INDEX, index: currentIndex, value: input.text }, getFastTimeout('typeText'));
+                if (fillRes?.ok) {
+                  return { ok: true, observation: fillRes.msg || `Filled refreshed element at index ${currentIndex}` };
+                }
+                const observation = fillRes?.error || "Typing by refreshed index failed";
+                return { ok: false, observation, errorCode: fillRes?.errorCode };
+              } catch (e) {
+                const observation = e.message || "Typing by refreshed index failed";
+                return { ok: false, observation, errorCode: e.errorCode };
+              }
+            } else {
+              // Use selector-based approach with fresh selector
+              const res = await sendContentRPC(tabId, { type: MSG.FILL_SELECTOR, selector: currentSelector, value: input.text }, getFastTimeout('typeText'));
+              return res?.ok ? { ok: true, observation: res.msg || "Filled refreshed element" } : { ok: false, observation: res?.error || "Typing failed", errorCode: res?.errorCode };
+            }
+          }
+          
+          // Legacy strategy with refreshed context
+          if (caps.supportsIndexFill && Number.isFinite(idx) && idx > 0 && idx <= elementData.allElements.length) {
+            try {
+              const fillRes = await sendContentRPC(tabId, { type: MSG.DEBUG_FILL_INDEX, index: idx, value: input.text }, getFastTimeout('typeText'));
+              if (fillRes?.ok) {
+                return { ok: true, observation: fillRes.msg || `Filled index ${idx}` };
+              }
+              const observation = fillRes?.error || "Typing by index failed";
+              return { ok: false, observation, errorCode: fillRes?.errorCode };
+            } catch (e) {
+              const observation = e.message || "Typing by index failed";
+              return { ok: false, observation, errorCode: e.errorCode };
+            }
+          }
+        } catch (error) {
+          console.error(`[BG] Element refresh failed for typeText:`, error);
+          // Continue with legacy behavior as fallback
+        }
+      
+        let sel = (input.selector || "").trim();
+
+        // Use already refreshed elements for inference if no selector provided
+        if (!sel) {
+          const elements = elementData?.allElements || [];
+          console.log(`[BG] Using already refreshed ${elements.length} elements for selector inference`);
+          
+          if (elements.length > 0) {
+            let candidate = null;
+            if (input.label) {
+              const label = String(input.label).toLowerCase();
+              candidate = elements.find(e => {
+                const name = String(e.name || '').toLowerCase();
+                const aria = String(e.ariaLabel || e.aria_label || '').toLowerCase();
+                const lbl = String(e.label || e.labelText || e.nearbyLabel || '').toLowerCase();
+                const ph = String(e.placeholder || '').toLowerCase();
+                const id = String(e.id || '').toLowerCase();
+                return (
+                  (name && name.includes(label)) ||
+                  (aria && aria.includes(label)) ||
+                  (lbl && lbl.includes(label)) ||
+                  (ph && ph.includes(label)) ||
+                  (id && id.includes(label))
+                );
+              });
+            }
+            if (!candidate) {
+              // Prefer visible text inputs or textareas (non-hidden)
+              candidate = elements.find(e => {
+                const tag = String(e.tag || e.tagName || '').toLowerCase();
+                const role = String(e.role || '').toLowerCase();
+                const inputType = String(e.inputType || e.type || '').toLowerCase();
+                return (tag === 'input' || tag === 'textarea' || role === 'textbox') && inputType !== 'hidden';
+              }) || elements.find(e => String(e.tag || e.tagName || '').toLowerCase() === 'input');
+            }
+            if (candidate) {
+              sel = candidate.selector;
+              emitAgentLog(tabId, { level: LOG_LEVELS.INFO, msg: `Inferred selector from fresh elements: ${sel}` });
+              highlightSelectorForDebug(tabId, sel, 'Inferred Type', '#4caf50', 1200);
+            }
+          }
+        }
+
+        // Preflight: ensure selector exists & is visible before attempting a selector-based fill.
+        if (sel) {
+          try {
+            const check = await sendContentRPC(tabId, { type: MSG.CHECK_SELECTOR, selector: sel, visibleOnly: true }, getFastTimeout('checkSelector'));
+            const found = !!(check && (check.exists === true || check.found === true || check.visible === true));
+            if (!found) {
+              // Give the page a brief chance to render then retry
+              try { await sendContentRPC(tabId, { type: MSG.SETTLE }, getFastTimeout("settle")); } catch (_) {}
+              const check2 = await sendContentRPC(tabId, { type: MSG.CHECK_SELECTOR, selector: sel, visibleOnly: true }, getFastTimeout('checkSelector'));
+              const found2 = !!(check2 && (check2.exists === true || check2.found === true || check2.visible === true));
+              if (!found2) {
+                return { ok: false, observation: `Selector not found or not visible: ${sel}` };
+              }
+            }
+          } catch (_) {
+            // If CHECK failed, we'll attempt the fill directly below as a best-effort
+          }
+        } else {
+            return { ok: false, observation: "No selector provided and could not infer one.", errorCode: "MISSING_SELECTOR" };
+        }
+      
+        try {
+          const res = await sendContentRPC(tabId, { type: MSG.FILL_SELECTOR, selector: sel, value: input.text }, getFastTimeout('typeText'));
+          if (res?.ok) {
+            return { ok: true, observation: res.msg || "Text entered" };
+          }
+          const observation = res?.error || "Typing failed";
+          return { ok: false, observation, errorCode: res?.errorCode };
+        } catch (e) {
+          const observation = e.message || "Typing failed";
+          return { ok: false, observation, errorCode: e.errorCode };
+        }
+      }
+    });
+
+    // waitForSelector
+    globalThis.ToolsRegistry.registerTool({
+      id: "waitForSelector",
+      title: "Wait For Selector",
+      description: "Wait until a selector appears (visible by default).",
+      capabilities: {
+        readOnly: true,
+        requiresVisibleElement: false,
+        requiresContentScript: true,
+        framesSupport: "all",
+        shadowDom: "full",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
+      inputSchema: {
+        type: "object",
+        properties: {
+          selector: { type: "string", maxLength: 2000 },
+          timeoutMs: { type: ["integer", "number"] }
+        },
+        required: ["selector"]
+      },
+      retryPolicy: { maxAttempts: 1 },
+      run: async (ctx, input) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+        const defaultTimeout = FAST_MODE_BG ? 2000 : 5000;
+        const timeoutMs = Number(input?.timeoutMs || defaultTimeout);
+        const res = await sendContentRPC(tabId, { type: MSG.WAIT_FOR_SELECTOR, selector: input.selector, timeoutMs }, timeoutMs);
+        return res?.ok ? { ok: true, observation: res.msg || "Selector found" } : { ok: false, observation: res?.error || "Wait failed" };
+      }
+    });
+
+    // checkSelector (instant existence/visibility check; no waiting)
+// settle (double rAF yield)
+globalThis.ToolsRegistry.registerTool({
+  id: "settle",
+  title: "Settle (yield two frames)",
+  description: "Waits for two requestAnimationFrame cycles to let the DOM settle.",
+  capabilities: {
+    readOnly: true,
+    requiresVisibleElement: false,
+    requiresContentScript: true,
+    framesSupport: "all",
+    shadowDom: "full",
+    navigation: { causesNavigation: false, waitsForLoad: false }
+  },
+  inputSchema: { type: "object", properties: {} },
+  retryPolicy: { maxAttempts: 1 },
+  run: async (ctx) => {
+    const tabId = ctx?.tabId;
+    if (!(await ctx.ensureContentScript(tabId))) {
+      return { ok: false, observation: "Content script unavailable" };
+    }
+    // Use Fast Mode-aware timeout without relying on a global flag
+    let timeoutMs = 2500;
+    try {
+      const o = await chrome.storage.local.get("FAST_MODE");
+      const fm = !!o?.FAST_MODE;
+      timeoutMs = fm ? 1200 : 2500;
+    } catch (_) {}
+    const res = await sendContentRPC(tabId, { type: MSG.SETTLE }, timeoutMs);
+    if (res?.ok) {
+      return { ok: true, observation: "Settled DOM (2 frames)" };
+    }
+    return { ok: false, observation: res?.error || "Settle failed" };
+  }
+});
+    globalThis.ToolsRegistry.registerTool({
+      id: "checkSelector",
+      title: "Check Selector",
+      description: "Check if a selector exists (and optionally visible) without waiting.",
+      capabilities: {
+        readOnly: true,
+        requiresVisibleElement: false,
+        requiresContentScript: true,
+        framesSupport: "all",
+        shadowDom: "full",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
+      inputSchema: {
+        type: "object",
+        properties: {
+          selector: { type: "string", maxLength: 2000 },
+          visibleOnly: { type: "boolean" }
+        },
+        required: ["selector"]
+      },
+      retryPolicy: { maxAttempts: 1 },
+      run: async (ctx, input) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+        const res = await sendContentRPC(tabId, { type: MSG.CHECK_SELECTOR, selector: input.selector, visibleOnly: input.visibleOnly !== false }, getFastTimeout('checkSelector'));
+        if (res?.ok) {
+          return { ok: true, observation: res.msg || (res.visible ? "Selector visible" : "Selector present"), found: res.exists ?? res.found, visible: res.visible === true };
+        }
+        return { ok: false, observation: res?.error || "Check selector failed" };
+      }
+    });
+
+    // clickAndWait (composite) - uses checkSelector and URL change monitoring
+    globalThis.ToolsRegistry.registerTool({
+      id: "clickAndWait",
+      title: "Click And Wait",
+      description: "Click a selector and wait for a condition (selector appear/disappear or URL change).",
+      capabilities: {
+        readOnly: false,
+        requiresVisibleElement: true,
+        requiresContentScript: true,
+        framesSupport: "all",
+        shadowDom: "full",
+        navigation: { causesNavigation: false, waitsForLoad: true }
+      },
+      inputSchema: {
+        type: "object",
+        properties: {
+          selector: { type: "string", maxLength: 2000 },
+          waitFor: {
+            type: "object",
+            properties: {
+              selector: { type: "string", maxLength: 2000 },
+              disappear: { type: "boolean" },
+              urlChange: { type: "boolean" },
+              timeoutMs: { type: ["integer", "number"] }
+            }
+          }
+        },
+        required: ["selector"]
+      },
+      retryPolicy: { maxAttempts: 1 },
+      run: async (ctx, input) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+
+        // Pre-capture URL if urlChange is requested
+        let initialUrl = null;
+        const wantsUrlChange = !!(input?.waitFor && input.waitFor.urlChange);
+        if (wantsUrlChange) {
+          try { const t = await chrome.tabs.get(tabId); initialUrl = t?.url || null; } catch (_) {}
+        }
+
+        // Click first
+        const clickRes = await sendContentRPC(tabId, { type: MSG.CLICK_SELECTOR, selector: input.selector });
+        if (!clickRes?.ok) {
+          return { ok: false, observation: clickRes?.error || "Click failed" };
+        }
+
+        // Determine waiting condition
+        const wf = input?.waitFor || {};
+        const defaultTimeout = FAST_MODE_BG ? 2500 : 6000;
+        const timeoutAt = Date.now() + Number(wf.timeoutMs || defaultTimeout);
+        const pollInterval = FAST_MODE_BG ? 75 : 150;
+
+        async function checkCondition() {
+          // URL change condition
+          if (wantsUrlChange) {
+            try {
+              const t = await chrome.tabs.get(tabId);
+              if (initialUrl && t?.url && t.url !== initialUrl) {
+                return { ok: true, observation: "URL changed after click" };
+              }
+            } catch (_) {}
+          }
+
+          // Selector appear/disappear
+          if (typeof wf.selector === 'string' && wf.selector) {
+            const res = await sendContentRPC(tabId, { type: MSG.CHECK_SELECTOR, selector: wf.selector, visibleOnly: true }).catch(() => null);
+            const foundVisible = !!(res && (res.visible || res.found));
+            if (wf.disappear === true) {
+              if (!foundVisible) return { ok: true, observation: `Wait condition met: selector disappeared (${wf.selector})` };
+            } else {
+              if (foundVisible) return { ok: true, observation: `Wait condition met: selector appeared (${wf.selector})` };
+            }
+          }
+
+          // Timeout?
+          if (Date.now() > timeoutAt) {
+            return { ok: false, observation: "clickAndWait timeout" };
+          }
+          return null;
+        }
+
+        // Poll condition
+        while (true) {
+          const cond = await checkCondition();
+          if (cond) {
+            return { ok: cond.ok !== false, observation: cond.observation };
+          }
+          await new Promise(r => setTimeout(r, pollInterval));
+        }
+      }
+    });
+
+    // scrollTo
+    globalThis.ToolsRegistry.registerTool({
+      id: "scrollTo",
+      title: "Scroll To",
+      description: "Scroll the page by direction or to a specific element.",
+      capabilities: {
+        readOnly: false,
+        requiresVisibleElement: false,
+        requiresContentScript: true,
+        framesSupport: "all",
+        shadowDom: "full",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
+      inputSchema: {
+        type: "object",
+        properties: {
+          selector: { type: "string", maxLength: 2000 },
+          direction: { type: "string", enum: ["up", "down", "top", "bottom"] },
+          amountPx: { type: ["integer", "number"] }
+        }
+      },
+      // Validate at runtime that either selector or direction is provided
+      preconditions: async (_ctx, input) => {
+        if (!input?.selector && !input?.direction) {
+          return { ok: false, observation: "Provide either 'selector' or 'direction' for scrollTo" };
+        }
+        return { ok: true };
+      },
+      retryPolicy: { maxAttempts: 1 },
+      run: async (ctx, input) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+        const amountPx = Number(input?.amountPx || 600);
+        const res = await sendContentRPC(tabId, { type: MSG.SCROLL_TO_SELECTOR, selector: input.selector || "", direction: input.direction || "", amountPx }, getFastTimeout('scrollTo'));
+        return res?.ok ? { ok: true, observation: res.msg || "Scrolled" } : { ok: false, observation: res?.error || "Scroll failed" };
+      }
+    });
+
+    // scrapeSelector
+    globalThis.ToolsRegistry.registerTool({
+      id: "scrapeSelector",
+      title: "Scrape Selector",
+      description: "Scrape elements matching a selector into structured data.",
+      capabilities: {
+        readOnly: true,
+        requiresVisibleElement: false,
+        requiresContentScript: true,
+        framesSupport: "all",
+        shadowDom: "full",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
+      inputSchema: {
+        type: "object",
+        properties: {
+          selector: { type: "string", maxLength: 2000 }
+        },
+        required: ["selector"]
+      },
+      retryPolicy: { maxAttempts: 1 },
+      run: async (ctx, input) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+        const res = await sendContentRPC(tabId, { type: MSG.SCRAPE_SELECTOR, selector: input.selector });
+        if (res?.ok) {
+          const observationText = `Scraped ${res.data?.length || 0} items.`;
+          return { ok: true, observation: observationText, data: res.data };
+        }
+        return { ok: false, observation: res?.error || "Scrape failed" };
+      }
+    });
+
+    // getInteractiveElements
+    globalThis.ToolsRegistry.registerTool({
+      id: "getInteractiveElements",
+      title: "Get Interactive Elements",
+      description: "List visible interactive elements (buttons, links, inputs).",
+      capabilities: {
+        readOnly: true,
+        requiresVisibleElement: false,
+        requiresContentScript: true,
+        framesSupport: "all",
+        shadowDom: "full",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
+      inputSchema: { type: "object", properties: {} },
+      retryPolicy: { maxAttempts: 1 },
+      run: async (ctx) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+
+        // First attempt
+        let res = await sendContentRPC(tabId, { type: "GET_ELEMENT_MAP" }, getFastTimeout('getInteractiveElements'));
+        let elements = (res?.ok && (res.elements || (res.map && res.map.elements))) ? (res.elements || res.map.elements) : [];
+
+        if (Array.isArray(elements) && elements.length > 0) {
+          return { ok: true, observation: `Found ${elements.length} interactive elements`, data: elements };
+        }
+
+        // Settle two frames and retry to wait for SPA render
+        try { await sendContentRPC(tabId, { type: MSG.SETTLE }, getFastTimeout("settle")); } catch (_) {}
+        res = await sendContentRPC(tabId, { type: "GET_ELEMENT_MAP" }, getFastTimeout('getInteractiveElements'));
+        elements = (res?.ok && (res.elements || (res.map && res.map.elements))) ? (res.elements || res.map.elements) : [];
+
+        if (Array.isArray(elements) && elements.length > 0) {
+          return { ok: true, observation: `Found ${elements.length} interactive elements (after settle)`, data: elements };
+        }
+
+        // Last fallback: capture page text so the planner isn't blind
+        try {
+          const textRes = await sendContentRPC(tabId, { type: "READ_PAGE_CONTENT", maxChars: 12000 }, getFastTimeout('readPageContent'));
+          if (textRes?.ok && typeof textRes.text === "string") {
+            return { ok: true, observation: `No interactive elements found; captured page text (${textRes.text.length} chars)`, data: [], pageContent: textRes.text };
+          }
+        } catch (_) {}
+
+        // Return empty data rather than failing hard to enable planner fallback paths
+        const obs = res?.error ? `Failed to get interactive elements: ${res.error}` : "No interactive elements found";
+        return { ok: true, observation: obs, data: [] };
+      }
+    });
+
+    // Debug overlay tools
+    globalThis.ToolsRegistry.registerTool({
+      id: "debugShowOverlay",
+      title: "Debug: Show Overlay",
+      description: "Render numbered borders and labels over interactive elements.",
+      capabilities: {
+        readOnly: true,
+        requiresVisibleElement: false,
+        requiresContentScript: true,
+        framesSupport: "all",
+        shadowDom: "full",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
+      inputSchema: {
+        type: "object",
+        properties: {
+          limit: { type: ["integer","number"] },
+          minScore: { type: ["integer","number"] },
+          colorScheme: { type: "string", enum: ["type","score","fixed"] },
+          fixedColor: { type: "string" },
+          clickableBadges: { type: "boolean" }
+        }
+      },
+      retryPolicy: { maxAttempts: 1 },
+      run: async (ctx, input) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+        const payload = {
+          type: MSG.DEBUG_SHOW_OVERLAY,
+          limit: Number.isFinite(input?.limit) ? input.limit : 50,
+          minScore: Number.isFinite(input?.minScore) ? input.minScore : 0,
+          colorScheme: input?.colorScheme || "type",
+          fixedColor: input?.fixedColor,
+          clickableBadges: !!input?.clickableBadges
+        };
+        const res = await sendContentRPC(tabId, payload, getFastTimeout("getInteractiveElements"));
+        return res?.ok ? { ok: true, observation: "Overlay shown" } : { ok: false, observation: res?.error || "Failed to show overlay" };
+      }
+    });
+
+    globalThis.ToolsRegistry.registerTool({
+      id: "debugHideOverlay",
+      title: "Debug: Hide Overlay",
+      description: "Remove the debug overlay from the page.",
+      capabilities: {
+        readOnly: true,
+        requiresVisibleElement: false,
+        requiresContentScript: true,
+        framesSupport: "all",
+        shadowDom: "full",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
+      inputSchema: { type: "object", properties: {} },
+      retryPolicy: { maxAttempts: 1 },
+      run: async (ctx) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+        const res = await sendContentRPC(tabId, { type: MSG.DEBUG_HIDE_OVERLAY }, getFastTimeout("getInteractiveElements"));
+        return res?.ok ? { ok: true, observation: "Overlay hidden" } : { ok: false, observation: res?.error || "Failed to hide overlay" };
+      }
+    });
+
+    globalThis.ToolsRegistry.registerTool({
+      id: "debugUpdateOverlay",
+      title: "Debug: Update Overlay",
+      description: "Recompute and refresh overlay positions.",
+      capabilities: {
+        readOnly: true,
+        requiresVisibleElement: false,
+        requiresContentScript: true,
+        framesSupport: "all",
+        shadowDom: "full",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
+      inputSchema: { type: "object", properties: {} },
+      retryPolicy: { maxAttempts: 1 },
+      run: async (ctx) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+        const res = await sendContentRPC(tabId, { type: MSG.DEBUG_UPDATE_OVERLAY }, getFastTimeout("getInteractiveElements"));
+        return res?.ok ? { ok: true, observation: "Overlay updated" } : { ok: false, observation: res?.error || "Failed to update overlay" };
+      }
+    });
+
+    globalThis.ToolsRegistry.registerTool({
+      id: "debugClickIndex",
+      title: "Debug: Click Indexed Element",
+      description: "Click an element by its overlay index number.",
+      capabilities: {
+        readOnly: false,
+        requiresVisibleElement: true,
+        requiresContentScript: true,
+        framesSupport: "all",
+        shadowDom: "full",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
+      inputSchema: {
+        type: "object",
+        properties: {
+          index: { type: ["integer","number"] }
+        },
+        required: ["index"]
+      },
+      retryPolicy: { maxAttempts: 1 },
+      run: async (ctx, input) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+        const res = await sendContentRPC(tabId, { type: MSG.DEBUG_CLICK_INDEX, index: Number(input.index) }, getFastTimeout("clickElement"));
+        return res?.ok ? { ok: true, observation: res?.msg || `Clicked index ${input.index}` } : { ok: false, observation: res?.error || "Click by index failed" };
+      }
+    });
+
+    /* ---------- Advanced Interaction Tools ---------- */
+
+    // uploadFile - Handle file input elements
+    globalThis.ToolsRegistry.registerTool({
+      id: "uploadFile",
+      title: "Upload File",
+      description: "Upload a file to a file input element. Creates a temporary file for upload testing.",
+      capabilities: {
+        readOnly: false,
+        requiresVisibleElement: true,
+        requiresContentScript: true,
+        framesSupport: "all",
+        shadowDom: "full",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
+      inputSchema: {
+        type: "object",
+        properties: {
+          selector: { type: "string", maxLength: 2000, description: "CSS selector for file input element" },
+          fileName: { type: "string", description: "Name for the test file (optional)" },
+          fileContent: { type: "string", description: "Content for the test file (optional)" },
+          fileType: { type: "string", description: "MIME type (optional, default: text/plain)" }
+        },
+        required: ["selector"]
+      },
+      retryPolicy: { maxAttempts: 2, backoffMs: 300 },
+      run: async (ctx, input) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+
+        const fileName = input.fileName || 'test-upload.txt';
+        const fileContent = input.fileContent || 'This is a test file for automation purposes.';
+        const fileType = input.fileType || 'text/plain';
+
+        try {
+          // Create a data URL for the file
+          const dataUrl = `data:${fileType};base64,${btoa(fileContent)}`;
+          
+          const res = await sendContentRPC(tabId, { 
+            type: "UPLOAD_FILE", 
+            selector: input.selector,
+            fileName: fileName,
+            dataUrl: dataUrl,
+            fileType: fileType
+          }, getFastTimeout('uploadFile'));
+          
+          return res?.ok ? 
+            { ok: true, observation: res.msg || `File uploaded: ${fileName}` } : 
+            { ok: false, observation: res?.error || "File upload failed" };
+        } catch (error) {
+          return { ok: false, observation: `Upload error: ${error.message}` };
+        }
+      }
+    });
+
+    // fillForm - Complete multi-step forms intelligently
+    globalThis.ToolsRegistry.registerTool({
+      id: "fillForm",
+      title: "Fill Form",
+      description: "Intelligently fill out complex forms with multiple fields and sections.",
+      capabilities: {
+        readOnly: false,
+        requiresVisibleElement: true,
+        requiresContentScript: true,
+        framesSupport: "all", 
+        shadowDom: "full",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
+      inputSchema: {
+        type: "object",
+        properties: {
+          formData: { 
+            type: "object", 
+            description: "Form data as key-value pairs (field name/label -> value)" 
+          },
+          formSelector: { 
+            type: "string", 
+            description: "CSS selector for the form container (optional)" 
+          },
+          submitAfter: { 
+            type: "boolean", 
+            description: "Whether to submit the form after filling (default: false)" 
+          }
+        },
+        required: ["formData"]
+      },
+      retryPolicy: { maxAttempts: 2, backoffMs: 500 },
+      run: async (ctx, input) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+
+        try {
+          const res = await sendContentRPC(tabId, { 
+            type: "FILL_FORM", 
+            formData: input.formData,
+            formSelector: input.formSelector,
+            submitAfter: input.submitAfter || false
+          }, 10000); // Longer timeout for complex forms
+          
+          return res?.ok ? 
+            { ok: true, observation: res.msg || `Form filled with ${Object.keys(input.formData).length} fields` } : 
+            { ok: false, observation: res?.error || "Form filling failed" };
+        } catch (error) {
+          return { ok: false, observation: `Form filling error: ${error.message}` };
+        }
+      }
+    });
+
+    // selectOption - Enhanced dropdown/select handling
+    globalThis.ToolsRegistry.registerTool({
+      id: "selectOption",
+      title: "Select Option",
+      description: "Select an option from dropdowns, multi-selects, or custom select components.",
+      capabilities: {
+        readOnly: false,
+        requiresVisibleElement: true,
+        requiresContentScript: true,
+        framesSupport: "all",
+        shadowDom: "full", 
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
+      inputSchema: {
+        type: "object",
+        properties: {
+          selector: { type: "string", maxLength: 2000, description: "CSS selector for select element" },
+          optionValue: { type: "string", description: "Value attribute of option to select" },
+          optionText: { type: "string", description: "Display text of option to select" },
+          optionIndex: { type: ["integer","number"], description: "Zero-based index of option" }
+        },
+        required: ["selector"]
+      },
+      retryPolicy: { maxAttempts: 2, backoffMs: 300 },
+      run: async (ctx, input) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+
+        const res = await sendContentRPC(tabId, { 
+          type: "SELECT_OPTION", 
+          selector: input.selector,
+          optionValue: input.optionValue,
+          optionText: input.optionText,
+          optionIndex: input.optionIndex
+        }, getFastTimeout('selectOption'));
+        
+        return res?.ok ? 
+          { ok: true, observation: res.msg || "Option selected" } : 
+          { ok: false, observation: res?.error || "Option selection failed" };
+      }
+    });
+
+    // dragAndDrop - Handle drag and drop interactions
+    globalThis.ToolsRegistry.registerTool({
+      id: "dragAndDrop",
+      title: "Drag and Drop",
+      description: "Perform drag and drop operations between elements.",
+      capabilities: {
+        readOnly: false,
+        requiresVisibleElement: true,
+        requiresContentScript: true,
+        framesSupport: "all",
+        shadowDom: "full",
+        navigation: { causesNavigation: false, waitsForLoad: false }
+      },
+      inputSchema: {
+        type: "object",
+        properties: {
+          sourceSelector: { type: "string", maxLength: 2000, description: "CSS selector for element to drag" },
+          targetSelector: { type: "string", maxLength: 2000, description: "CSS selector for drop target" },
+          offsetX: { type: ["integer","number"], description: "X offset for drop position" },
+          offsetY: { type: ["integer","number"], description: "Y offset for drop position" }
+        },
+        required: ["sourceSelector", "targetSelector"]
+      },
+      retryPolicy: { maxAttempts: 2, backoffMs: 400 },
+      run: async (ctx, input) => {
+        const tabId = ctx?.tabId;
+        if (!(await ctx.ensureContentScript(tabId))) {
+          return { ok: false, observation: "Content script unavailable" };
+        }
+
+        const res = await sendContentRPC(tabId, { 
+          type: "DRAG_AND_DROP", 
+          sourceSelector: input.sourceSelector,
+          targetSelector: input.targetSelector,
+          offsetX: input.offsetX || 0,
+          offsetY: input.offsetY || 0
+        }, getFastTimeout('dragDrop'));
+        
+        return res?.ok ? 
+          { ok: true, observation: res.msg || "Drag and drop completed" } : 
+          { ok: false, observation: res?.error || "Drag and drop failed" };
+      }
+    });
+
+    console.log("[BG] Advanced tools registered: uploadFile, fillForm, selectOption, dragAndDrop");
+    console.log("[BG] Core tools registered: navigateToUrl, extractLinks, readPageContent, analyzeUrls, extractStructuredContent, recordFinding, clickElement, typeText, waitForSelector, scrollTo, scrapeSelector, getInteractiveElements, debugShowOverlay, debugHideOverlay, debugUpdateOverlay, debugClickIndex");
   } catch (e) {
     console.warn("[BG] Core tool registration failed:", e);
   }
@@ -1635,13 +3482,22 @@ async function runRegisteredTool(tabId, toolId, input) {
   // Best-effort namespaced logger
   const log = BG_LOG?.withContext?.({ tabId, toolId }) || BG_LOG;
 
+  // Resolve capabilities for observability
+  let capabilities = null;
+  try {
+    capabilities = globalThis.ToolsRegistry?.getCapabilities?.(toolId) || null;
+  } catch (_) {}
+
   // Console summary for start
-  try { log?.info?.("tool_started", { input: sanitizeForLog(input) }); } catch (_) {}
+  try { log?.info?.("tool_started", { input: sanitizeForLog(input), capabilities }); } catch (_) {}
 
   // Emit tool_started
   try {
     if (globalThis.AgentObserver && typeof globalThis.AgentObserver.emitToolStarted === "function") {
-      await globalThis.AgentObserver.emitToolStarted(tabId, toolId, input || {});
+      await globalThis.AgentObserver.emitToolStarted(tabId, toolId, {
+        ...(input || {}),
+        __meta: { capabilities }
+      });
     }
   } catch (_) {}
 
@@ -1653,12 +3509,13 @@ async function runRegisteredTool(tabId, toolId, input) {
     };
     const result = await globalThis.ToolsRegistry.runTool(toolId, ctx, input || {});
 
-    // Emit tool_result
+    // Emit tool_result (include capabilities)
     try {
       if (globalThis.AgentObserver && typeof globalThis.AgentObserver.emitToolResult === "function") {
         await globalThis.AgentObserver.emitToolResult(tabId, toolId, {
           ...result,
-          durationMs: result?.durationMs ?? Math.max(0, Date.now() - startedAt)
+          durationMs: result?.durationMs ?? Math.max(0, Date.now() - startedAt),
+          capabilities
         });
       }
     } catch (_) {}
@@ -1669,7 +3526,8 @@ async function runRegisteredTool(tabId, toolId, input) {
         ok: result?.ok !== false,
         status: result?.status,
         observation: (result?.observation || "").slice(0, 200),
-        durationMs: result?.durationMs ?? Math.max(0, Date.now() - startedAt)
+        durationMs: result?.durationMs ?? Math.max(0, Date.now() - startedAt),
+        capabilities
       };
       log?.info?.("tool_result", summary);
     } catch (_) {}
@@ -1683,7 +3541,8 @@ async function runRegisteredTool(tabId, toolId, input) {
           ok: false,
           observation: String(e?.message || e),
           durationMs: Math.max(0, Date.now() - startedAt),
-          errors: [String(e?.message || e)]
+          errors: [String(e?.message || e)],
+          capabilities
         });
       }
     } catch (_) {}
@@ -1721,7 +3580,21 @@ async function dispatchAgentAction(tabId, action, settings) {
     waitForSelector: "wait_for_selector",
     screenshot: "take_screenshot",
     "tabs.activate": "switch_tab",
-    "tabs.close": "close_tab"
+    "tabs.close": "close_tab",
+
+    // CamelCase aliases → canonical snake-case for legacy handlers
+    navigateToUrl: "goto_url",
+    clickElement: "click_element",
+    typeText: "type_text",
+    scrollTo: "scroll_to",
+    readPageContent: "read_page_content",
+    extractStructuredContent: "extract_structured_content",
+    analyzeUrls: "analyze_urls",
+    extractLinks: "get_page_links",
+    scrapeSelector: "scrape",
+    getInteractiveElements: "get_interactive_elements",
+    recordFinding: "record_finding",
+    generateReport: "generate_report"
   };
   const normalizedTool = legacyToolMap[tool] || tool;
 
@@ -1765,7 +3638,12 @@ async function dispatchAgentAction(tabId, action, settings) {
         });
         return { ok: false, observation: "Content script unavailable" };
       }
-      const res = await chrome.tabs.sendMessage(tabId, { type: "CLICK_SELECTOR", selector: normalizedParams.selector || "" });
+      const idx = Number(normalizedParams.elementIndex);
+      if (Number.isFinite(idx) && idx > 0) {
+        const res = await sendContentRPC(tabId, { type: "DEBUG_CLICK_INDEX", index: idx });
+        return res?.ok ? { ok: true, observation: res.msg || `Clicked index ${idx}` } : { ok: false, observation: res?.error || "Click by index failed" };
+      }
+      const res = await sendContentRPC(tabId, { type: "CLICK_SELECTOR", selector: normalizedParams.selector || "" });
       return res?.ok ? { ok: true, observation: res.msg || "Clicked" } : { ok: false, observation: res?.error || "Click failed" };
     }
     case "type_text": {
@@ -1778,7 +3656,54 @@ async function dispatchAgentAction(tabId, action, settings) {
         });
         return { ok: false, observation: "Content script unavailable" };
       }
-      const res = await chrome.tabs.sendMessage(tabId, { type: "FILL_SELECTOR", selector: normalizedParams.selector || "", value: normalizedParams.text ?? "" });
+      const idx = Number(normalizedParams.elementIndex);
+      if (Number.isFinite(idx) && idx > 0) {
+        try {
+          // Validate overlay/index map before attempting index-based fill
+          const mapRes = await sendContentRPC(tabId, { type: "GET_ELEMENT_MAP" }, getFastTimeout('getInteractiveElements'));
+          const elements = (mapRes?.ok && (mapRes.elements || (mapRes.map && mapRes.map.elements))) ? (mapRes.elements || mapRes.map.elements) : [];
+          if (Array.isArray(elements) && elements.length >= idx) {
+            const fillRes = await sendContentRPC(tabId, { type: MSG.DEBUG_FILL_INDEX, index: idx, value: normalizedParams.text ?? "" }, getFastTimeout('typeText'));
+            return fillRes?.ok ? { ok: true, observation: fillRes.msg || `Filled index ${idx}` } : { ok: false, observation: fillRes?.error || "Typing by index failed" };
+          } else {
+            const fallbackSelector = normalizedParams.selector || (elements && elements[idx - 1] && elements[idx - 1].selector) || "";
+            const fallbackRes = await sendContentRPC(tabId, { type: MSG.FILL_SELECTOR, selector: fallbackSelector, value: normalizedParams.text ?? "" }, getFastTimeout('typeText'));
+            return fallbackRes?.ok ? { ok: true, observation: fallbackRes.msg || "Text entered (fallback)" } : { ok: false, observation: fallbackRes?.error || "Typing failed (fallback)" };
+          }
+        } catch (e) {
+          // If capability check / RPC failed, fall back to selector fill
+          const fallbackRes = await sendContentRPC(tabId, { type: MSG.FILL_SELECTOR, selector: normalizedParams.selector || "", value: normalizedParams.text ?? "" }, getFastTimeout('typeText'));
+          return fallbackRes?.ok ? { ok: true, observation: fallbackRes.msg || "Text entered (fallback)" } : { ok: false, observation: fallbackRes?.error || "Typing failed" };
+        }
+      }
+
+      // Preflight: ensure selector exists & is visible before attempting a selector-based fill.
+      const sel2 = (normalizedParams.selector || "").trim();
+      if (sel2) {
+        try {
+          const check = await sendContentRPC(tabId, { type: MSG.CHECK_SELECTOR, selector: sel2, visibleOnly: true }, getFastTimeout('checkSelector'));
+          const found = !!(check && (check.exists === true || check.found === true || check.visible === true));
+          if (!found) {
+            try { await sendContentRPC(tabId, { type: MSG.SETTLE }, getFastTimeout("settle")); } catch (_) {}
+            const check2 = await sendContentRPC(tabId, { type: MSG.CHECK_SELECTOR, selector: sel2, visibleOnly: true }, getFastTimeout('checkSelector'));
+            const found2 = !!(check2 && (check2.exists === true || check2.found === true || check2.visible === true));
+            if (!found2) {
+              try {
+                const mapRes2 = await sendContentRPC(tabId, { type: "GET_ELEMENT_MAP" }, getFastTimeout('getInteractiveElements'));
+                const elements2 = (mapRes2?.ok && (mapRes2.elements || (mapRes2.map && mapRes2.map.elements))) ? (mapRes2.elements || mapRes2.map.elements) : [];
+                if (Array.isArray(elements2) && elements2.length > 0) {
+                  const candidate = elements2[0];
+                  const fallbackRes = await sendContentRPC(tabId, { type: MSG.FILL_SELECTOR, selector: candidate.selector || sel2, value: normalizedParams.text ?? "" }, getFastTimeout('typeText'));
+                  return fallbackRes?.ok ? { ok: true, observation: fallbackRes.msg || "Text entered (fallback element map)" } : { ok: false, observation: fallbackRes?.error || "Typing failed (fallback)" };
+                }
+              } catch (_) {}
+              return { ok: false, observation: `Selector not found or not visible: ${sel2}` };
+            }
+          }
+        } catch (_) {}
+      }
+
+      const res = await sendContentRPC(tabId, { type: MSG.FILL_SELECTOR, selector: normalizedParams.selector || "", value: normalizedParams.text ?? "" }, getFastTimeout('typeText'));
       return res?.ok ? { ok: true, observation: res.msg || "Text entered" } : { ok: false, observation: res?.error || "Typing failed" };
     }
     case "scroll_to": {
@@ -1791,7 +3716,7 @@ async function dispatchAgentAction(tabId, action, settings) {
         });
         return { ok: false, observation: "Content script unavailable" };
       }
-      const res = await chrome.tabs.sendMessage(tabId, { type: "SCROLL_TO_SELECTOR", selector: normalizedParams.selector || "", direction: normalizedParams.direction || "" });
+      const res = await sendContentRPC(tabId, { type: "SCROLL_TO_SELECTOR", selector: normalizedParams.selector || "", direction: normalizedParams.direction || "" });
       return res?.ok ? { ok: true, observation: res.msg || "Scrolled" } : { ok: false, observation: res?.error || "Scroll failed" };
     }
     case "wait_for_selector": {
@@ -1804,7 +3729,7 @@ async function dispatchAgentAction(tabId, action, settings) {
         });
         return { ok: false, observation: "Content script unavailable" };
       }
-      const res = await chrome.tabs.sendMessage(tabId, { type: "WAIT_FOR_SELECTOR", selector: normalizedParams.selector || "", timeoutMs: normalizedParams.timeoutMs || 5000 });
+      const res = await sendContentRPC(tabId, { type: "WAIT_FOR_SELECTOR", selector: normalizedParams.selector || "", timeoutMs: normalizedParams.timeoutMs || 5000 });
       return res?.ok ? { ok: true, observation: res.msg || "Selector found" } : { ok: false, observation: res?.error || "Wait failed" };
     }
     case "scrape": {
@@ -1860,6 +3785,39 @@ async function dispatchAgentAction(tabId, action, settings) {
       return { ok: true, observation: `Closed tab ${tgt}` };
     }
     case "done": {
+      // Heuristic: if taskType is AUTOMATION, auto-mark minimal success when recent actions show real UI work
+      try {
+        const schemaKey = (sess?.taskContext?.taskType || '').toLowerCase();
+        if (schemaKey === 'automation') {
+          // Ensure an automation schema exists on the session even if the global registry lacks it
+          const automationSchema = (globalThis.SUCCESS_CRITERIA_SCHEMAS && globalThis.SUCCESS_CRITERIA_SCHEMAS.automation) || {
+            type: "object",
+            properties: {
+              completed: { type: "boolean" },
+              steps: { type: "array", items: { type: "string" } },
+              summary: { type: "string" }
+            },
+            required: ["completed"]
+          };
+          if (!sess.successCriteria || sess.successCriteria === globalThis.SUCCESS_CRITERIA_SCHEMAS?.default) {
+            sess.successCriteria = automationSchema;
+          }
+
+          // If not marked yet, infer completion from recent concrete actions
+          const recent = Array.isArray(sess.history) ? sess.history.slice(-8) : [];
+          const hasTyped = recent.some(h => ['type_text', 'typeText', 'fill'].includes(h?.action?.tool));
+          const hasClicked = recent.some(h => ['click_element', 'click', 'clickElement'].includes(h?.action?.tool));
+          if (hasTyped && hasClicked) {
+            const steps = recent.map(h => `${h?.action?.tool || 'action'} -> ${(h?.observation || '').slice(0, 120)}`);
+            const pageInfo = await getPageInfoForPlanning(tabId).catch(() => ({}));
+            const summary = `Automation completed on ${pageInfo?.url || 'current page'} with ${steps.length} recent steps.`;
+            sess.findings = Utils.deepMerge(sess.findings || {}, { automation: { completed: true, steps, summary } });
+            emitAgentLog(tabId, { level: LOG_LEVELS.INFO, msg: "Heuristically marked automation as completed", stepCount: steps.length, url: pageInfo?.url });
+            await SessionManager.saveSessionToStorage(tabId, sess);
+          }
+        }
+      } catch (_) {}
+
       const { success, errors } = checkSuccessCriteria(sess, tabId);
       if (success) {
         return { ok: true, observation: "Goal marked done after meeting success criteria." };
@@ -1892,7 +3850,7 @@ async function dispatchAgentAction(tabId, action, settings) {
           msg: "User-facing report generated from validated findings",
           report: reportRes.text
         });
-        chrome.runtime.sendMessage({
+        safeRuntimeSendMessage({
           type: MSG.SHOW_REPORT,
           tabId: tabId,
           report: reportRes.text,
@@ -1907,7 +3865,7 @@ async function dispatchAgentAction(tabId, action, settings) {
       if (!(await ensureContentScript(tabId))) {
         return { ok: false, observation: "Content script unavailable" };
       }
-      const res = await chrome.tabs.sendMessage(tabId, { type: "ANALYZE_PAGE_URLS" });
+      const res = await sendContentRPC(tabId, { type: "ANALYZE_PAGE_URLS" });
       
       if (res?.ok && res.analysis) {
         // Store the analysis results in session for template variable access
@@ -1939,14 +3897,14 @@ async function dispatchAgentAction(tabId, action, settings) {
       }
       const includeExternal = resolvedParams.includeExternal !== false;
       const maxLinks = resolvedParams.maxLinks || 20;
-      const res = await chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_LINKS", includeExternal, maxLinks });
+      const res = await sendContentRPC(tabId, { type: "GET_PAGE_LINKS", includeExternal, maxLinks });
       return res?.ok ? { ok: true, observation: `Found ${res.links?.length || 0} relevant links`, links: res.links } : { ok: false, observation: res?.error || "Link extraction failed" };
     }
     case "read_page_content": {
       if (!(await ensureContentScript(tabId))) {
         return { ok: false, observation: "Content script unavailable" };
       }
-      const res = await chrome.tabs.sendMessage(tabId, { type: "READ_PAGE_CONTENT", maxChars: 15000 });
+      const res = await sendContentRPC(tabId, { type: "READ_PAGE_CONTENT", maxChars: 15000 });
       if (res?.ok) {
         const observationText = `Successfully read page content. Length: ${res.text?.length}.`;
         return { ok: true, observation: observationText, pageContent: res.text };
@@ -1958,7 +3916,7 @@ async function dispatchAgentAction(tabId, action, settings) {
         if (!(await ensureContentScript(tabId))) {
             return { ok: false, observation: "Content script unavailable" };
         }
-        const res = await chrome.tabs.sendMessage(tabId, { type: "EXTRACT_STRUCTURED_CONTENT" });
+        const res = await sendContentRPC(tabId, { type: "EXTRACT_STRUCTURED_CONTENT" });
         // Handle new structured content format
         if (res?.ok && res.content) {
             const { source, data, ...rest } = res.content;
@@ -1967,10 +3925,10 @@ async function dispatchAgentAction(tabId, action, settings) {
             // If data from JSON-LD is an array, merge each item
             if (Array.isArray(findingToRecord)) {
                 findingToRecord.forEach(item => {
-                    sess.findings = deepMerge(sess.findings, item);
+                    sess.findings = Utils.deepMerge(sess.findings, item);
                 });
             } else {
-                sess.findings = deepMerge(sess.findings, findingToRecord);
+                sess.findings = Utils.deepMerge(sess.findings, findingToRecord);
             }
 
             emitAgentLog(tabId, {
@@ -1990,7 +3948,7 @@ async function dispatchAgentAction(tabId, action, settings) {
         }
         const findingToRecord = finding;
         // Deep merge the new finding with existing findings
-        sess.findings = deepMerge(sess.findings, findingToRecord);
+        sess.findings = Utils.deepMerge(sess.findings, findingToRecord);
         
         emitAgentLog(tabId, {
             level: LOG_LEVELS.SUCCESS,
@@ -1999,7 +3957,7 @@ async function dispatchAgentAction(tabId, action, settings) {
           });
         
         // Send a dedicated message to the chat to make the finding visible
-        chrome.runtime.sendMessage({
+        safeRuntimeSendMessage({
           type: MSG.AGENT_FINDING,
           tabId: tabId,
           finding: findingToRecord,
@@ -2007,7 +3965,7 @@ async function dispatchAgentAction(tabId, action, settings) {
         });
 
         // Persist session after recording a finding
-        saveSessionToStorage(tabId, sess);
+        SessionManager.saveSessionToStorage(tabId, sess);
         return { ok: true, observation: "Finding recorded successfully." };
         }
     case "smart_navigate": {
@@ -2061,7 +4019,7 @@ async function dispatchAgentAction(tabId, action, settings) {
       // Extract structured content
       let content = null;
       if (await ensureContentScript(tabId)) {
-        const res = await chrome.tabs.sendMessage(tabId, { type: "EXTRACT_STRUCTURED_CONTENT" });
+        const res = await sendContentRPC(tabId, { type: "EXTRACT_STRUCTURED_CONTENT" });
         if (res?.ok) {
           content = res.content;
         }
@@ -2070,7 +4028,7 @@ async function dispatchAgentAction(tabId, action, settings) {
       // If depth is less than maxDepth, analyze URLs for deeper research
       let deeperUrls = [];
       if (depth < maxDepth && content) {
-        const urlAnalysis = await chrome.tabs.sendMessage(tabId, { type: "ANALYZE_PAGE_URLS" });
+        const urlAnalysis = await sendContentRPC(tabId, { type: "ANALYZE_PAGE_URLS" });
         if (urlAnalysis?.ok && urlAnalysis.analysis?.relevantUrls) {
           deeperUrls = urlAnalysis.analysis.relevantUrls.slice(0, 3); // Limit to top 3 URLs
         }
@@ -2167,13 +4125,13 @@ async function dispatchAgentAction(tabId, action, settings) {
       const researchGoal = String(resolvedParams.researchGoal || "");
       
       // Get URL analysis
-      const urlAnalysis = await chrome.tabs.sendMessage(tabId, { type: "ANALYZE_PAGE_URLS" });
+      const urlAnalysis = await sendContentRPC(tabId, { type: "ANALYZE_PAGE_URLS" });
       if (!urlAnalysis?.ok) {
         return { ok: false, observation: "Failed to analyze page URLs" };
       }
       
       // Get current page content quality
-      const contentRes = await chrome.tabs.sendMessage(tabId, { type: "EXTRACT_STRUCTURED_CONTENT" });
+      const contentRes = await sendContentRPC(tabId, { type: "EXTRACT_STRUCTURED_CONTENT" });
       const contentQuality = contentRes?.ok ? analyzeContentQuality(contentRes.content, researchGoal) : 'low';
       
       // Decision logic for deeper reading
@@ -2214,42 +4172,71 @@ async function sendActionResultToChat(tabId, sess, action, execRes) {
   const { tool, params } = action;
 
   switch (tool) {
-    case 'record_finding':
-      payload = {
-        tool,
-        data: params.finding,
-      };
-      break;
-    case 'read_page_content':
-      if (execRes.pageContent) {
-        const pageInfo = await getPageInfoForPlanning(tabId);
-        payload = {
-          tool,
-          data: {
-            summary: execRes.pageContent.substring(0, 500) + (execRes.pageContent.length > 500 ? '...' : ''),
-            url: pageInfo.url,
-            title: pageInfo.title,
-          }
-        };
-      }
-      break;
-    case 'navigate':
-    case 'goto_url':
-      // Wait a bit for the page to load before getting title
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      const pageInfo = await getPageInfoForPlanning(tabId);
-      payload = {
-        tool,
-        data: {
-          url: params.url,
-          title: pageInfo.title,
-        }
-      };
-      break;
-  }
+   case 'record_finding':
+   case 'recordFinding':
+     payload = {
+       tool,
+       data: params.finding,
+     };
+     break;
+   case 'read_page_content':
+   case 'readPageContent':
+     if (execRes.pageContent) {
+       const pageInfo = await getPageInfoForPlanning(tabId);
+       payload = {
+         tool,
+         data: {
+           summary: execRes.pageContent.substring(0, 500) + (execRes.pageContent.length > 500 ? '...' : ''),
+           url: pageInfo.url,
+           title: pageInfo.title,
+         }
+       };
+     }
+     break;
+   case 'navigate':
+   case 'goto_url':
+   case 'navigateToUrl':
+     // Wait a bit for the page to load before getting title
+     await new Promise(resolve => setTimeout(resolve, 1500));
+     const pageInfo = await getPageInfoForPlanning(tabId);
+     payload = {
+       tool,
+       data: {
+         url: params.url,
+         title: pageInfo.title,
+       }
+     };
+     break;
+   case 'click_element':
+   case 'clickElement':
+   case 'click': {
+     payload = {
+       tool,
+       data: {
+         selector: params.selector || null,
+         elementIndex: Number.isFinite(params.elementIndex) ? params.elementIndex : null
+       }
+     };
+     break;
+   }
+   case 'type_text':
+   case 'typeText':
+   case 'fill': {
+     const textPreview = typeof params.text === 'string' ? params.text.slice(0, 100) : '';
+     payload = {
+       tool,
+       data: {
+         selector: params.selector || null,
+         elementIndex: Number.isFinite(params.elementIndex) ? params.elementIndex : null,
+         textPreview
+       }
+     };
+     break;
+   }
+ }
 
   if (payload) {
-    chrome.runtime.sendMessage({
+    safeRuntimeSendMessage({
       type: MSG.AGENT_ACTION_RESULT,
       tabId: tabId,
       payload: sanitizePayload(payload),
@@ -2292,6 +4279,19 @@ async function runAgentLoop(tabId, goal, settings) {
     model: sess.selectedModel,
     settings
   });
+  try { await chrome.storage.local.set({ LAST_PLANNER_USED: "legacy" }); } catch (_) {}
+  // Auto-enable debug overlay visualization for this tab (best-effort)
+  try { await showOverlayForDebug(tabId, { limit: 50, colorScheme: "type", clickableBadges: false }); } catch (_) {}
+  try {
+    const { PLANNER_STATS } = await chrome.storage.local.get("PLANNER_STATS");
+    const s = PLANNER_STATS || {};
+    const next = {
+      react: Number(s?.react || 0),
+      linear: Number(s?.linear || 0),
+      legacy: Number(s?.legacy || 0) + 1
+    };
+    await chrome.storage.local.set({ PLANNER_STATS: next });
+  } catch (_) {}
 
   // Emit run_state: started
   try {
@@ -2307,6 +4307,24 @@ async function runAgentLoop(tabId, goal, settings) {
 
   // Start the agentic loop
   agenticLoop(tabId, goal, settings);
+}
+
+// Send agent status updates to the sidepanel
+function emitAgentStatus(tabId, message) {
+  try {
+    const sess = agentSessions.get(tabId);
+    if (!sess) return;
+
+    safeRuntimeSendMessage({
+      type: MSG.AGENT_STATUS_UPDATE,
+      tabId,
+      message,
+      step: sess.step ?? 0,
+      timestamp: Date.now()
+    });
+  } catch (e) {
+    // Ignore errors if the sidepanel is not open
+  }
 }
 
 async function agenticLoop(tabId, goal, settings) {
@@ -2349,9 +4367,11 @@ async function agenticLoop(tabId, goal, settings) {
       reasoningPrompt = buildAgentPlanPrompt(goal, currentSubTask, contextData);
   }
   
+  emitAgentStatus(tabId, "🤔 Thinking...");
   const modelResponse = await callModelWithRotation(reasoningPrompt, { model: sess.selectedModel, tabId });
 
   // 3. Parse and Validate Action
+  emitAgentStatus(tabId, "📝 Parsing action...");
   let action;
   if (modelResponse.ok) {
     const validationResult = parseAndValidateAction(tabId, sess, modelResponse.text);
@@ -2375,19 +4395,53 @@ async function agenticLoop(tabId, goal, settings) {
 
   // 4. Act: Execute the action, with a guard against premature 'done'
   if (action.tool === 'done' && Object.keys(sess.findings).length === 0) {
-    emitAgentLog(tabId, {
-      level: LOG_LEVELS.WARN,
-      msg: "Premature 'done' action detected. Overriding with 'think' to force re-evaluation.",
-      originalAction: action
-    });
-    action = {
-      tool: 'think',
-      params: { thought: "I was about to mark the task as done, but I haven't recorded any findings yet. I need to re-evaluate my plan and gather information first." },
-      rationale: "Overriding premature 'done' action to ensure findings are gathered before completion.",
-      confidence: 0.99,
-      done: false
-    };
+    if (!sess.doneGuardUsed) {
+      emitAgentLog(tabId, {
+        level: LOG_LEVELS.WARN,
+        msg: "Premature 'done' action detected. Overriding with 'think' to force re-evaluation.",
+        originalAction: action
+      });
+      action = {
+        tool: 'think',
+        params: { thought: "I was about to mark the task as done, but I haven't recorded any findings yet. I need to re-evaluate my plan and gather information first." },
+        rationale: "Overriding premature 'done' action to ensure findings are gathered before completion.",
+        confidence: 0.99,
+        done: false
+      };
+      sess.doneGuardUsed = true;
+    } else {
+      emitAgentLog(tabId, {
+        level: LOG_LEVELS.WARN,
+        msg: "Accepting 'done' despite empty findings (second attempt)."
+      });
+    }
   }
+
+  // Optimization: If the agent wants to read the page but we already have interactive elements,
+  // skip the read and use the elements, as this is faster and provides enough context.
+  try {
+    const isReadAction = action.tool === 'read_page_content' || action.tool === 'readPageContent';
+    // Element caching removed - always refresh elements for reliability
+    const hasInteractiveElements = false; // Force fresh element queries
+
+    if (isReadAction && hasInteractiveElements) {
+      emitAgentLog(tabId, {
+        level: LOG_LEVELS.INFO,
+        msg: "Skipping redundant read_page_content; using existing interactive elements for planning.",
+        originalTool: action.tool
+      });
+      // By returning early from this execution, we effectively skip the action
+      // and allow the loop to continue to the next planning stage with existing context.
+      // This is a temporary solution. A better approach would be to replace the action
+      // with a no-op or 'think' action.
+      // For now, we will just proceed to the next loop iteration.
+      agenticLoop(tabId, goal, settings);
+      return;
+    } else if (isReadAction) {
+      emitAgentLog(tabId, { level: LOG_LEVELS.INFO, msg: "Proceeding with read_page_content as no interactive elements are cached." });
+    }
+  } catch (_) {}
+
   const execRes = await executeActionWithContext(tabId, sess, action, settings);
 
   // 5. Observe and Update Context
@@ -2426,16 +4480,21 @@ async function agenticLoop(tabId, goal, settings) {
 
   // 7. Advance to the next sub-task if 'done' is signaled for the current one
   if (action.tool === 'done' || action.done === true) {
-    emitAgentLog(tabId, { level: LOG_LEVELS.INFO, msg: `Sub-task "${currentSubTask}" completed.` });
-    sess.currentTaskIndex++;
-    sess.subTaskStep = 0; // Reset sub-task step counter
-    sess.noProgressCounter = 0; // Reset no-progress counter
-    // Send a step update to the sidepanel
-    chrome.runtime.sendMessage({
-      type: MSG.AGENT_STEP_UPDATE,
-      tabId: tabId,
-      currentTaskIndex: sess.currentTaskIndex
-    });
+    const { success, errors } = checkSuccessCriteria(sess, tabId);
+    if (success) {
+      emitAgentLog(tabId, { level: LOG_LEVELS.INFO, msg: `Sub-task "${currentSubTask}" completed.` });
+      sess.currentTaskIndex++;
+      sess.subTaskStep = 0; // Reset sub-task step counter
+      sess.noProgressCounter = 0; // Reset no-progress counter
+      // Send a step update to the sidepanel
+      safeRuntimeSendMessage({
+        type: MSG.AGENT_STEP_UPDATE,
+        tabId: tabId,
+        currentTaskIndex: sess.currentTaskIndex
+      });
+    } else {
+      emitAgentLog(tabId, { level: LOG_LEVELS.WARN, msg: "Done requested but success criteria not met. Not advancing.", errors });
+    }
   }
 
   // 8. Check for overall completion or max steps
@@ -2467,7 +4526,7 @@ async function agenticLoop(tabId, goal, settings) {
 
 function parseModelResponse(responseText) {
   try {
-    const jsonResult = extractJSONWithRetry(responseText, 'model response');
+    const jsonResult = Utils.extractJSONWithRetry(responseText, 'model response');
     if (jsonResult.success) {
       return { action: jsonResult.data.action, rationale: jsonResult.data.rationale };
     }
@@ -2488,8 +4547,10 @@ async function gatherContextForReasoning(tabId, sess) {
         const textExtract = await chrome.tabs.sendMessage(tabId, { type: MSG.EXTRACT_PAGE_TEXT, maxChars: 8000 });
         if (textExtract?.ok) pageContent = textExtract.text;
 
-        const elementsExtract = await chrome.tabs.sendMessage(tabId, { type: MSG.GET_INTERACTIVE_ELEMENTS });
-        if (elementsExtract?.ok) interactiveElements = elementsExtract.elements;
+        const elementsExtract = await sendContentRPC(tabId, { type: "GET_ELEMENT_MAP" }, getFastTimeout('getInteractiveElements'));
+        if (elementsExtract?.ok) {
+          interactiveElements = elementsExtract.elements || (elementsExtract.map && elementsExtract.map.elements) || [];
+        }
       } catch (e) {
         console.warn("Failed to get page context", e);
       }
@@ -2518,7 +4579,7 @@ async function generateFinalReport(tabId, sess) {
   const reportRes = await callModelWithRotation(reportPrompt, { model: sess.selectedModel, tabId });
 
   if (reportRes.ok) {
-    chrome.runtime.sendMessage({
+    safeRuntimeSendMessage({
       type: MSG.SHOW_REPORT,
       tabId: tabId,
       report: reportRes.text,
@@ -2526,7 +4587,7 @@ async function generateFinalReport(tabId, sess) {
     });
   } else {
     // Fallback message if report generation fails
-    chrome.runtime.sendMessage({
+    safeRuntimeSendMessage({
       type: MSG.SHOW_REPORT,
       tabId: tabId,
       report: `I have completed the task, but encountered an issue generating the final summary. The goal was: "${sess.goal}".`,
@@ -2541,7 +4602,7 @@ chrome.runtime.onStartup.addListener(async () => {
   // Initialize API key manager
   await apiKeyManager.initialize();
   // Clean up old sessions on startup
-  await cleanupOldSessions();
+  await SessionManager.cleanupOldSessions();
   // Initialize enhanced features
   initializeEnhancedFeatures();
   
@@ -2550,7 +4611,7 @@ chrome.runtime.onStartup.addListener(async () => {
     const tabs = await chrome.tabs.query({});
     for (const tab of tabs) {
       if (tab.id) {
-        await restoreSessionFromStorage(tab.id);
+        await SessionManager.restoreSessionFromStorage(tab.id);
       }
     }
   } catch (e) {
@@ -2563,7 +4624,7 @@ chrome.runtime.onInstalled.addListener(async () => {
   // Initialize API key manager
   await apiKeyManager.initialize();
   // Clean up old sessions on install
-  await cleanupOldSessions();
+  await SessionManager.cleanupOldSessions();
   // Initialize enhanced features
   initializeEnhancedFeatures();
 });
@@ -2586,7 +4647,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           if (!tab?.id) return sendResponse({ ok: false, error: "No active tab" });
 
           // Check for a restorable session
-          const restoredSession = await restoreSessionFromStorage(tab.id);
+          const restoredSession = await SessionManager.restoreSessionFromStorage(tab.id);
           if (restoredSession && restoredSession.subTasks && restoredSession.currentTaskIndex < restoredSession.subTasks.length) {
             emitAgentLog(tab.id, {
               level: LOG_LEVELS.INFO,
@@ -2640,11 +4701,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
 
           // 2. Initialize session with enhanced context
-          const newSession = initializeNewSession(tab.id, goal, subTasks, settings, GEMINI_MODEL || "gemini-2.5-flash", taskContext);
-          agentSessions.set(tab.id, newSession);
+          const newSession = SessionManager.initializeNewSession(tab.id, goal, subTasks, settings, GEMINI_MODEL || "gemini-2.5-flash", taskContext);
+          SessionManager.setSession(tab.id, newSession);
           
           // Persist new session
-          await saveSessionToStorage(tab.id, newSession);
+          await SessionManager.saveSessionToStorage(tab.id, newSession);
           
           emitAgentLog(tab.id, {
             level: LOG_LEVELS.INFO,
@@ -2664,9 +4725,77 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
 // 3. Start execution engine (graph mode or legacy loop) but don't block sendResponse
 try {
-  const { EXPERIMENTAL_GRAPH_MODE } = await chrome.storage.local.get("EXPERIMENTAL_GRAPH_MODE");
+  const { EXPERIMENTAL_GRAPH_MODE, REACT_PLANNER_MODE } = await chrome.storage.local.get(["EXPERIMENTAL_GRAPH_MODE", "REACT_PLANNER_MODE"]);
   if (globalThis.TaskGraphEngine && EXPERIMENTAL_GRAPH_MODE) {
-    const graph = buildSimpleGraphForSession(tab.id, newSession);
+    // Default REACT_PLANNER_MODE to true when Graph Mode is enabled (unless explicitly set to false)
+    const reactPlannerEnabled = (typeof REACT_PLANNER_MODE === "boolean") ? REACT_PLANNER_MODE : true;
+    const hasReactPlanner = !!(globalThis.ReActPlanner && typeof globalThis.ReActPlanner.plan === "function");
+
+    let graph = null;
+    let plannerKind = "linear";
+
+    // Try ReAct planner first if enabled and available
+    try {
+      if (reactPlannerEnabled && hasReactPlanner) {
+        plannerKind = "react";
+        const planningContext = await gatherContextForReasoning(tab.id, newSession).catch(() => ({}));
+        const planRes = await globalThis.ReActPlanner.plan(
+          newSession.goal,
+          planningContext,
+          { model: newSession.selectedModel, tabId: tab.id, requestId: newSession.requestId, maxChars: 15000 }
+        );
+        if (planRes?.ok && planRes.graph) {
+          graph = planRes.graph;
+          // Minimal end-to-end validation telemetry for the ReAct planner
+          try {
+            emitAgentLog(tab.id, {
+              level: LOG_LEVELS.INFO,
+              msg: "ReAct plan generated",
+              planner: plannerKind,
+              nodeCount: Array.isArray(graph?.nodes) ? graph.nodes.length : undefined,
+              rawBytes: typeof planRes.raw === "string" ? planRes.raw.length : undefined
+            });
+          } catch (_) {}
+        }
+      }
+    } catch (e) {
+      console.warn("[BG] ReAct planner failed, falling back to linear graph:", e);
+      plannerKind = "linear";
+      graph = null;
+    }
+
+    // Fallback to linear graph if ReAct graph not built
+    if (!graph) {
+      graph = globalThis.TaskGraphEngine.createLinearGraphFromSubTasks(
+        newSession.subTasks,
+        { requestId: newSession.requestId, goal: newSession.goal },
+        { maxChars: 15000 }
+      );
+    }
+
+    // Telemetry: which planner path we are using
+    try {
+      emitAgentLog(tab.id, {
+        level: LOG_LEVELS.INFO,
+        msg: "Graph mode starting",
+        planner: plannerKind,
+        reactPlannerEnabled,
+        hasReactPlanner,
+        nodeCount: Array.isArray(graph?.nodes) ? graph.nodes.length : undefined
+      });
+    } catch (_) {}
+    try { await chrome.storage.local.set({ LAST_PLANNER_USED: plannerKind }); } catch (_) {}
+    try {
+      const { PLANNER_STATS } = await chrome.storage.local.get("PLANNER_STATS");
+      const s = PLANNER_STATS || {};
+      const next = {
+        react: Number(s?.react || 0) + (plannerKind === "react" ? 1 : 0),
+        linear: Number(s?.linear || 0) + (plannerKind === "linear" ? 1 : 0),
+        legacy: Number(s?.legacy || 0)
+      };
+      await chrome.storage.local.set({ PLANNER_STATS: next });
+    } catch (_) {}
+
     runGraphForSession(tab.id, newSession, graph).catch(e => {
       console.error("[BG] Graph run error:", e);
       emitAgentLog(tab.id, { level: "error", msg: "Graph run error", error: String(e?.message || e) });
@@ -2686,7 +4815,7 @@ try {
 
         
           // Send the generated plan to the sidepanel
-          chrome.runtime.sendMessage({
+          safeRuntimeSendMessage({
             type: MSG.AGENT_PLAN_GENERATED,
             tabId: tab.id,
             plan: subTasks
@@ -2712,7 +4841,7 @@ try {
           
           // If no session in memory, try to restore from storage
           if (!sess) {
-            sess = await restoreSessionFromStorage(tab.id);
+            sess = await SessionManager.restoreSessionFromStorage(tab.id);
           }
           
           sendResponse({ ok: true, session: sess });
@@ -2750,7 +4879,7 @@ try {
             try {
               await chrome.scripting.executeScript({
                 target: { tabId: tab.id },
-                files: ["common/messages.js", "content/content.js"]
+                files: ["common/messages.js", "content/dom-agent.js", "content/content.js"]
               });
               const result = await chrome.tabs.sendMessage(tab.id, { type: MSG.EXTRACT_PAGE_TEXT });
               sendResponse(result);
@@ -2796,7 +4925,7 @@ try {
 
             // Notify UI of tool result (optional; timeline already receives events)
             try {
-              chrome.runtime.sendMessage({
+              safeRuntimeSendMessage({
                 type: MSG.AGENT_TOOL_RESULT,
                 tabId: targetTabId,
                 toolId,
@@ -2851,7 +4980,7 @@ try {
             try {
               await chrome.scripting.executeScript({
                 target: { tabId: tab.id },
-                files: ["common/messages.js", "content/content.js"]
+                files: ["common/messages.js", "content/dom-agent.js", "content/content.js"]
               });
               extract = await chrome.tabs.sendMessage(tab.id, { type: MSG.EXTRACT_PAGE_TEXT, maxChars });
             } catch (injErr) {
@@ -3039,7 +5168,7 @@ try {
             return sendResponse({ ok: false, error: "Coordinator model call failed.", details: modelRes.error });
           }
 
-          const extracted = extractJSONWithRetry(modelRes.text, 'coordinator response');
+          const extracted = Utils.extractJSONWithRetry(modelRes.text, 'coordinator response');
           if (!extracted.success) {
             // If JSON parsing fails, fall back to a general chat response.
             const fallbackPrompt = buildSummarizePrompt("", `I couldn't determine a specific action for your request: "${userMessage}". Please try rephrasing. Here's a general response:`);
@@ -3063,53 +5192,15 @@ try {
               
               // De-duplicate agent run logic by calling the existing handler function internally
               // This requires refactoring the AGENT_RUN case slightly. For now, we duplicate a bit.
-              const newSession = initializeNewSession(tab.id, agentGoal, [agentGoal], agentSettings, selectedModel, { taskType: 'AUTOMATION' });
-              agentSessions.set(tab.id, newSession);
-              await saveSessionToStorage(tab.id, newSession);
+              const newSession = SessionManager.initializeNewSession(tab.id, agentGoal, [agentGoal], agentSettings, selectedModel, { taskType: 'AUTOMATION' });
+              SessionManager.setSession(tab.id, newSession);
+              await SessionManager.saveSessionToStorage(tab.id, newSession);
               runAgentLoop(tab.id, agentGoal, agentSettings).catch(e => console.error("[BG] Agent loop error:", e));
               
               sendResponse({ ok: true, agentStarted: true, goal: agentGoal });
               break;
             default:
               sendResponse({ ok: false, error: `Unknown tool from coordinator: ${tool}` });
-          }
-          break;
-        }
-        case MSG.AGENT_EXECUTE_TOOL: {
-          try {
-            // Determine target tabId: prefer explicit, fallback to active tab
-            let targetTabId = Number.isFinite(message.tabId) ? message.tabId : null;
-            if (!Number.isFinite(targetTabId)) {
-              const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-              if (!tab?.id) {
-                return sendResponse({ ok: false, error: "No active tab" });
-              }
-              targetTabId = tab.id;
-            }
-
-            const toolId = message.toolId;
-            const input = message.input || {};
-            if (!toolId || typeof toolId !== "string") {
-              return sendResponse({ ok: false, error: "Missing toolId" });
-            }
-
-            // Execute the registered tool (emits timeline events internally)
-            const result = await runRegisteredTool(targetTabId, toolId, input);
-
-            // Notify UI (optional convenience channel in addition to direct response)
-            try {
-              chrome.runtime.sendMessage({
-                type: MSG.AGENT_TOOL_RESULT,
-                tabId: targetTabId,
-                toolId,
-                result,
-                timestamp: Date.now()
-              });
-            } catch (_) {}
-
-            sendResponse({ ok: true, result });
-          } catch (e) {
-            sendResponse({ ok: false, error: String(e?.message || e) });
           }
           break;
         }
@@ -3155,7 +5246,7 @@ async function classifyAndDecomposeTask(tabId, goal, pageInfo) {
     let confidence = 0.5;
     
     if (classificationRes?.ok) {
-      const jsonResult = extractJSONWithRetry(classificationRes.text, 'task classification');
+      const jsonResult = Utils.extractJSONWithRetry(classificationRes.text, 'task classification');
       if (jsonResult.success) {
         taskType = jsonResult.data.intent || 'AUTOMATION';
         confidence = jsonResult.data.confidence || 0.5;
@@ -3198,7 +5289,7 @@ async function classifyAndDecomposeTask(tabId, goal, pageInfo) {
     };
     
     if (decompRes?.ok) {
-      const jsonResult = extractJSONWithRetry(decompRes.text, 'task decomposition');
+      const jsonResult = Utils.extractJSONWithRetry(decompRes.text, 'task decomposition');
       if (jsonResult.success) {
         const parsed = jsonResult.data;
         
@@ -3263,7 +5354,7 @@ async function classifyAndDecomposeTask(tabId, goal, pageInfo) {
 
 // [SCHEMA VALIDATION] New parse and validate function using the schema
 function parseAndValidateAction(tabId, sess, responseText) {
-  const jsonResult = extractJSONWithRetry(responseText, 'planning response');
+  const jsonResult = Utils.extractJSONWithRetry(responseText, 'planning response');
 
   if (!jsonResult.success) {
     return {
@@ -3298,7 +5389,7 @@ function parseAndValidateAction(tabId, sess, responseText) {
   let { valid, errors } = validateAction(action);
 
   // One-shot repair attempt for record_finding
-  if (!valid && action.tool === 'record_finding') {
+  if (!valid && (action.tool === 'record_finding' || action.tool === 'recordFinding')) {
     const repaired = preNormalizeAction(action);
     const res2 = validateAction(repaired);
     if (res2.valid) {
@@ -3429,7 +5520,7 @@ async function gatherEnhancedContext(tabId, sess, currentSubTask) {
     const contextData = {
       pageInfo,
       pageContent: sess.currentPageContent || "", // Get content from session
-      interactiveElements: sess.currentInteractiveElements || [], // Get elements from session
+      interactiveElements: [], // Elements removed from cache - will be fetched fresh when needed
       history: sess.history || [],
       scratchpad: sess.scratchpad || [],
       lastAction: sess.lastAction,
@@ -3454,6 +5545,107 @@ async function gatherEnhancedContext(tabId, sess, currentSubTask) {
   
 }
 
+/**
+* Smart wait after navigation to reduce "perception timing" issues.
+* Strategy:
+* 1) Poll chrome.tabs.get(tabId).status until 'complete' or timeout (FAST_MODE aware)
+* 2) Ensure content script and yield two rAF frames via SETTLE (best-effort)
+* Never throws; logs are minimal and best-effort.
+*/
+async function waitForPageInteractive(tabId, options = {}) {
+  const start = Date.now();
+  const isClickTriggered = options.trigger === 'clickElement' || options.trigger === 'click';
+  const maxMs = Number.isFinite(options.maxMs) ? options.maxMs : (FAST_MODE_BG ? (isClickTriggered ? 3000 : 1500) : (isClickTriggered ? 7000 : 4000));
+  const pollInterval = FAST_MODE_BG ? 150 : 250;
+
+  try {
+    // 1. Wait for the tab status to be 'complete'
+    while (Date.now() - start < maxMs) {
+      try {
+        const t = await chrome.tabs.get(tabId);
+        if (t?.status === 'complete') break;
+      } catch (e) {
+        // Tab may not exist yet, continue polling
+      }
+      await new Promise(r => setTimeout(r, pollInterval));
+    }
+
+    // 2. Ensure content script is available
+    if (!(await ensureContentScript(tabId))) {
+      emitAgentLog(tabId, { level: LOG_LEVELS.WARN, msg: "waitForPageInteractive: Content script not available after load." });
+      return;
+    }
+    
+    // 3. Actively poll for interactive elements to appear, confirming SPA render
+    let elementsFound = 0;
+    let consecutiveFailures = 0;
+    const maxConsecutiveFailures = 3;
+    
+    while (Date.now() - start < maxMs) {
+      try {
+        const res = await sendContentRPC(tabId, { type: "GET_ELEMENT_MAP" }, getFastTimeout('getInteractiveElements'));
+        const elements = (res?.ok && (res.elements || (res.map && res.map.elements))) ? (res.elements || res.map.elements) : [];
+        
+        if (Array.isArray(elements) && elements.length > 0) {
+          elementsFound = elements.length;
+          consecutiveFailures = 0; // Reset failure count
+          
+          // Cache the elements to avoid redundant fetches in refreshElementsAndExecute
+          elementFetchCache.set(tabId, {
+            timestamp: Date.now(),
+            elements: elements
+          });
+          
+          console.log(`[BG] waitForPageInteractive found ${elementsFound} elements after ${Date.now() - start}ms`);
+          break; // Elements found, page is interactive
+        } else {
+          consecutiveFailures++;
+          // If we've had multiple consecutive failures but still have time, try waiting a bit longer
+          if (consecutiveFailures >= maxConsecutiveFailures && (Date.now() - start) < (maxMs * 0.7)) {
+            console.log(`[BG] waitForPageInteractive: ${consecutiveFailures} consecutive failures, waiting longer...`);
+            await new Promise(r => setTimeout(r, pollInterval * 3));
+            consecutiveFailures = 0; // Reset after longer wait
+          }
+        }
+      } catch (e) {
+        consecutiveFailures++;
+        console.warn(`[BG] waitForPageInteractive error (attempt ${consecutiveFailures}):`, e.message);
+      }
+      
+      await new Promise(r => setTimeout(r, pollInterval * 2)); // Use a slightly longer poll for this part
+    }
+    
+    // Final attempt if no elements were found
+    if (elementsFound === 0 && (Date.now() - start) < maxMs) {
+      console.log(`[BG] waitForPageInteractive: Making final attempt...`);
+      try {
+        const res = await sendContentRPC(tabId, { type: "GET_ELEMENT_MAP" }, getFastTimeout('getInteractiveElements'));
+        const elements = (res?.ok && (res.elements || (res.map && res.map.elements))) ? (res.elements || res.map.elements) : [];
+        if (Array.isArray(elements)) {
+          elementsFound = elements.length;
+          if (elementsFound > 0) {
+            elementFetchCache.set(tabId, {
+              timestamp: Date.now(),
+              elements: elements
+            });
+          }
+        }
+      } catch (e) {
+        console.warn(`[BG] waitForPageInteractive final attempt failed:`, e.message);
+      }
+    }
+
+    emitAgentLog(tabId, {
+      level: LOG_LEVELS.DEBUG,
+      msg: `waitForPageInteractive finished after ${Date.now() - start}ms. Found ${elementsFound} elements.`,
+      trigger: options.trigger
+    });
+
+  } catch (e) {
+    emitAgentLog(tabId, { level: LOG_LEVELS.WARN, msg: "waitForPageInteractive encountered an error", error: e.message });
+  }
+}
+
 // [CONTEXT ENGINEERING] Enhanced action execution
 async function executeActionWithContext(tabId, sess, action, settings) {
   // Log with redacted params
@@ -3468,14 +5660,41 @@ async function executeActionWithContext(tabId, sess, action, settings) {
   };
 
   emitAgentLog(tabId, {
-    level: LOG_LEVELS.INFO,
-    msg: `Executing Tool: ${action.tool}`,
-    action: redactedAction,
-    rationale: action.rationale, // Add rationale to the log
-    requestId: sess.requestId
-  });
+      level: LOG_LEVELS.INFO,
+      msg: `Executing Tool: ${action.tool}`,
+      tool: action.tool,
+      action: redactedAction,
+      rationale: action.rationale, // Add rationale to the log
+      requestId: sess.requestId
+    });
+  
+  emitAgentStatus(tabId, `Executing: ${getToolDescription(action.tool)}...`);
+
+  // Capture URL before action for implicit navigation detection
+  // Capture URL before action for implicit navigation detection, but skip for internal-only actions.
+  let urlBeforeAction = '';
+  if (action.tool !== 'think') {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      urlBeforeAction = tab?.url || '';
+    } catch (e) {
+      emitAgentLog(tabId, { level: LOG_LEVELS.WARN, msg: "Could not get URL before action", error: e.message });
+    }
+  }
 
   const execRes = await dispatchActionWithTimeout(tabId, action, settings);
+
+  // Capture URL after action
+  // Similarly, skip URL check for internal-only actions.
+  let urlAfterAction = '';
+  if (action.tool !== 'think') {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      urlAfterAction = tab?.url || '';
+    } catch (e) {
+      emitAgentLog(tabId, { level: LOG_LEVELS.WARN, msg: "Could not get URL after action", error: e.message });
+    }
+  }
 
   emitAgentLog(tabId, {
     level: execRes?.ok === false ? LOG_LEVELS.ERROR : LOG_LEVELS.SUCCESS,
@@ -3484,27 +5703,109 @@ async function executeActionWithContext(tabId, sess, action, settings) {
     success: execRes?.ok !== false,
     observation: execRes?.observation?.substring(0, 300) + (execRes?.observation?.length > 300 ? '...' : ''),
     errorType: execRes?.errorType,
+    errorCode: execRes?.errorCode, // Propagate structured error code
     requestId: sess.requestId
   });
 
   sendActionResultToChat(tabId, sess, action, execRes);
 
-  // Auto-sense: if navigation was successful, immediately read the new page content
-  if (execRes.ok && ['navigate', 'goto_url', 'smart_navigate', 'research_url'].includes(action.tool)) {
+  // Debug visualization: highlight executed action and update overlay indices
+  try {
+    if (execRes?.ok) {
+      const tool = String(action.tool || '').trim();
+      const p = action.params || {};
+      const selector = typeof p.selector === 'string' ? p.selector : '';
+
+      if (tool === 'click' || tool === 'click_element' || tool === 'clickElement') {
+        // Keep the visual highlight for up to 1 minute so users can clearly see where the AI clicked
+        await highlightSelectorForDebug(tabId, selector, 'AI Click', '#ff9800', 60000);
+        await updateOverlayForDebug(tabId);
+      } else if (tool === 'type_text' || tool === 'fill' || tool === 'typeText') {
+        await highlightSelectorForDebug(tabId, selector, 'Type', '#4caf50', 1200);
+        await updateOverlayForDebug(tabId);
+      } else if (tool === 'wait_for_selector' || tool === 'waitForSelector') {
+        if (selector) await highlightSelectorForDebug(tabId, selector, 'Wait OK', '#2196f3', 800);
+      } else if (tool === 'scroll_to' || tool === 'scrollTo') {
+        if (selector) await highlightSelectorForDebug(tabId, selector, 'Scroll', '#9c27b0', 800);
+      } else if (tool === 'scrape' || tool === 'scrapeSelector') {
+        if (selector) await highlightSelectorForDebug(tabId, selector, 'Scrape', '#607d8b', 1000);
+      } else if (tool === 'get_interactive_elements' || tool === 'getInteractiveElements') {
+        await updateOverlayForDebug(tabId);
+      }
+    }
+  } catch (_) {}
+
+  // Auto-sense: if navigation was successful or a click caused a URL change, wait for page to become interactive.
+  const clickCausedNavigation = execRes.ok &&
+                                ['click', 'click_element', 'clickElement'].includes(action.tool) &&
+                                urlBeforeAction &&
+                                urlAfterAction &&
+                                urlBeforeAction !== urlAfterAction;
+
+  if (clickCausedNavigation) {
     emitAgentLog(tabId, {
       level: LOG_LEVELS.INFO,
-      msg: "Auto-sensing new page content after navigation",
-      triggeringTool: action.tool
+      msg: "Implicit navigation detected after click action.",
+      from: urlBeforeAction,
+      to: urlAfterAction
     });
-    const readAction = { tool: 'read_page_content', params: {} };
-    const readRes = await dispatchActionWithTimeout(tabId, readAction, settings);
-    if (readRes.ok && readRes.pageContent) {
-      sess.currentPageContent = readRes.pageContent;
+  }
+
+  // This function centralizes the logic for re-scanning elements after an action.
+  const senseAndStoreElements = async (trigger) => {
+    emitAgentLog(tabId, {
+      level: LOG_LEVELS.INFO,
+      msg: "Auto-sensing interactive elements",
+      triggeringTool: trigger
+    });
+
+    try { AgentPortManager.invalidate(tabId); } catch (_) {}
+    await waitForPageInteractive(tabId, { trigger });
+
+    try {
+      let getElementsAction = { tool: 'get_interactive_elements', params: {} };
+      let elementsRes = await dispatchActionWithTimeout(tabId, getElementsAction, settings);
+
+      if (elementsRes?.ok && Array.isArray(elementsRes.data) && elementsRes.data.length === 0) {
+        await waitForPageInteractive(tabId, { maxMs: FAST_MODE_BG ? 800 : 1500, trigger: `${trigger}_retry` });
+        elementsRes = await dispatchActionWithTimeout(tabId, getElementsAction, settings);
+      }
+
+      if (elementsRes?.ok && elementsRes.data) {
+        // Element caching removed for bfcache compatibility
+        // sess.currentInteractiveElements = elementsRes.data;
+        sess.currentPageContent = ""; // Clear stale content
+        emitAgentLog(tabId, {
+          level: LOG_LEVELS.DEBUG,
+          msg: `Auto-get_interactive_elements successful, found ${elementsRes.data.length} elements (no longer cached).`
+        });
+        try { await showOverlayForDebug(tabId, { limit: 50, colorScheme: "type" }); } catch (_) {}
+      } else {
+        emitAgentLog(tabId, {
+          level: LOG_LEVELS.WARN,
+          msg: "Auto-sensing interactive elements returned no data after navigation retry"
+        });
+      }
+    } catch (e) {
       emitAgentLog(tabId, {
         level: LOG_LEVELS.DEBUG,
-        msg: `Auto-read successful, stored page content in session (length: ${readRes.pageContent.length})`
+        msg: "Gracefully handled comms error during post-action sensing.",
+        error: e.message
       });
     }
+  };
+
+  // Logic Branch 1: Explicit navigation tool was used.
+  if (execRes.ok && ['navigate', 'goto_url', 'navigateToUrl', 'smart_navigate', 'research_url'].includes(action.tool)) {
+    await senseAndStoreElements(action.tool);
+  }
+  // Logic Branch 2: A click implicitly caused a navigation.
+  else if (clickCausedNavigation) {
+    await senseAndStoreElements('implicit_nav_click');
+  }
+  // Logic Branch 3: A non-navigating action that might change the DOM was used.
+  else if (execRes.ok && ['click_element', 'type_text', 'wait_for_selector', 'select_option'].includes(action.tool)) {
+    await senseAndStoreElements(`post_${action.tool}`);
   }
 
   return execRes;
@@ -3533,24 +5834,31 @@ function updateSessionContext(tabId, sess, action, execRes) {
       sess.scratchpad.shift();
   }
 
-  // If the page content was read, store it in the session
-  if (action.tool === 'read_page_content' && execRes.ok && execRes.pageContent) {
+  // Store page content in the session whenever provided by a tool result
+  if (execRes.ok && typeof execRes.pageContent === 'string' && execRes.pageContent) {
     sess.currentPageContent = execRes.pageContent;
     emitAgentLog(tabId, { level: LOG_LEVELS.DEBUG, msg: `Stored page content in session (length: ${execRes.pageContent.length})` });
   }
+  
+  // Element caching removed for bfcache compatibility - no longer storing elements in session
+  if (action.tool === 'getInteractiveElements' && execRes.ok && execRes.data) {
+      emitAgentLog(tabId, { level: LOG_LEVELS.DEBUG, msg: `Found ${execRes.data.length} interactive elements (not cached for bfcache compatibility)` });
+  }
 
   // If we navigate away, the content is now stale and must be cleared
-  if (action.tool === 'navigate' || action.tool === 'goto_url' || action.tool === 'smart_navigate') {
+  if (action.tool === 'navigate' || action.tool === 'goto_url' || action.tool === 'navigateToUrl' || action.tool === 'smart_navigate') {
     sess.currentPageContent = "";
-    sess.currentInteractiveElements = [];
+    // Element caching removed for bfcache compatibility
+    // sess.currentInteractiveElements = [];
     emitAgentLog(tabId, { level: LOG_LEVELS.DEBUG, msg: "Cleared stale page content from session after navigation." });
   }
 
   // Persist session state after each action
-  saveSessionToStorage(tabId, sess);
+  SessionManager.saveSessionToStorage(tabId, sess);
 
   // Update domain visit count for the watchdog
-  if (execRes.ok && ['navigate', 'goto_url', 'smart_navigate', 'research_url'].includes(action.tool)) {
+  if (!sess.domainVisitCount || typeof sess.domainVisitCount !== 'object') { sess.domainVisitCount = {}; }
+  if (execRes.ok && ['navigate', 'goto_url', 'navigateToUrl', 'smart_navigate', 'research_url'].includes(action.tool)) {
     try {
       const url = new URL(action.params.url);
       const domain = url.hostname;
@@ -3562,15 +5870,130 @@ function updateSessionContext(tabId, sess, action, execRes) {
 
   // Update no-progress detector state
   const observation = execRes?.observation || "";
-  // Consider progress made if the observation is new and substantive
-  if (observation.length > 50 && observation !== sess.lastProgressObservation) {
-      sess.noProgressCounter = 0;
-      sess.lastProgressObservation = observation;
+  const progressTools = new Set([
+    'navigate','goto_url','navigateToUrl','smart_navigate',
+    'click','click_element','clickElement',
+    'type_text','typeText','fill',
+    'wait_for_selector','waitForSelector',
+    'read_page_content','readPageContent',
+    'get_interactive_elements','getInteractiveElements',
+    'analyze_urls','analyzeUrls'
+  ]);
+  const isProgressTool = progressTools.has(action.tool);
+
+  if ((execRes.ok && isProgressTool) ||
+      (observation.length > 50 && observation !== sess.lastProgressObservation)) {
+    sess.noProgressCounter = 0;
+    sess.lastProgressObservation = observation;
   } else {
-      sess.noProgressCounter = (sess.noProgressCounter || 0) + 1;
+    sess.noProgressCounter = (sess.noProgressCounter || 0) + 1;
   }
 }
 
+// Fast-path deterministic correction builder (avoids model call for common failures)
+function buildDeterministicCorrection(failedAction, execRes, contextData) {
+  try {
+    const tool = String(failedAction?.tool || '').trim();
+    const observation = String(execRes?.observation || '').toLowerCase();
+    const code = String(execRes?.errorCode || '').toUpperCase();
+    const params = failedAction?.params || {};
+    const elements = Array.isArray(contextData?.interactiveElements) ? contextData.interactiveElements : [];
+
+    // Helper to read overlay index consistently
+    const getIndex = (el) => {
+      const v = el?.index ?? el?.elementIndex ?? el?.idx;
+      const n = Number(v);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    };
+
+    // 1) Missing selector or element not found → prefer index typing/click, else fetch elements
+    const isSelectorIssue =
+      code === 'MISSING_SELECTOR' ||
+      observation.includes('no selector provided') ||
+      observation.includes('selector not found') ||
+      observation.includes('not found or not visible');
+
+    if (isSelectorIssue && (tool === 'type_text' || tool === 'typeText' || tool === 'click_element' || tool === 'clickElement')) {
+      // Try index-based correction using existing interactive elements
+      if (elements.length > 0) {
+        if (tool === 'type_text' || tool === 'typeText') {
+          const cand = elements.find(el => {
+            const tag = String(el.tag || el.tagName || '').toLowerCase();
+            const role = String(el.role || '').toLowerCase();
+            const inputType = String(el.inputType || '').toLowerCase();
+            return (tag === 'input' || tag === 'textarea' || role === 'textbox') && inputType !== 'hidden';
+          }) || elements.find(el => String(el.tag || '').toLowerCase() === 'input');
+          const idx = cand ? getIndex(cand) : null;
+          if (idx) {
+            return {
+              tool: 'type_text',
+              params: {
+                elementIndex: idx,
+                text: String(params.text ?? params.value ?? '')
+              },
+              rationale: 'Use overlay index to type into a visible input after selector failure',
+              confidence: 0.9,
+              done: false
+            };
+          }
+        } else {
+          const cand = elements.find(el => {
+            const tag = String(el.tag || '').toLowerCase();
+            const role = String(el.role || '').toLowerCase();
+            return tag === 'button' || tag === 'a' || role === 'button' || role === 'link';
+          }) || elements[0];
+          const idx = cand ? getIndex(cand) : null;
+          if (idx) {
+            return {
+              tool: 'click_element',
+              params: { elementIndex: idx },
+              rationale: 'Use overlay index to click after selector failure',
+              confidence: 0.85,
+              done: false
+            };
+          }
+        }
+      }
+      // If we don't have elements cached, fetch them to enable index-based actions next
+      return {
+        tool: 'get_interactive_elements',
+        params: {},
+        rationale: 'Fetch interactive elements to enable elementIndex-based targeting',
+        confidence: 0.85,
+        done: false
+      };
+    }
+
+    // 2) Timeout on wait_for_selector → increase timeout and retry
+    if ((tool === 'wait_for_selector' || tool === 'waitForSelector') &&
+        (code === 'TIMEOUT' || observation.includes('timeout'))) {
+      const selector = String(params.selector || '');
+      // If waiting for a selector fails, don't just wait longer.
+      // Force a re-think to determine if another action is needed first.
+      return {
+          tool: 'think',
+          params: {
+              thought: `I waited for the element "${selector}" but it did not appear. I need to re-evaluate the page and my plan. Perhaps I need to navigate to a different page or click another element first to make it visible.`
+          },
+          rationale: 'Selector did not appear after waiting. Re-evaluating plan is safer than waiting longer.',
+          confidence: 0.95,
+          done: false
+      };
+    }
+
+    // 3) Element not visible → scroll into view before retry
+    if (params.selector && (observation.includes('not visible') || observation.includes('not in viewport') || observation.includes('obscured'))) {
+      return {
+        tool: 'scroll_to',
+        params: { selector: params.selector },
+        rationale: 'Scroll element into view before interacting',
+        confidence: 0.85,
+        done: false
+      };
+    }
+  } catch (_) {}
+  return null;
+}
 // [CONTEXT ENGINEERING] Adaptive failure handling and self-correction
 async function handleActionFailure(tabId, sess, goal, currentSubTask, contextData, failedAction, execRes) {
   const MAX_CONSECUTIVE_FAILURES = 3;
@@ -3587,13 +6010,36 @@ async function handleActionFailure(tabId, sess, goal, currentSubTask, contextDat
     level: LOG_LEVELS.WARN,
     msg: `Action failed. Attempting self-correction. (Attempt ${sess.consecutiveFailures + 1}/${MAX_CONSECUTIVE_FAILURES})`,
     failedAction: failedAction,
-    observation: execRes.observation
+    observation: execRes.observation,
+    errorCode: execRes.errorCode // Log the structured error code
   });
 
+  // Fast-path: try deterministic correction before invoking the LLM
+  try {
+    const fastCorrection = buildDeterministicCorrection(failedAction, execRes, contextData);
+    if (fastCorrection) {
+      emitAgentLog(tabId, {
+        level: LOG_LEVELS.INFO,
+        msg: "Using deterministic self-correction (no LLM).",
+        proposed: fastCorrection
+      });
+      return fastCorrection;
+    }
+  } catch (_) {}
+
+  // Generate a more targeted correction plan based on the error code
+  const attemptCount = (sess.consecutiveFailures || 0) + 1;
   const correctionPrompt = buildSelfCorrectPrompt(goal, currentSubTask, {
     ...contextData,
     failedAction,
-    observation: execRes.observation
+    observation: execRes.observation,
+    // Pass the structured error code to the prompt for better context
+    errorInfo: {
+      type: execRes.errorType,
+      code: execRes.errorCode,
+      message: execRes.observation
+    },
+    attemptCount
   });
 
   const correctionRes = await callModelWithRotation(correctionPrompt, { model: sess.selectedModel, tabId });
@@ -3601,21 +6047,50 @@ async function handleActionFailure(tabId, sess, goal, currentSubTask, contextDat
   if (correctionRes?.ok) {
     const validationResult = parseAndValidateAction(tabId, sess, correctionRes.text);
     if (validationResult.success) {
+      const correctedAction = validationResult.action;
+      // Guard against repeating the exact same failed action
+      if (Utils.deepEqual(correctedAction, failedAction)) {
+        emitAgentLog(tabId, {
+          level: LOG_LEVELS.WARN,
+          msg: "Self-correction proposed the same failing action. Overriding with a 'think' action to force re-evaluation."
+        });
+        return {
+          tool: 'think',
+          params: { thought: `My previous action (${failedAction.tool}) failed. I need to try a different approach instead of repeating the same mistake. I will re-evaluate the page and my plan.` },
+          rationale: "Avoiding a failure loop by not repeating the same action.",
+          confidence: 0.99
+        };
+      }
       emitAgentLog(tabId, { level: LOG_LEVELS.INFO, msg: "Self-correction plan generated successfully." });
-      return validationResult.action;
+      return correctedAction;
     } else {
       emitAgentLog(tabId, { level: LOG_LEVELS.ERROR, msg: "Failed to parse self-correction plan.", error: validationResult.error });
     }
   } else {
-    emitAgentLog(tabId, { level: LOG_LEVELS.ERROR, msg: "Self-correction planning failed.", error: correctionRes?.error });
+    emitAgentLog(tabId, {
+      level: LOG_LEVELS.ERROR,
+      msg: "Self-correction planning failed.",
+      error: correctionRes?.error,
+      provider: "model"
+    });
   }
 
-  return null;
+  // Fallback to a deterministic 'think' action if LLM-based correction fails
+  emitAgentLog(tabId, {
+    level: LOG_LEVELS.WARN,
+    msg: "LLM-based self-correction failed. Falling back to a deterministic 'think' action."
+  });
+  return {
+    tool: 'think',
+    params: { thought: `My previous action (${failedAction.tool}) failed with the error: '${execRes.observation}'. I will re-read the page content and elements to re-evaluate my next step.` },
+    rationale: "Fallback after failed self-correction attempt.",
+    confidence: 0.95
+  };
 }
 
 // [CONTEXT ENGINEERING] Dynamic delay between steps
 function calculateAdaptiveDelay(action, success) {
-  if (action.tool === 'navigate') {
+  if (action.tool === 'navigate' || action.tool === 'goto_url' || action.tool === 'navigateToUrl') {
     return TIMEOUTS.PAGE_LOAD_DELAY;
   }
   if (!success) {
@@ -3862,7 +6337,7 @@ function runWatchdogs(tabId, sess, lastAction, lastExecRes) {
   }
 
   // 2. Per-domain visit cap
-  if (['navigate', 'goto_url', 'smart_navigate', 'research_url'].includes(lastAction.tool) && lastExecRes.ok) {
+  if (['navigate', 'goto_url', 'navigateToUrl', 'smart_navigate', 'research_url'].includes(lastAction.tool) && lastExecRes.ok) {
     try {
       const url = new URL(lastAction.params.url);
       const domain = url.hostname;
@@ -4036,14 +6511,14 @@ globalThis.testTemplateSubstitution = testTemplateSubstitution;
               const { content } = out;
               let findingToRecord = content.source === 'json-ld' ? content.data : { ...content };
               if (Array.isArray(findingToRecord)) {
-                findingToRecord.forEach(item => { sess.findings = deepMerge(sess.findings || {}, item); });
+                findingToRecord.forEach(item => { sess.findings = Utils.deepMerge(sess.findings || {}, item); });
               } else {
-                sess.findings = deepMerge(sess.findings || {}, findingToRecord);
+                sess.findings = Utils.deepMerge(sess.findings || {}, findingToRecord);
               }
               emitAgentLog(tabId, { level: MessageTypes.LOG_LEVELS.SUCCESS, msg: 'Graph: recorded structured finding', source: content.source || 'unknown' });
             }
             // Persist after each successful node
-            saveSessionToStorage(tabId, sess);
+            SessionManager.saveSessionToStorage(tabId, sess);
           }
         } catch (e) {
           try { LOGGER?.warn?.('graph_onNodeFinish_error', { nodeId: node?.id, error: String(e?.message || e) }); } catch (_) {}
