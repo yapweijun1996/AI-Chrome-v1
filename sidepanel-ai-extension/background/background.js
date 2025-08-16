@@ -11,8 +11,35 @@
       console.log("[BG] importScripts OK  ->", path);
       return true;
     } catch (e) {
+      // Enhanced error handling for import failures
+      const importError = {
+        name: 'ImportError',
+        message: `Failed to import script: ${path}`,
+        originalError: e,
+        path,
+        timestamp: new Date().toISOString(),
+        context: 'background-script-initialization'
+      };
+      
       // This will appear in chrome://extensions → Errors
       console.error("[BG] importScripts FAILED ->", path, String(e && e.message || e), e && e.stack);
+      
+      // Track error if ErrorTracker is available (it won't be for the first few imports)
+      if (globalThis.ErrorTracker) {
+        try {
+          globalThis.ErrorTracker.trackError({
+            name: 'ImportError',
+            message: importError.message,
+            category: 'background',
+            severity: 'critical',
+            code: 'IMPORT_FAILED',
+            context: importError
+          });
+        } catch (trackingError) {
+          console.warn("[BG] Failed to track import error:", trackingError);
+        }
+      }
+      
       throw e; // rethrow to preserve failure semantics for Status 15
     }
   }
@@ -20,6 +47,11 @@
   // Import in strict order; if any fails, we will know which.
   safeImport("../common/messages.js");        // defines globalThis.MessageTypes
   safeImport("../common/utils.js");           // defines globalThis.Utils
+  safeImport("../common/errors.js");          // Custom error classes and error handling
+  safeImport("../common/error-boundary.js");  // Error boundary and circuit breaker patterns
+  safeImport("../common/error-tracker.js");   // Centralized error tracking
+  safeImport("../common/indexed-db.js");      // IndexedDB wrapper
+  safeImport("../common/sync-manager.js");    // Background sync manager
   safeImport("../common/api.js");             // API wrapper (classic script)
   safeImport("../common/automation-templates.js");  // Automation templates library
   safeImport("../common/prompts.js");         // Prompt builders (classic script)
@@ -32,6 +64,7 @@
   safeImport("../common/success-criteria.js");  // Success criteria schemas and validator
   safeImport("../common/action-schema.js");     // Action validation schema
   safeImport("../common/tools-registry.js");    // Tool Registry (contracts, runTool)
+  safeImport("./tools.js");                     // Browser automation tools
   // Observer for structured timeline events
   safeImport("./observer.js");                  // AgentObserver (run/tool events to UI + storage)
   safeImport("./session-manager.js");         // Session management
@@ -1675,6 +1708,33 @@ function isRestrictedUrl(url = "") {
 }
 
 async function ensureContentScript(tabId) {
+  // Enhanced tab validation with detailed error reporting
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    
+    // Validate tab state
+    if (!tab) {
+      console.warn(`[BG] Tab ${tabId} not found`);
+      return false;
+    }
+    
+    // Check for restricted URLs that don't support content scripts
+    if (isRestrictedUrl(tab.url)) {
+      console.warn(`[BG] Tab ${tabId} has restricted URL: ${tab.url}`);
+      return false;
+    }
+    
+    // Check tab loading state
+    if (tab.status === 'loading') {
+      console.warn(`[BG] Tab ${tabId} is still loading, content script injection may fail`);
+      // Continue anyway as content script can be injected during loading
+    }
+    
+    console.log(`[BG] Tab ${tabId} validation passed - URL: ${tab.url}, Status: ${tab.status}`);
+  } catch (error) {
+    console.warn(`[BG] Tab ${tabId} is not accessible: ${error.message}`);
+    return false;
+  }
   // Manual timeout wrapper for sendMessage (since the API has no timeout option)
   const ping = (timeoutMs = 400) =>
     new Promise((resolve, reject) => {
@@ -1706,56 +1766,77 @@ async function ensureContentScript(tabId) {
 
   try {
     // Try a quick ping to see if the current content script is responsive
+    console.log(`[BG] Attempting to ping existing content script in tab ${tabId}`);
     const resp = await ping(300);
     if (resp && resp.ok === true) {
+      console.log(`[BG] Content script ping successful for tab ${tabId}, checking capabilities`);
       // Full capability handshake
       try {
         const caps = await sendContentRPC(tabId, { type: MSG.AGENT_CAPS }, 800);
-        if (caps?.ok && caps.capabilities) {
-          contentScriptCaps.set(tabId, caps.capabilities);
+        if (caps?.ok) {
+          const capabilities = caps.capabilities || {};
+          contentScriptCaps.set(tabId, capabilities);
           const sess = agentSessions.get(tabId);
           if (sess) {
-            sess.contentScriptCaps = caps.capabilities;
+            sess.contentScriptCaps = capabilities;
           }
+          console.log(`[BG] Content script capabilities confirmed for tab ${tabId}:`, capabilities);
           return true;
+        } else {
+          console.warn(`[BG] Content script capabilities check failed for tab ${tabId}:`, caps);
         }
       } catch (e) {
         // Handshake failed; attempt injection below
-        console.warn(`[BG] AGENT_CAPS handshake failed for tab ${tabId}:`, e);
+        console.warn(`[BG] AGENT_CAPS handshake failed for tab ${tabId}:`, e.message);
       }
+    } else {
+      console.log(`[BG] Content script ping failed for tab ${tabId}, response:`, resp);
     }
-  } catch {
+  } catch (pingError) {
     // No listener or timed out — attempt to inject the latest scripts
+    console.log(`[BG] Content script ping threw error for tab ${tabId}:`, pingError.message);
   }
 
   try {
+    console.log(`[BG] Injecting content scripts into tab ${tabId}`);
     await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
       // Ensure ranker is present before DOMAgent so DOMAgent.getInteractiveElements works
       files: ["common/messages.js", "content/element-ranker.js", "content/dom-agent.js", "content/content.js"]
     });
+    console.log(`[BG] Content script injection completed for tab ${tabId}`);
+    
     // Confirm the newly injected script is responsive
+    console.log(`[BG] Verifying injected content script in tab ${tabId}`);
     const resp2 = await ping(800);
     if (resp2 && resp2.ok === true) {
+      console.log(`[BG] Content script injection verified for tab ${tabId}`);
       // Retry handshake after injection
       try {
         const caps = await sendContentRPC(tabId, { type: MSG.AGENT_CAPS }, 800);
-        if (caps?.ok && caps.capabilities) {
-          contentScriptCaps.set(tabId, caps.capabilities);
+        if (caps?.ok) {
+          const capabilities = caps.capabilities || {};
+          contentScriptCaps.set(tabId, capabilities);
           const sess = agentSessions.get(tabId);
           if (sess) {
-            sess.contentScriptCaps = caps.capabilities;
+            sess.contentScriptCaps = capabilities;
           }
+          console.log(`[BG] Content script capabilities confirmed after injection for tab ${tabId}:`, capabilities);
           return true;
+        } else {
+          console.warn(`[BG] Content script capabilities check failed after injection for tab ${tabId}:`, caps);
         }
       } catch (e) {
-        console.warn(`[BG] AGENT_CAPS handshake failed after injection for tab ${tabId}:`, e);
+        console.warn(`[BG] AGENT_CAPS handshake failed after injection for tab ${tabId}:`, e.message);
       }
+      console.log(`[BG] Assuming basic functionality for tab ${tabId} despite handshake failure`);
       return true; // Assume basic functionality even if handshake fails
+    } else {
+      console.error(`[BG] Content script injection verification failed for tab ${tabId}, response:`, resp2);
+      return false;
     }
-    return false;
   } catch (injectionError) {
-    console.error(`[BG] Failed to inject or ping content script for tab ${tabId}:`, injectionError);
+    console.error(`[BG] Failed to inject content script for tab ${tabId}:`, injectionError.message, injectionError);
     return false;
   }
 }
@@ -1909,7 +1990,7 @@ if (typeof window !== 'undefined' && window.chrome?.runtime) {
 }
 
 // Enhanced timing safeguards for page interactivity
-async function waitForPageStability(tabId, maxWaitMs = 2000, skipIfRecentFetch = true) {
+async function waitForPageStability(tabId, maxWaitMs = 4000, skipIfRecentFetch = true) {
   // Check DOM readiness first before element fetching
   const domCheck = await checkDOMReadiness(tabId, 500);
   if (!domCheck.ready) {
@@ -1929,8 +2010,9 @@ async function waitForPageStability(tabId, maxWaitMs = 2000, skipIfRecentFetch =
   const start = Date.now();
   let lastElementCount = 0;
   let stableCount = 0;
+  let retries = 3; // Number of retries
   
-  while (Date.now() - start < maxWaitMs) {
+  while (Date.now() - start < maxWaitMs && retries > 0) {
     try {
       const mapRes = await sendContentRPC(tabId, { type: "GET_ELEMENT_MAP" }, getFastTimeout('getInteractiveElements'));
       const currentCount = (mapRes?.ok && mapRes.elements) ? mapRes.elements.length : 0;
@@ -1954,9 +2036,10 @@ async function waitForPageStability(tabId, maxWaitMs = 2000, skipIfRecentFetch =
         lastElementCount = currentCount;
       }
       
-      await new Promise(resolve => setTimeout(resolve, 300)); // Wait 300ms between checks
+      await new Promise(resolve => setTimeout(resolve, 500)); // Increased delay between checks
     } catch (error) {
       console.warn(`[BG] Page stability check failed:`, error.message);
+      retries--; // Decrement retries on error
       await new Promise(resolve => setTimeout(resolve, 200));
     }
   }
@@ -2036,14 +2119,20 @@ async function refreshElementsAndExecute(tabId, targetSelector, targetIndex, act
     
     // Enhanced element selection with fuzzy matching
     if (targetSelector) {
+      // Normalize selector to fix common quote issues
+      let normalizedSelector = targetSelector
+        .replace(/\[([^=]+)='([^']*)'([^\]]*)\]/g, '[$1="$2"$3]') // Fix mixed quotes
+        .replace(/\[([^=]+)="([^"]*)'\]/g, '[$1="$2"]'); // Fix trailing quote issues
+      
       // First try exact match
-      let matchingElement = elements.find(el => el.selector === targetSelector);
+      let matchingElement = elements.find(el => el.selector === normalizedSelector || el.selector === targetSelector);
       
       if (!matchingElement) {
         console.warn(`[BG] Exact selector '${targetSelector}' not found, trying fuzzy matching`);
         
         // Try partial matches (for dynamic selectors that may change)
-        const selectorParts = targetSelector.split(/[\s>+~]/).filter(p => p.trim());
+        const selectorToMatch = normalizedSelector !== targetSelector ? normalizedSelector : targetSelector;
+        const selectorParts = selectorToMatch.split(/[\s>+~]/).filter(p => p.trim());
         if (selectorParts.length > 0) {
           const mainPart = selectorParts[selectorParts.length - 1]; // Get the last part
           matchingElement = elements.find(el => 
@@ -2230,6 +2319,7 @@ async function ensureRobustConnection(tabId) {
 async function sendContentRPC(tabId, message, timeoutMs) {
   // Pre-flight connection check for critical operations
   const isCriticalOperation = message.type === "GET_ELEMENT_MAP" || 
+                              message.type === "GET_DOM_STATE" ||
                               message.type === "CLICK_SELECTOR" || 
                               message.type === "FILL_SELECTOR" ||
                               message.type === "DEBUG_CLICK_INDEX" ||
@@ -2244,10 +2334,41 @@ async function sendContentRPC(tabId, message, timeoutMs) {
   }
   
   try {
-    return await AgentPortManager.request(tabId, message, timeoutMs);
+    // Add diagnostic logging for critical operations
+    if (isCriticalOperation) {
+      console.log(`[BG] Executing critical operation ${message.type} on tab ${tabId}`);
+    }
+    
+    const result = await AgentPortManager.request(tabId, message, timeoutMs);
+    
+    // Log successful results for debugging
+    if (message.type === "GET_DOM_STATE") {
+      console.log(`[BG] DOM State: readyState=${result?.readyState}, elements=${result?.elementCount}`);
+    } else if (message.type === "GET_ELEMENT_MAP") {
+      console.log(`[BG] Element Map: found ${result?.elements?.length || 0} elements`);
+    }
+    
+    return result;
   } catch (e) {
     const msg = String(e?.message || e || "");
     const retriable = /Port RPC timeout|Port disconnected|message channel is closed|back\/forward cache|Could not establish connection/i.test(msg);
+    
+    // Enhanced error logging with better serialization
+    let errorDetails;
+    try {
+      errorDetails = {
+        message: msg,
+        type: e?.constructor?.name || 'Unknown',
+        stack: e?.stack ? e.stack.split('\n').slice(0, 3).join('\n') : 'No stack',
+        retriable,
+        timeout: timeoutMs,
+        isCritical: isCriticalOperation
+      };
+    } catch (serializationError) {
+      errorDetails = `Failed to serialize error: ${String(serializationError)}`;
+    }
+    
+    console.error(`[BG] sendContentRPC failed for ${message.type} on tab ${tabId}:`, JSON.stringify(errorDetails, null, 2));
       
       // Enhanced BFCache error handling with better logging
       if (isBFCacheError(msg)) {
@@ -3622,89 +3743,19 @@ async function dispatchAgentAction(tabId, action, settings) {
     case "navigate":
     case "goto_url": {
       const url = String(normalizedParams.url || "");
-      if (!/^https?:\/\//i.test(url)) {
-        return { ok: false, observation: "Invalid URL for navigate" };
-      }
-      await chrome.tabs.update(tabId, { url });
-      return { ok: true, observation: `Navigated to ${url}` };
+      const result = await globalThis.navigateTo(url);
+      return { ok: result.ok, observation: result.ok ? `Navigated to ${url}` : result.error };
     }
     case "click_element": {
-      if (!(await ensureContentScript(tabId))) {
-        emitAgentLog(tabId, {
-          level: LOG_LEVELS.ERROR,
-          msg: "Content script unavailable: cannot execute DOM tool",
-          tool: "click_element",
-          errorType: ERROR_TYPES.CONTENT_SCRIPT_UNAVAILABLE
-        });
-        return { ok: false, observation: "Content script unavailable" };
-      }
-      const idx = Number(normalizedParams.elementIndex);
-      if (Number.isFinite(idx) && idx > 0) {
-        const res = await sendContentRPC(tabId, { type: "DEBUG_CLICK_INDEX", index: idx });
-        return res?.ok ? { ok: true, observation: res.msg || `Clicked index ${idx}` } : { ok: false, observation: res?.error || "Click by index failed" };
-      }
-      const res = await sendContentRPC(tabId, { type: "CLICK_SELECTOR", selector: normalizedParams.selector || "" });
-      return res?.ok ? { ok: true, observation: res.msg || "Clicked" } : { ok: false, observation: res?.error || "Click failed" };
+      const selector = normalizedParams.selector || "";
+      const result = await globalThis.click(tabId, selector);
+      return { ok: result.ok, observation: result.ok ? `Clicked element: ${selector}` : result.error };
     }
     case "type_text": {
-      if (!(await ensureContentScript(tabId))) {
-        emitAgentLog(tabId, {
-          level: LOG_LEVELS.ERROR,
-          msg: "Content script unavailable: cannot execute DOM tool",
-          tool: "type_text",
-          errorType: ERROR_TYPES.CONTENT_SCRIPT_UNAVAILABLE
-        });
-        return { ok: false, observation: "Content script unavailable" };
-      }
-      const idx = Number(normalizedParams.elementIndex);
-      if (Number.isFinite(idx) && idx > 0) {
-        try {
-          // Validate overlay/index map before attempting index-based fill
-          const mapRes = await sendContentRPC(tabId, { type: "GET_ELEMENT_MAP" }, getFastTimeout('getInteractiveElements'));
-          const elements = (mapRes?.ok && (mapRes.elements || (mapRes.map && mapRes.map.elements))) ? (mapRes.elements || mapRes.map.elements) : [];
-          if (Array.isArray(elements) && elements.length >= idx) {
-            const fillRes = await sendContentRPC(tabId, { type: MSG.DEBUG_FILL_INDEX, index: idx, value: normalizedParams.text ?? "" }, getFastTimeout('typeText'));
-            return fillRes?.ok ? { ok: true, observation: fillRes.msg || `Filled index ${idx}` } : { ok: false, observation: fillRes?.error || "Typing by index failed" };
-          } else {
-            const fallbackSelector = normalizedParams.selector || (elements && elements[idx - 1] && elements[idx - 1].selector) || "";
-            const fallbackRes = await sendContentRPC(tabId, { type: MSG.FILL_SELECTOR, selector: fallbackSelector, value: normalizedParams.text ?? "" }, getFastTimeout('typeText'));
-            return fallbackRes?.ok ? { ok: true, observation: fallbackRes.msg || "Text entered (fallback)" } : { ok: false, observation: fallbackRes?.error || "Typing failed (fallback)" };
-          }
-        } catch (e) {
-          // If capability check / RPC failed, fall back to selector fill
-          const fallbackRes = await sendContentRPC(tabId, { type: MSG.FILL_SELECTOR, selector: normalizedParams.selector || "", value: normalizedParams.text ?? "" }, getFastTimeout('typeText'));
-          return fallbackRes?.ok ? { ok: true, observation: fallbackRes.msg || "Text entered (fallback)" } : { ok: false, observation: fallbackRes?.error || "Typing failed" };
-        }
-      }
-
-      // Preflight: ensure selector exists & is visible before attempting a selector-based fill.
-      const sel2 = (normalizedParams.selector || "").trim();
-      if (sel2) {
-        try {
-          const check = await sendContentRPC(tabId, { type: MSG.CHECK_SELECTOR, selector: sel2, visibleOnly: true }, getFastTimeout('checkSelector'));
-          const found = !!(check && (check.exists === true || check.found === true || check.visible === true));
-          if (!found) {
-            try { await sendContentRPC(tabId, { type: MSG.SETTLE }, getFastTimeout("settle")); } catch (_) {}
-            const check2 = await sendContentRPC(tabId, { type: MSG.CHECK_SELECTOR, selector: sel2, visibleOnly: true }, getFastTimeout('checkSelector'));
-            const found2 = !!(check2 && (check2.exists === true || check2.found === true || check2.visible === true));
-            if (!found2) {
-              try {
-                const mapRes2 = await sendContentRPC(tabId, { type: "GET_ELEMENT_MAP" }, getFastTimeout('getInteractiveElements'));
-                const elements2 = (mapRes2?.ok && (mapRes2.elements || (mapRes2.map && mapRes2.map.elements))) ? (mapRes2.elements || mapRes2.map.elements) : [];
-                if (Array.isArray(elements2) && elements2.length > 0) {
-                  const candidate = elements2[0];
-                  const fallbackRes = await sendContentRPC(tabId, { type: MSG.FILL_SELECTOR, selector: candidate.selector || sel2, value: normalizedParams.text ?? "" }, getFastTimeout('typeText'));
-                  return fallbackRes?.ok ? { ok: true, observation: fallbackRes.msg || "Text entered (fallback element map)" } : { ok: false, observation: fallbackRes?.error || "Typing failed (fallback)" };
-                }
-              } catch (_) {}
-              return { ok: false, observation: `Selector not found or not visible: ${sel2}` };
-            }
-          }
-        } catch (_) {}
-      }
-
-      const res = await sendContentRPC(tabId, { type: MSG.FILL_SELECTOR, selector: normalizedParams.selector || "", value: normalizedParams.text ?? "" }, getFastTimeout('typeText'));
-      return res?.ok ? { ok: true, observation: res.msg || "Text entered" } : { ok: false, observation: res?.error || "Typing failed" };
+      const selector = normalizedParams.selector || "";
+      const text = normalizedParams.text ?? "";
+      const result = await globalThis.type(tabId, selector, text);
+      return { ok: result.ok, observation: result.ok ? `Typed text into element: ${selector}` : result.error };
     }
     case "scroll_to": {
       if (!(await ensureContentScript(tabId))) {
@@ -4353,22 +4404,26 @@ async function agenticLoop(tabId, goal, settings) {
   // 2. Reason: Select appropriate prompt based on task type
   const { taskType } = sess.taskContext || { taskType: 'AUTOMATION' };
   let reasoningPrompt;
+  // Determine verbosity based on task complexity and progress
+  const isSimpleTask = sess.subTaskStep > 2 && sess.consecutiveFailures === 0;
+  const verbosity = isSimpleTask ? 'low' : 'high';
+
   switch (taskType) {
     case 'RESEARCH':
-      reasoningPrompt = buildResearchAgentPrompt(goal, currentSubTask, contextData);
+      reasoningPrompt = buildResearchAgentPrompt(goal, currentSubTask, contextData, verbosity);
       break;
     case 'YOUTUBE':
-      reasoningPrompt = buildYouTubeActionPrompt(goal, contextData);
+      reasoningPrompt = buildYouTubeActionPrompt(goal, contextData, verbosity);
       break;
     case 'NAVIGATION':
-      reasoningPrompt = buildNavigationActionPrompt(goal, contextData);
+      reasoningPrompt = buildNavigationActionPrompt(goal, contextData, verbosity);
       break;
     default:
-      reasoningPrompt = buildAgentPlanPrompt(goal, currentSubTask, contextData);
+      reasoningPrompt = buildAgentPlanPrompt(goal, currentSubTask, contextData, verbosity);
   }
   
   emitAgentStatus(tabId, "🤔 Thinking...");
-  const modelResponse = await callModelWithRotation(reasoningPrompt, { model: sess.selectedModel, tabId });
+  const modelResponse = await callModelWithRotation(reasoningPrompt, { model: sess.selectedModel, tabId, verbosity });
 
   // 3. Parse and Validate Action
   emitAgentStatus(tabId, "📝 Parsing action...");
@@ -4618,6 +4673,9 @@ chrome.runtime.onStartup.addListener(async () => {
     console.warn("[BG] Failed to restore sessions on startup:", e);
   }
 });
+
+// Service worker registration is handled by the manifest.json in MV3
+// No need to manually register service workers in background scripts
 
 chrome.runtime.onInstalled.addListener(async () => {
   console.log("[BG] Installed");
@@ -6542,5 +6600,65 @@ globalThis.testTemplateSubstitution = testTemplateSubstitution;
     return res;
   };
 })(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : window));
+
+// ============================================================================
+// SYNC MANAGER INTEGRATION
+// ============================================================================
+
+// Initialize sync functionality
+(function initSyncIntegration() {
+  try {
+    // Initialize database and sync manager
+    const db = new globalThis.IndexedDB('ai-chrome-extension', 1, 'ai-state');
+    const syncManager = new globalThis.SyncManager(db);
+    
+    // Setup background sync event listener
+    if (typeof self !== 'undefined' && self.addEventListener) {
+      self.addEventListener('sync', (event) => {
+        if (event.tag === 'sync-ai-actions') {
+          event.waitUntil(
+            syncManager.sync().catch(error => {
+              console.error('[BG] Background sync failed:', error);
+            })
+          );
+        }
+      });
+      
+      // Handle WebRTC offers (if needed for AI communication)
+      self.addEventListener('message', async (event) => {
+        if (event.data && event.data.type === 'webrtc-offer') {
+          try {
+            // For now, WebRTC is not fully implemented
+            // Send back an error response instead of invalid SDP
+            console.warn('[BG] WebRTC offer received but not implemented yet');
+            
+            if (event.source && event.source.postMessage) {
+              event.source.postMessage({
+                type: 'webrtc-error',
+                error: 'WebRTC functionality not implemented yet'
+              });
+            }
+          } catch (error) {
+            console.error('[BG] Error handling WebRTC offer:', error);
+          }
+        }
+      });
+      
+      // Initialize database on activation
+      self.addEventListener('activate', (event) => {
+        event.waitUntil(
+          db.open().catch(error => {
+            console.error('[BG] Failed to open database:', error);
+          })
+        );
+      });
+    }
+    
+    console.log('[BG] Sync integration initialized');
+    
+  } catch (error) {
+    console.error('[BG] Failed to initialize sync integration:', error);
+  }
+})();
 
 // ===== End Graph helpers =====

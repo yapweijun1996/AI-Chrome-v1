@@ -12,9 +12,14 @@
   <h1>AI Assistant</h1>
   <div class="header-actions">
     <button id="toggleActivityBtn" title="Toggle Activity Panel" class="icon-btn" aria-pressed="false" aria-controls="activityPanel" aria-label="Toggle agent activity panel">🧭</button>
+    <button id="openActionsModalBtn" title="Actions" class="icon-btn" aria-label="Actions">⚡️</button>
     <button id="clearChatBtn" title="Clear chat history" class="icon-btn" aria-label="Clear chat history">🧹</button>
     <button id="openOptionsBtn" title="Settings" class="icon-btn" aria-label="Settings">⚙️</button>
     <button id="agentStopBtn" class="stop-btn" title="Emergency STOP" aria-label="Emergency Stop">STOP</button>
+    <label class="toggle-switch">
+      <input type="checkbox" id="darkModeToggle">
+      <span class="slider"></span>
+    </label>
   </div>
 </header>
 
@@ -45,24 +50,6 @@
       <!-- Context chips: auto-filled with current tab URL and other context -->
       <div class="context-chips" id="contextChips" aria-label="Context attachments" role="group"></div>
 
-      <!-- Quick actions toolbar for one-tap intents -->
-      <div class="quick-actions" role="toolbar" aria-label="Quick actions">
-        <button id="qaSummarize" class="quick-btn" title="Summarize this page" aria-label="Summarize this page">Summarize page</button>
-        <button id="qaExtractLinks" class="quick-btn" title="Extract all links from this page" aria-label="Extract all links from this page">Extract links</button>
-        <button id="qaOutline" class="quick-btn" title="Create an outline of this page" aria-label="Create an outline of this page">Outline</button>
-        <button id="qaNavigate" class="quick-btn" title="Prepare navigation request" aria-label="Prepare navigation request">Navigate to…</button>
-      </div>
-
-      <!-- Autonomous Task Templates -->
-      <div class="automation-templates" id="automationTemplates" role="region" aria-label="Autonomous task templates">
-        <div class="templates-header">
-          <h3>🤖 Autonomous Tasks</h3>
-          <small>Let the AI agent perform complex multi-step tasks automatically</small>
-        </div>
-        <div class="templates-grid" id="templatesGrid">
-          <!-- Templates will be populated dynamically -->
-        </div>
-      </div>
     </div>
   </section>
 
@@ -138,9 +125,40 @@
     </div>
   </div>
 
+  <!-- Actions Modal -->
+  <div id="actionsModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>Actions</h3>
+        <button id="closeActionsModal" class="close-btn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <!-- Quick actions toolbar for one-tap intents -->
+        <div class="quick-actions" role="toolbar" aria-label="Quick actions">
+          <button id="qaSummarize" class="quick-btn" title="Summarize this page" aria-label="Summarize this page">Summarize page</button>
+          <button id="qaExtractLinks" class="quick-btn" title="Extract all links from this page" aria-label="Extract all links from this page">Extract links</button>
+          <button id="qaOutline" class="quick-btn" title="Create an outline of this page" aria-label="Create an outline of this page">Outline</button>
+          <button id="qaNavigate" class="quick-btn" title="Prepare navigation request" aria-label="Prepare navigation request">Navigate to…</button>
+        </div>
+        <!-- Autonomous Task Templates -->
+        <div class="automation-templates" id="automationTemplates" role="region" aria-label="Autonomous task templates">
+          <div class="templates-header">
+            <h3>🤖 Autonomous Tasks</h3>
+            <input type="text" id="taskSearch" placeholder="Search tasks...">
+          </div>
+          <div class="templates-grid" id="templatesGrid">
+            <!-- Templates will be populated dynamically -->
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div id="toastContainer" class="toast-container" aria-live="polite" aria-atomic="true"></div>
 
   <script src="../common/messages.js"></script>
+  <script src="../common/indexed-db.js"></script>
+  <script src="../common/sync-manager.js"></script>
   <script src="../common/automation-templates.js"></script>
   <script src="../common/prompts.js"></script>
   <script src="../lib/marked.min.js"></script>

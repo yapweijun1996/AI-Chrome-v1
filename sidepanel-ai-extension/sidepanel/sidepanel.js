@@ -1,4 +1,8 @@
 import { initActivityTimeline, handleTraceMessage, loadRecentTimeline } from "./components/activity-timeline.js";
+
+// Use globally available classes loaded as scripts
+const SyncManager = window.SyncManager;
+const IndexedDB = window.IndexedDB;
 // sidepanel/sidepanel.js
 // Chat-based UI for AI Assistant with Agent Mode capabilities
 
@@ -47,6 +51,7 @@ const els = {
   agentStopBtn: document.getElementById("agentStopBtn"),
   clearChatBtn: document.getElementById("clearChatBtn"),
   toggleActivityBtn: document.getElementById("toggleActivityBtn"),
+  openActionsModalBtn: document.getElementById("openActionsModalBtn"),
   
   // Layout
   spLayout: document.getElementById("spLayout"),
@@ -100,6 +105,11 @@ const els = {
   taskTitle: document.getElementById("taskTitle"),
   addTaskBtn: document.getElementById("addTaskBtn"),
   taskList: document.getElementById("taskList"),
+  
+  // Actions Modal
+  actionsModal: document.getElementById("actionsModal"),
+  closeActionsModal: document.getElementById("closeActionsModal"),
+  
   // Feature flags (Graph/Planner)
   featureFlags: document.getElementById("featureFlags"),
   flagGraphMode: document.getElementById("flagGraphMode"),
@@ -112,7 +122,8 @@ const storageKeys = {
   TASKS: "SP_TASKS_V1",
   AGENT_SETTINGS: "SP_AGENT_SETTINGS_V1",
   CHAT_HISTORY: "SP_CHAT_HISTORY_V1",
-  UI_ACTIVITY_OPEN: "SP_UI_ACTIVITY_OPEN_V1"
+  UI_ACTIVITY_OPEN: "SP_UI_ACTIVITY_OPEN_V1",
+  DARK_MODE: "SP_DARK_MODE_V1"
 };
 
  // Chat state
@@ -123,6 +134,7 @@ let isAgentRunning = false;
 let currentPlanMessage = null;
 let currentStatusBubble = null; // Phase 3: Single status bubble for progress updates
 let clarificationContext = null; // For handling ambiguous query clarification
+let webrtcManager = null;
 
 // Slash commands state (UI-only; no CSS dependency)
 const SLASH_COMMANDS = [
@@ -1648,9 +1660,13 @@ function wireBasics() {
   
   // Tasks modal
   els.closeTasksModal?.addEventListener("click", () => hideModal(els.tasksModal));
+
+  // Actions modal
+  els.openActionsModalBtn?.addEventListener("click", () => showModal(els.actionsModal));
+  els.closeActionsModal?.addEventListener("click", () => hideModal(els.actionsModal));
   
   // Close modals on backdrop click
-  [els.agentModal, els.tasksModal].forEach(modal => {
+  [els.agentModal, els.tasksModal, els.actionsModal].forEach(modal => {
     modal?.addEventListener("click", (e) => {
       if (e.target === modal) hideModal(modal);
     });
@@ -1790,6 +1806,16 @@ chrome.runtime.onMessage.addListener((message) => {
   }
 });
 
+navigator.serviceWorker.addEventListener('message', event => {
+  if (event.data && event.data.type === 'webrtc-answer') {
+    // Handle WebRTC answer from the service worker
+    console.log('[Sidepanel] WebRTC answer received:', event.data.answer);
+  } else if (event.data && event.data.type === 'webrtc-error') {
+    // Handle WebRTC errors from the service worker
+    console.error('[Sidepanel] WebRTC error:', event.data.error);
+  }
+});
+
 async function loadChatHistoryOnStart() {
   const history = await loadChatHistory();
   history.forEach(msg => {
@@ -1838,7 +1864,31 @@ async function main() {
     startStatusMonitoring();
     ensureActivityOpen();
   }
+
+  // Dark mode
+  const darkModeToggle = document.getElementById('darkModeToggle');
+  const currentTheme = localStorage.getItem(storageKeys.DARK_MODE);
+  if (currentTheme === 'dark') {
+    document.body.classList.add('dark-mode');
+    darkModeToggle.checked = true;
+  }
+  darkModeToggle.addEventListener('change', () => {
+    if (darkModeToggle.checked) {
+      document.body.classList.add('dark-mode');
+      localStorage.setItem(storageKeys.DARK_MODE, 'dark');
+    } else {
+      document.body.classList.remove('dark-mode');
+      localStorage.setItem(storageKeys.DARK_MODE, 'light');
+    }
+  });
 }
+
+
+  const db = new IndexedDB('ai-chrome-extension', 1, 'ai-state');
+  const syncManager = new SyncManager(db);
+  db.open().then(() => {
+    syncManager.register();
+  });
 
 // Cleanup on page unload
 window.addEventListener('beforeunload', () => {
@@ -2399,33 +2449,33 @@ const TEMPLATE_ICONS = {
 // Initialize automation templates UI
 function initAutomationTemplates() {
   if (!window.AutomationTemplates || !els.templatesGrid) return;
-  
-  // Get featured templates (2-3 from each category)
-  const featuredTemplates = [
-    // E-commerce
-    window.AutomationTemplates.getEcommerceTemplates()['product-research'],
-    window.AutomationTemplates.getEcommerceTemplates()['price-tracking'],
-    
-    // Research  
-    window.AutomationTemplates.getResearchTemplates()['market-research'],
-    window.AutomationTemplates.getResearchTemplates()['news-aggregation'],
-    
-    // Productivity
-    window.AutomationTemplates.getProductivityTemplates()['data-collection'],
-    window.AutomationTemplates.getProductivityTemplates()['email-management']
-  ].filter(Boolean);
-  
-  // Clear and populate templates grid
-  els.templatesGrid.innerHTML = '';
-  
-  featuredTemplates.forEach(template => {
-    const card = createTemplateCard(template);
-    els.templatesGrid.appendChild(card);
+
+  const taskSearch = document.getElementById('taskSearch');
+  const allTemplates = Object.values(window.AutomationTemplates.getAllTemplates()).flatMap(Object.values);
+
+  function renderTemplates(filter = '') {
+    const filteredTemplates = allTemplates.filter(template =>
+      template.name.toLowerCase().includes(filter.toLowerCase()) ||
+      template.description.toLowerCase().includes(filter.toLowerCase())
+    );
+
+    els.templatesGrid.innerHTML = '';
+    filteredTemplates.forEach(template => {
+      const card = createTemplateCard(template);
+      els.templatesGrid.appendChild(card);
+    });
+
+    if (filter === '') {
+      const moreCard = createMoreTemplatesCard();
+      els.templatesGrid.appendChild(moreCard);
+    }
+  }
+
+  renderTemplates();
+
+  taskSearch.addEventListener('input', () => {
+    renderTemplates(taskSearch.value);
   });
-  
-  // Add "More Templates" card
-  const moreCard = createMoreTemplatesCard();
-  els.templatesGrid.appendChild(moreCard);
 }
 
 // Create individual template card

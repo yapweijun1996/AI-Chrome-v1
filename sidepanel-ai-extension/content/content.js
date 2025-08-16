@@ -104,16 +104,33 @@
     }
   }
 
-  // Visibility helper reused by multiple handlers
+  // Enhanced visibility helper reused by multiple handlers
   function isElementVisible(el) {
     try {
+      if (!el || !el.getBoundingClientRect) return false;
+      
       const rect = el.getBoundingClientRect();
       if (!rect || rect.width === 0 || rect.height === 0) return false;
+      
+      // Check if element is off-screen
+      if (rect.bottom < 0 || rect.right < 0 || rect.left > window.innerWidth || rect.top > window.innerHeight) {
+        return false;
+      }
+      
       const cs = el.ownerDocument.defaultView.getComputedStyle(el);
-      if (!cs) return true;
-      if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') === 0) return false;
+      if (!cs) return true; // Assume visible if we can't get computed style
+      
+      if (cs.display === 'none' || 
+          cs.visibility === 'hidden' || 
+          cs.visibility === 'collapse' ||
+          parseFloat(cs.opacity || '1') === 0 ||
+          cs.pointerEvents === 'none') {
+        return false;
+      }
+      
       return true;
-    } catch (_) {
+    } catch (e) {
+      console.warn(`[Content] isElementVisible error for element:`, el, e);
       return false;
     }
   }
@@ -346,16 +363,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         try { sendResponse({ ok: true, ts: Date.now() }); } catch (_) {}
         break;
       }
-      case "AGENT_CAPS": {
+      case MSG.AGENT_CAPS: {
         try {
-          const caps = {
-            ok: true,
+          const capabilities = {
             supportsDebugOverlay: true,
             supportsIndexFill: true,
             supportedMessages: Object.keys(MSG || {}).slice(0, 200),
             overlayVersion: "1.0.0"
           };
-          sendResponse(caps);
+          sendResponse({ ok: true, capabilities });
         } catch (e) {
           sendResponse({ ok: false, error: String(e?.message || e) });
         }
@@ -378,7 +394,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             result = await new Promise(resolve => handleWaitForSelector({ selector: params.selector, timeoutMs: params.timeoutMs }, resolve));
             break;
           case "scrape":
-            result = await new Promise(resolve => handleScrapeSelector({ selector: params.selector }, resolve));
+            result = await new Promise(resolve => handleScrapeSelector({ selector: params.selector || 'body' }, resolve));
             break;
           default:
             result = { ok: false, error: `Unknown tool: ${tool}` };
@@ -413,7 +429,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       case MSG.SETTLE: {
         settleNextFrame().then(() => sendResponse({ ok: true }));
-        break;
+        return true; // Keep message port open for async response
       }
       case MSG.CHECK_SELECTOR: {
         handleCheckSelector(message, sendResponse);
@@ -651,15 +667,15 @@ async function __dispatchMessageForPort(message) {
       case "__PING_CONTENT__": {
         return { ok: true, ts: Date.now() };
       }
-      case "AGENT_CAPS": {
+      case MSG.AGENT_CAPS: {
         try {
-          return {
-            ok: true,
+          const capabilities = {
             supportsDebugOverlay: true,
             supportsIndexFill: true,
             supportedMessages: Object.keys(MSG || {}).map(k => MSG[k]).filter(Boolean).slice(0, 200),
             overlayVersion: "1.0.0"
           };
+          return { ok: true, capabilities };
         } catch (e) {
           return { ok: false, error: String(e?.message || e) };
         }
@@ -2434,7 +2450,7 @@ function calculateLinkRelevance(linkElement) {
 
 function handleScrapeSelector(message, sendResponse) {
   try {
-    const selector = message.selector;
+    const selector = message.selector || 'body';
     if (!selector) {
       return sendResponse({ ok: false, error: "No selector provided for scrape" });
     }
@@ -2651,24 +2667,44 @@ function overlayComputeItems(opts) {
   const minScore = typeof opts.minScore === 'number' ? opts.minScore : 0;
 
   const DA = (typeof window !== 'undefined' ? window.DOMAgent : null);
+  const rankerAvailable = typeof window.getRankedInteractiveElements === 'function';
+  
+  console.log(`[Content] overlayComputeItems: DOMAgent=${!!DA}, ranker=${rankerAvailable}, limit=${limit}`);
+  
   // Prefer DOMAgent ranked elements
   if (DA && typeof DA.getInteractiveElements === 'function') {
     try {
+      console.log(`[Content] Calling DOMAgent.getInteractiveElements with limit ${limit * 2}`);
       const res = DA.getInteractiveElements(limit * 2);
+      console.log(`[Content] DOMAgent.getInteractiveElements result:`, res);
+      
       if (res?.ok) {
         const filtered = (res.elements || []).filter(e => {
           if (!e || !e.position) return false;
           // visible bounding boxes
           return e.position.width > 0 && e.position.height > 0 && (typeof e.score !== 'number' || e.score >= minScore);
         }).slice(0, limit);
+        console.log(`[Content] DOMAgent filtered ${filtered.length} elements from ${res.elements?.length || 0} raw elements`);
         return filtered;
+      } else {
+        console.warn(`[Content] DOMAgent.getInteractiveElements failed:`, res);
       }
-    } catch (_) {}
+    } catch (e) {
+      console.error(`[Content] DOMAgent.getInteractiveElements threw error:`, e);
+    }
+  } else {
+    console.log(`[Content] DOMAgent not available or missing getInteractiveElements function`);
   }
 
   // Fallback heuristic with dialog-first context
+  console.log(`[Content] Using fallback heuristic element detection`);
   // Determine scanning root: prefer active modal/dialog if present, else document.body
   let scanRoot = document.body;
+  
+  if (!scanRoot) {
+    console.error(`[Content] document.body is not available!`);
+    return [];
+  }
   try {
     const dialogSelectors = [
       '[role="dialog"]',
@@ -2715,10 +2751,19 @@ function overlayComputeItems(opts) {
   let nodeList = [];
   try {
     nodeList = Array.from(scanRoot.querySelectorAll(sel));
-  } catch (_) {
-    try { nodeList = Array.from(document.querySelectorAll(sel)); } catch (_) { nodeList = []; }
+    console.log(`[Content] Found ${nodeList.length} elements matching interactive selectors`);
+  } catch (e) {
+    console.warn(`[Content] Failed to query scanRoot, falling back to document:`, e);
+    try { 
+      nodeList = Array.from(document.querySelectorAll(sel)); 
+      console.log(`[Content] Fallback query found ${nodeList.length} elements`);
+    } catch (e2) { 
+      console.error(`[Content] Both queries failed:`, e2);
+      nodeList = []; 
+    }
   }
   const elements = nodeList.filter(isElementVisible);
+  console.log(`[Content] ${elements.length} elements passed visibility filter from ${nodeList.length} candidates`);
 
   const out = [];
   for (const el of elements) {
@@ -2754,6 +2799,7 @@ function overlayComputeItems(opts) {
     const ay = a.position?.y ?? 0, by = b.position?.y ?? 0;
     return ay - by;
   });
+  console.log(`[Content] Fallback heuristic returning ${out.length} elements`);
   return out;
 }
 
@@ -2774,9 +2820,9 @@ async function overlayClickIndex(index) {
   // If still no selector, try to get it directly from element list
   if (!selector) {
     try {
-      const elementData = getInteractiveElementsInternal();
-      if (elementData.elements && elementData.elements[index - 1]) {
-        selector = elementData.elements[index - 1].selector;
+      const items = overlayComputeItems({ limit: 50 });
+      if (items && items[index - 1]) {
+        selector = items[index - 1].selector;
         console.log(`[CS] Found selector from direct element lookup: ${selector}`);
       }
     } catch (e) {
@@ -3160,16 +3206,25 @@ function handleDragAndDrop(message, sendResponse) {
 // Handle DOM state checking for enhanced readiness detection
 function handleGetDOMState(_message, sendResponse) {
   try {
+    console.log(`[Content] handleGetDOMState called`);
+    
     const state = {
       readyState: document.readyState,
       elementCount: document.querySelectorAll('*').length,
       interactiveElementCount: document.querySelectorAll('button, input, select, textarea, a[href], [onclick], [role="button"]').length,
       loadComplete: document.readyState === 'complete',
-      hasContent: document.body && document.body.children.length > 0
+      hasContent: document.body && document.body.children.length > 0,
+      // Add diagnostic info about dependencies
+      domAgentAvailable: !!(typeof window !== 'undefined' && window.DOMAgent),
+      rankerAvailable: typeof window.getRankedInteractiveElements === 'function',
+      bodyExists: !!document.body,
+      url: window.location.href
     };
 
+    console.log(`[Content] DOM state result:`, state);
     sendResponse({ ok: true, state });
   } catch (error) {
+    console.error(`[Content] handleGetDOMState error:`, error);
     sendResponse({ ok: false, error: `DOM state check error: ${error.message}` });
   }
 }
@@ -3209,22 +3264,38 @@ function handleGetElementMap(message, sendResponse) {
       items = overlayComputeItems({ limit });
     }
 
-    const elements = items.slice(0, limit).map((it, i) => ({
-      index: i + 1,
-      selector: it.selector,
-      tag: it.tag,
-      role: it.role,
-      type: it.type,
-      inputType: it.inputType,
-      name: buildElementName(it),
-      placeholder: it.placeholder || '',
-      ariaLabel: it.ariaLabel || '',
-      value: (it.value != null ? String(it.value).slice(0, 200) : ''),
-      position: it.position,
-      score: typeof it.score === 'number' ? it.score : null,
-      contentEditable: !!it.contentEditable,
-      tabIndex: typeof it.tabIndex === 'number' ? it.tabIndex : null
-    }));
+    const elements = items.slice(0, limit).map((it, i) => {
+      // Add visibility validation to each element
+      let visible = true;
+      try {
+        if (it.selector) {
+          const el = document.querySelector(it.selector);
+          if (el) {
+            visible = isElementVisible(el);
+          }
+        }
+      } catch (e) {
+        console.warn(`[Content] Failed to validate visibility for element ${i + 1}:`, e);
+      }
+      
+      return {
+        index: i + 1,
+        selector: it.selector,
+        tag: it.tag,
+        role: it.role,
+        type: it.type,
+        inputType: it.inputType,
+        name: buildElementName(it),
+        placeholder: it.placeholder || '',
+        ariaLabel: it.ariaLabel || '',
+        value: (it.value != null ? String(it.value).slice(0, 200) : ''),
+        position: it.position,
+        score: typeof it.score === 'number' ? it.score : null,
+        contentEditable: !!it.contentEditable,
+        tabIndex: typeof it.tabIndex === 'number' ? it.tabIndex : null,
+        visible: visible
+      };
+    });
 
     const mapData = {
       map: {

@@ -138,6 +138,106 @@
     }
   }
 
+  // Error serialization utilities
+  function serializeError(error) {
+    if (!error) return null;
+    
+    const serialized = {
+      name: error.name || 'Error',
+      message: error.message || 'Unknown error',
+      stack: error.stack || null,
+      timestamp: new Date().toISOString()
+    };
+
+    // Handle ExtensionError (from our error system)
+    if (error.toJSON && typeof error.toJSON === 'function') {
+      try {
+        return { ...serialized, ...error.toJSON() };
+      } catch (e) {
+        // Fallback if toJSON fails
+      }
+    }
+
+    // Handle native errors and custom properties
+    const errorKeys = Object.getOwnPropertyNames(error);
+    for (const key of errorKeys) {
+      if (key !== 'name' && key !== 'message' && key !== 'stack') {
+        try {
+          const value = error[key];
+          if (value !== undefined && value !== null) {
+            serialized[key] = typeof value === 'object' ? 
+              JSON.parse(JSON.stringify(value)) : value;
+          }
+        } catch (e) {
+          // Skip properties that can't be serialized
+          serialized[key] = '[Non-serializable]';
+        }
+      }
+    }
+
+    return serialized;
+  }
+
+  function sanitizeLogData(data, depth = 0, seen = new Set()) {
+    // Prevent infinite recursion and circular references
+    if (depth > 10) return '[Max Depth Reached]';
+    if (data === null || data === undefined) return data;
+    
+    if (data instanceof Error) {
+      return { error: serializeError(data) };
+    }
+    
+    if (Array.isArray(data)) {
+      try {
+        return data.map(item => sanitizeLogData(item, depth + 1, seen));
+      } catch (e) {
+        return '[Array Serialization Failed]';
+      }
+    }
+    
+    if (typeof data === 'object') {
+      try {
+        // Create a unique identifier for this object
+        const objId = data.constructor?.name + '_' + Date.now() + '_' + Math.random();
+        
+        if (seen.has(objId)) return '[Circular Reference]';
+        seen.add(objId);
+        
+        const sanitized = {};
+        
+        for (const [key, value] of Object.entries(data)) {
+          // Redact sensitive information
+          if (typeof key === 'string') {
+            const lowerKey = key.toLowerCase();
+            if (lowerKey.includes('password') || 
+                lowerKey.includes('token') || 
+                lowerKey.includes('key') || 
+                lowerKey.includes('secret') ||
+                lowerKey.includes('auth')) {
+              sanitized[key] = '[REDACTED]';
+              continue;
+            }
+          }
+          
+          if (value instanceof Error) {
+            sanitized[key] = serializeError(value);
+          } else if (typeof value === 'object' && value !== null) {
+            sanitized[key] = sanitizeLogData(value, depth + 1, new Set(seen));
+          } else {
+            sanitized[key] = value;
+          }
+        }
+        
+        seen.delete(objId);
+        return sanitized;
+      } catch (e) {
+        return '[Object Serialization Failed]';
+      }
+    }
+    
+    return data;
+  }
+
   class NamespacedLogger {
     constructor(ns, context = null) {
       this.ns = ns;
@@ -150,14 +250,34 @@
     }
     logAt(level, message, meta) {
       if (!shouldLog(this.ns, level)) return;
-      const { msg, styles } = fmt(this.ns, level, meta || this.context);
+      
+      // Sanitize and serialize log data
+      const sanitizedMeta = sanitizeLogData(meta || this.context);
+      const sanitizedMessage = typeof message === 'object' ? sanitizeLogData(message) : message;
+      
+      const { msg, styles } = fmt(this.ns, level, sanitizedMeta);
       const fn = rawConsole(level);
-      if (meta) {
-        fn(msg, ...styles, meta, message);
-      } else if (this.context) {
-        fn(msg, ...styles, this.context, message);
+      
+      if (sanitizedMeta) {
+        fn(msg, ...styles, sanitizedMeta, sanitizedMessage);
       } else {
-        fn(msg, ...styles, message);
+        fn(msg, ...styles, sanitizedMessage);
+      }
+      
+      // Send to centralized error tracking if it's an error
+      if (level === 'error' && global.ErrorTracker && this.ns !== 'error-tracker') {
+        try {
+          global.ErrorTracker.trackError({
+            namespace: this.ns,
+            level,
+            message: sanitizedMessage,
+            metadata: sanitizedMeta,
+            timestamp: new Date().toISOString()
+          });
+        } catch (e) {
+          // Ignore tracking errors to prevent recursion
+          console.warn('[Logger] Failed to track error:', e.message);
+        }
       }
     }
     error(message, meta) { this.logAt("error", message, meta); }
